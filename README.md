@@ -45,7 +45,78 @@ make
 
 This creates `./solver`.
 
-## 3) Build STRIDE (if you do not already have `stride`)
+## 3) Solver Function Contract (how to plug in your algorithm)
+
+Your implementation should only modify `solve(const PaceInstance& instance)` in `solver.cpp`.
+
+The runner code already does:
+- parse stdin into a `PaceInstance`
+- install SIGTERM handling
+- print the current best known valid solution on timeout
+
+### Input your `solve(...)` receives
+
+`PaceInstance` has:
+
+- `tree_count`: number of input trees (`#p t n` -> `t`)
+- `leaf_count`: number of leaves (`#p t n` -> `n`)
+- `trees`: `std::vector<genesis::tree::Tree>` of parsed Newick trees
+
+The input has already been parsed and validated enough to populate these fields.
+
+### Output your `solve(...)` must return
+
+Return `std::vector<std::string>` where each element is one forest component in Newick format.
+
+Examples of valid returned entries:
+- `"(1,2);"`
+- `"4;"`
+
+Semicolon is optional in returned strings; the framework normalizes missing semicolons.
+
+### Required correctness rules for returned forest
+
+- Every leaf label from `1..leaf_count` appears exactly once across all returned components.
+- No duplicate leaf labels across components.
+- Components must be valid Newick trees.
+- The forest should be an agreement forest for all input trees (checker enforces feasibility).
+
+### SIGTERM / heuristic best-so-far behavior
+
+You can publish intermediate improvements during search:
+
+```cpp
+publish_best_solution(current_best_forest);
+```
+
+Where `current_best_forest` is `std::vector<std::string>`.
+
+If STRIDE sends SIGTERM, the process prints the last published solution immediately.
+
+### Minimal solve template
+
+```cpp
+std::vector<std::string> solve(const PaceInstance& instance) {
+    std::vector<std::string> best = build_singleton_forest(instance.leaf_count);
+    publish_best_solution(best);  // optional extra safety while experimenting
+
+    // TODO: your heuristic/exact logic here using instance.trees
+    // If you find a better valid forest:
+    // best = candidate;
+    // publish_best_solution(best);
+
+    return best;
+}
+```
+
+### Practical design guidance
+
+- Keep stdout strictly for solution lines only.
+- Send debug/progress logs to stderr only.
+- Maintain one always-valid `best` forest in memory.
+- Only call `publish_best_solution(...)` with valid forests.
+
+## 4) Build STRIDE (if you do not already have `stride`)
 
 Build from the bundled source:
 
@@ -65,7 +136,7 @@ Optional convenience alias:
 alias stride=./pace26stride/target/release/stride
 ```
 
-## 4) Prepare an instance list (`.lst`)
+## 5) Prepare an instance list (`.lst`)
 
 `stride run` requires `-i <list-or-instance...>`.
 
@@ -96,7 +167,7 @@ If you use `s:<idigest>` entries, download them first:
 
 This creates `stride-downloads/` automatically.
 
-## 5) Run solver with STRIDE
+## 6) Run solver with STRIDE
 
 Use the compiled binary (`./solver`), not `solver.cpp`.
 
@@ -114,7 +185,7 @@ Useful flags:
 - `-g`: grace seconds before SIGKILL
 - `-p`: parallel jobs
 
-## 6) Check results and debug failures
+## 7) Check results and debug failures
 
 STRIDE writes logs under `stride-logs/`.
 
@@ -128,7 +199,7 @@ If you see many `SolverError` results, check:
 - solver writes only solution to stdout (debug to stderr)
 - shared libraries are resolvable at runtime
 
-## 7) Minimal repeat workflow
+## 8) Minimal repeat workflow
 
 ```bash
 cd genesis && make && cd ..
