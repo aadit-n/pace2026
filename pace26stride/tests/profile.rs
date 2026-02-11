@@ -1,0 +1,109 @@
+use pace26stride::{
+    job::job_processor::{JobProcessorBuilder, JobResult},
+    run_directory::RunDirectory,
+    test_helpers::*,
+};
+use serde_json::Value;
+use std::{collections::HashMap, path::PathBuf, time::Duration};
+use tempdir::TempDir;
+
+fn test_solver_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_test_solver"))
+}
+
+fn test_stride_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_stride"))
+}
+
+async fn run(instance: PathBuf, profiler: bool) -> (JobResult, HashMap<String, Value>) {
+    let instance = test_testcases_dir().join(instance);
+    let tempdir = TempDir::new("profile_test").unwrap();
+    let run_dir = RunDirectory::new_within(tempdir.path()).unwrap();
+    let work_dir = run_dir.create_task_dir_for(&instance).unwrap();
+
+    let job = JobProcessorBuilder::default()
+        .soft_timeout(Duration::from_secs_f64(1.5))
+        .grace_period(Duration::from_secs_f64(1.5))
+        .solver(test_solver_path())
+        .solver_args(vec!["-f".into()])
+        .work_dir(work_dir)
+        .instance_path(instance)
+        .profiler(profiler)
+        .profiler_executable(Some(test_stride_path()))
+        .build()
+        .unwrap();
+
+    let (job_result, solution_infos) = job.run().await;
+
+    let mut infos = HashMap::new();
+    if let Some((_, vec)) = solution_infos {
+        for (key, value) in vec.into_iter() {
+            infos.insert(key, value);
+        }
+    }
+
+    (job_result, infos)
+}
+
+#[tokio::test]
+async fn valid_wo_profiler() {
+    let (result, _infos) = run(PathBuf::from("test_solver_valid/valid.in"), false).await;
+    assert_eq!(result, JobResult::Valid { size: 2 });
+}
+
+#[tokio::test]
+async fn valid_with_profiler() {
+    let (result, _infos) = run(PathBuf::from("test_solver_valid/valid.in"), true).await;
+    assert_eq!(result, JobResult::Valid { size: 2 });
+}
+
+#[tokio::test]
+async fn profile_time_shortwait() {
+    // idle wait
+    let (result, infos) = run(PathBuf::from("test_solver_valid/shortwait.in"), true).await;
+    assert_eq!(result, JobResult::Valid { size: 2 });
+
+    assert!(
+        infos.get("s_wtime").unwrap().as_f64().unwrap() > 0.65,
+        "actual: {:?}",
+        infos.get("s_wtime")
+    );
+    assert!(
+        infos.get("s_utime").unwrap().as_f64().unwrap() < 0.5,
+        "actual: {:?}",
+        infos.get("s_utime")
+    );
+}
+
+#[tokio::test]
+async fn profile_time_busywait() {
+    let (result, infos) = run(PathBuf::from("test_solver_valid/busywait.in"), true).await;
+    assert_eq!(result, JobResult::Valid { size: 2 });
+
+    assert!(
+        infos.get("s_wtime").unwrap().as_f64().unwrap() > 0.7,
+        "actual: {:?}",
+        infos.get("s_wtime")
+    );
+    assert!(
+        infos.get("s_utime").unwrap().as_f64().unwrap() > 0.7,
+        "actual: {:?}",
+        infos.get("s_utime")
+    );
+}
+
+#[tokio::test]
+async fn profile_maxrss() {
+    // idle wait
+    let (result, infos) = run(PathBuf::from("test_solver_valid/valid.in"), true).await;
+    assert_eq!(result, JobResult::Valid { size: 2 });
+    let maxrss_before = infos.get("s_maxrss").unwrap().as_i64().unwrap();
+
+    // busy wait
+    let (result, infos) = run(PathBuf::from("test_solver_valid/alloc50mb.in"), true).await;
+    assert_eq!(result, JobResult::Valid { size: 2 });
+    let maxrss_after = infos.get("s_maxrss").unwrap().as_i64().unwrap();
+
+    // make sure it's atleast 30mb larger
+    assert!(maxrss_before + 30_000_000 < maxrss_after);
+}

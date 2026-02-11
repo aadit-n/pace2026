@@ -1,0 +1,145 @@
+/*
+    Genesis - A toolkit for working with phylogenetic data.
+    Copyright (C) 2014-2025 Lucas Czech
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+    Contact:
+    Lucas Czech <lucas.czech@sund.ku.dk>
+    University of Copenhagen, Globe Institute, Section for GeoGenetics
+    Oster Voldgade 5-7, 1350 Copenhagen K, Denmark
+*/
+
+/**
+ * @brief
+ *
+ * @file
+ * @ingroup test
+ */
+
+#include "src/common.hpp"
+
+#include "genesis/taxonomy/formats/taxonomy_reader.hpp"
+#include "genesis/taxonomy/functions/taxonomy.hpp"
+#include "genesis/taxonomy/functions/tree.hpp"
+#include "genesis/taxonomy/taxon.hpp"
+#include "genesis/taxonomy/taxonomy.hpp"
+#include "genesis/taxonomy/taxopath.hpp"
+
+#include "genesis/tree/common_tree/newick_writer.hpp"
+#include "genesis/tree/tree.hpp"
+
+#include <stdexcept>
+
+using namespace genesis::taxonomy;
+using namespace genesis::tree;
+using namespace genesis::utils;
+
+TEST( Taxonomy, TreeBasic )
+{
+    // Skip test if no data availabe.
+    NEEDS_TEST_DATA;
+    std::string const infile = environment->data_dir + "taxonomy/tax_slv_ssu_123.1.clean";
+    auto const reader = TaxonomyReader();
+    Taxonomy tax;
+    EXPECT_NO_THROW( reader.read( from_file( infile ), tax ));
+    EXPECT_EQ( 32, total_taxa_count(tax) );
+    sort_by_name( tax );
+    EXPECT_TRUE( validate( tax ));
+
+    // auto const tree = taxonomy_to_tree( tax );
+    auto nw = CommonTreeNewickWriter();
+    nw.enable_branch_lengths( false );
+    nw.trailing_new_line( false );
+
+    // LOG_DBG << "default";
+    auto const t1 = taxonomy_to_tree( tax );
+    // LOG_DBG << nw.to_string( t1 );
+    // nw.to_file( t1, "/home/lucas/t1.newick" );
+    EXPECT_EQ(
+        "(((Staphylothermus,Ignisphaera,Ignicoccus,Desulfurococcus,Aeropyrum),(SK190,Caldisphaera,Acidilobus),a87Y42,4136-1-21,1A-6),Ancient_Archaeal_Group_AAG,(Terrestrial_Hot_Spring_Gp_THSCG,Candidatus_Caldiarchaeum),(Deep_Sea_Euryarchaeotic_Group_DSEG,Candidatus_Aenigmarchaeum));",
+        nw.to_string( t1 )
+    );
+
+    // LOG_DBG << "false, true, -1";
+    TaxonomyToTreeParams params_1;
+    params_1.keep_singleton_inner_nodes = true;
+    params_1.keep_inner_node_names = false;
+    params_1.max_level = -1;
+    auto const t2 = taxonomy_to_tree( tax, params_1 );
+    // LOG_DBG << nw.to_string( t2 );
+    // nw.to_file( t2, "/home/lucas/t2.newick" );
+    EXPECT_EQ(
+        "(((((Staphylothermus,Ignisphaera,Ignicoccus,Desulfurococcus,Aeropyrum)),(SK190,(Caldisphaera),(Acidilobus)),a87Y42,4136-1-21,1A-6)),Ancient_Archaeal_Group_AAG,(Terrestrial_Hot_Spring_Gp_THSCG,(((Candidatus_Caldiarchaeum)))),(Deep_Sea_Euryarchaeotic_Group_DSEG,(((Candidatus_Aenigmarchaeum)))));",
+        nw.to_string( t2 )
+    );
+
+    // LOG_DBG << "true, false, -1";
+    TaxonomyToTreeParams params_2;
+    params_2.keep_singleton_inner_nodes = false;
+    params_2.keep_inner_node_names = true;
+    params_2.max_level = -1;
+    auto const t3 = taxonomy_to_tree( tax, params_2 );
+    // LOG_DBG << nw.to_string( t3 );
+    // nw.to_file( t3, "/home/lucas/t3.newick" );
+    EXPECT_EQ(
+        "(((Staphylothermus,Ignisphaera,Ignicoccus,Desulfurococcus,Aeropyrum)Desulfurococcaceae,(SK190,Caldisphaera,Acidilobus)Acidilobales,a87Y42,4136-1-21,1A-6)Thermoprotei,Ancient_Archaeal_Group_AAG,(Terrestrial_Hot_Spring_Gp_THSCG,Candidatus_Caldiarchaeum)Aigarchaeota,(Deep_Sea_Euryarchaeotic_Group_DSEG,Candidatus_Aenigmarchaeum)Aenigmarchaeota)Archaea;",
+         nw.to_string( t3 )
+    );
+
+    // LOG_DBG << "false, false, 2";
+    TaxonomyToTreeParams params_3;
+    params_3.keep_singleton_inner_nodes = true;
+    params_3.keep_inner_node_names = true;
+    params_3.max_level = 2;
+    auto const t4 = taxonomy_to_tree( tax, params_3 );
+    // LOG_DBG << nw.to_string( t4 );
+    // nw.to_file( t4, "/home/lucas/t4.newick" );
+    EXPECT_EQ(
+        "((Thermoprotei)Crenarchaeota,Ancient_Archaeal_Group_AAG,(Terrestrial_Hot_Spring_Gp_THSCG,Aigarchaeota_Incertae_Sedis)Aigarchaeota,(Deep_Sea_Euryarchaeotic_Group_DSEG,Aenigmarchaeota_Incertae_Sedis)Aenigmarchaeota)Archaea;",
+        nw.to_string( t4 )
+    );
+}
+
+TEST( Taxonomy, TreeAdvanced )
+{
+    // Skip test if no data availabe.
+    NEEDS_TEST_DATA;
+    std::string const infile = environment->data_dir + "taxonomy/tax_slv_ssu_123.1.clean";
+
+    // Read the taxonomy and check its properties
+    auto const reader = TaxonomyReader();
+    Taxonomy tax;
+    EXPECT_NO_THROW( reader.read( from_file( infile ), tax ));
+    EXPECT_EQ( 32, total_taxa_count(tax) );
+    sort_by_name( tax );
+    EXPECT_TRUE( validate( tax ));
+
+    // Turn the taxonomy into a tree, and collect the list of taxa,
+    // in the order of the nodes of the tree.
+    TaxonomyToTreeParams params;
+    params.keep_singleton_inner_nodes = true;
+    params.keep_inner_node_names = true;
+    params.max_level = -1;
+    std::vector<Taxon const*> per_node_taxa;
+    auto const tax_tree = taxonomy_to_tree( tax, per_node_taxa, params );
+
+    // Check that the list of taxa corresponds to the correct nodes.
+    EXPECT_EQ( 32, per_node_taxa.size() );
+    ASSERT_EQ( per_node_taxa.size(), tax_tree.node_count() );
+    for( size_t i = 0; i < tax_tree.node_count(); ++i ) {
+        ASSERT_TRUE( per_node_taxa[i] );
+        EXPECT_EQ( per_node_taxa[i]->name(), tax_tree.node_at(i).data<CommonNodeData>().name );
+    }
+}
