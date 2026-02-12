@@ -47,7 +47,8 @@ struct TreeInfo {
     std::vector<int> node_to_leaf;      // 0 for internal
     std::vector<int> subtree_leaf_count;
     std::vector<std::vector<int>> up;   // binary lifting table
-    std::vector<uint64_t> sub_hash;     // topology hash (unordered rooted)
+    std::vector<uint64_t> sub_hash_a;   // topology hash A (unordered rooted)
+    std::vector<uint64_t> sub_hash_b;   // topology hash B (independent mix)
 };
 
 using Bitmask = std::vector<uint64_t>;
@@ -288,7 +289,8 @@ TreeInfo build_tree_info(const SimpleTree& tree, int leaf_count) {
     info.node_to_leaf = tree.leaf_label;
     info.depth.assign(info.node_count, 0);
     info.subtree_leaf_count.assign(info.node_count, 0);
-    info.sub_hash.assign(info.node_count, 0);
+    info.sub_hash_a.assign(info.node_count, 0);
+    info.sub_hash_b.assign(info.node_count, 0);
     info.leaf_to_node.assign(leaf_count + 1, -1);
 
     std::vector<int> stack{info.root};
@@ -328,11 +330,17 @@ TreeInfo build_tree_info(const SimpleTree& tree, int leaf_count) {
         }
     }
 
-    auto mix64 = [](uint64_t x) -> uint64_t {
+    auto mix64a = [](uint64_t x) -> uint64_t {
         x += 0x9e3779b97f4a7c15ULL;
         x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
         x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
         return x ^ (x >> 31);
+    };
+    auto mix64b = [](uint64_t x) -> uint64_t {
+        x += 0x517cc1b727220a95ULL;
+        x = (x ^ (x >> 33)) * 0xff51afd7ed558ccdULL;
+        x = (x ^ (x >> 33)) * 0xc4ceb9fe1a85ec53ULL;
+        return x ^ (x >> 33);
     };
 
     std::vector<std::pair<int, bool>> post_hash;
@@ -348,20 +356,32 @@ TreeInfo build_tree_info(const SimpleTree& tree, int leaf_count) {
         }
 
         if (info.node_to_leaf[v] > 0) {
-            info.sub_hash[v] = mix64(static_cast<uint64_t>(info.node_to_leaf[v]) + 0x123456789abcdefULL);
+            info.sub_hash_a[v] = mix64a(static_cast<uint64_t>(info.node_to_leaf[v]) + 0x123456789abcdefULL);
+            info.sub_hash_b[v] = mix64b(static_cast<uint64_t>(info.node_to_leaf[v]) + 0xfedcba987654321ULL);
             continue;
         }
 
-        std::vector<uint64_t> child_hashes;
-        child_hashes.reserve(info.children[v].size());
-        for (int c : info.children[v]) child_hashes.push_back(info.sub_hash[c]);
-        std::sort(child_hashes.begin(), child_hashes.end());
-
-        uint64_t h = mix64(0xCAFEBABE12345678ULL ^ static_cast<uint64_t>(child_hashes.size()));
-        for (uint64_t ch : child_hashes) {
-            h = mix64(h ^ mix64(ch + 0x9e3779b97f4a7c15ULL));
+        std::vector<uint64_t> child_hashes_a;
+        std::vector<uint64_t> child_hashes_b;
+        child_hashes_a.reserve(info.children[v].size());
+        child_hashes_b.reserve(info.children[v].size());
+        for (int c : info.children[v]) {
+            child_hashes_a.push_back(info.sub_hash_a[c]);
+            child_hashes_b.push_back(info.sub_hash_b[c]);
         }
-        info.sub_hash[v] = h;
+        std::sort(child_hashes_a.begin(), child_hashes_a.end());
+        std::sort(child_hashes_b.begin(), child_hashes_b.end());
+
+        uint64_t ha = mix64a(0xCAFEBABE12345678ULL ^ static_cast<uint64_t>(child_hashes_a.size()));
+        for (uint64_t ch : child_hashes_a) {
+            ha = mix64a(ha ^ mix64a(ch + 0x9e3779b97f4a7c15ULL));
+        }
+        uint64_t hb = mix64b(0x3141592653589793ULL ^ static_cast<uint64_t>(child_hashes_b.size()));
+        for (uint64_t ch : child_hashes_b) {
+            hb = mix64b(hb ^ mix64b(ch + 0x517cc1b727220a95ULL));
+        }
+        info.sub_hash_a[v] = ha;
+        info.sub_hash_b[v] = hb;
     }
 
     int lg = 1;
@@ -530,22 +550,56 @@ bool component_valid_in_tree(const std::vector<int>& leaves, const TreeInfo& inf
     return info.subtree_leaf_count[r] == static_cast<int>(leaves.size());
 }
 
-bool component_topology_valid_across_trees(const std::vector<int>& leaves, const std::vector<TreeInfo>& infos) {
+std::pair<bool, int> cluster_root(const TreeInfo& T, const std::vector<int>& leaves) {
+    if (leaves.empty()) return {false, -1};
+    if (leaves.size() == 1) {
+        const int node = T.leaf_to_node[leaves[0]];
+        return {node != -1, node};
+    }
+    const int r = lca_of_component(leaves, T);
+    if (r == -1) return {false, -1};
+    if (T.subtree_leaf_count[r] != static_cast<int>(leaves.size())) return {false, -1};
+    return {true, r};
+}
+
+std::pair<bool, uint64_t> component_cluster_hash_all_trees(
+    const std::vector<TreeInfo>& infos,
+    const std::vector<int>& leaves,
+    int upto_tree
+) {
+    if (leaves.size() <= 1) return {true, 0};
+    if (infos.empty()) return {true, 0};
+    const int last = std::min(upto_tree, static_cast<int>(infos.size()) - 1);
+    if (last < 0) return {true, 0};
+
+    uint64_t h = 0;
+    uint64_t h2 = 0;
+    bool h_set = false;
+    for (int t = 0; t <= last; ++t) {
+        auto [ok, r] = cluster_root(infos[t], leaves);
+        if (!ok) return {false, 0};
+        const uint64_t ht = infos[t].sub_hash_a[r];
+        const uint64_t ht2 = infos[t].sub_hash_b[r];
+        if (!h_set) {
+            h = ht;
+            h2 = ht2;
+            h_set = true;
+        } else if (ht != h || ht2 != h2) {
+            return {false, 0};
+        }
+    }
+    return {true, h};
+}
+
+bool component_topology_valid_across_trees(
+    const std::vector<int>& leaves,
+    const std::vector<TreeInfo>& infos,
+    int upto_tree
+) {
     if (leaves.size() <= 1) return true;
     if (infos.empty()) return true;
-
-    const int r0 = lca_of_component(leaves, infos[0]);
-    if (r0 == -1) return false;
-    if (infos[0].subtree_leaf_count[r0] != static_cast<int>(leaves.size())) return false;
-    const uint64_t ref_hash = infos[0].sub_hash[r0];
-
-    for (size_t ti = 1; ti < infos.size(); ++ti) {
-        const int rt = lca_of_component(leaves, infos[ti]);
-        if (rt == -1) return false;
-        if (infos[ti].subtree_leaf_count[rt] != static_cast<int>(leaves.size())) return false;
-        if (infos[ti].sub_hash[rt] != ref_hash) return false;
-    }
-    return true;
+    auto [ok, _h] = component_cluster_hash_all_trees(infos, leaves, upto_tree);
+    return ok;
 }
 
 bool isComponentValid(const TreeInfo& info, const std::vector<int>& comp_leaves) {
@@ -565,14 +619,24 @@ std::map<int, std::vector<int>> build_components(const std::vector<int>& compone
 
 bool partition_valid_across_all_trees(
     const std::vector<int>& component_of_leaf,
-    const std::vector<TreeInfo>& infos
+    const std::vector<TreeInfo>& infos,
+    int upto_tree
 ) {
     const auto components = build_components(component_of_leaf);
     for (const auto& [id, leaves] : components) {
         (void)id;
-        if (!component_topology_valid_across_trees(leaves, infos)) return false;
+        if (!component_topology_valid_across_trees(leaves, infos, upto_tree)) return false;
     }
     return true;
+}
+
+int count_components(const std::vector<int>& component_of_leaf) {
+    std::unordered_set<int> ids;
+    ids.reserve(component_of_leaf.size());
+    for (int leaf = 1; leaf < static_cast<int>(component_of_leaf.size()); ++leaf) {
+        ids.insert(component_of_leaf[leaf]);
+    }
+    return static_cast<int>(ids.size());
 }
 
 bool are_sibling_leaves_in_tree(int a, int b, const TreeInfo& info) {
@@ -742,6 +806,7 @@ void enforce_validity_for_trees(
 bool repair_all_components(
     std::vector<int>& component_of_leaf,
     const std::vector<TreeInfo>& infos,
+    int upto_tree,
     int& next_component_id
 ) {
     bool any_change = false;
@@ -753,17 +818,18 @@ bool repair_all_components(
             if (leaves.size() <= 1) continue;
 
             bool cluster_fail = false;
-            for (const auto& info : infos) {
-                if (!isComponentValid(info, leaves)) {
+            const int last = std::min(upto_tree, static_cast<int>(infos.size()) - 1);
+            for (int ti = 0; ti <= last; ++ti) {
+                if (!isComponentValid(infos[ti], leaves)) {
                     cluster_fail = true;
                     break;
                 }
             }
 
             if (cluster_fail) {
-                for (const auto& info : infos) {
-                    if (!isComponentValid(info, leaves)) {
-                        if (split_component_by_tree(component_of_leaf, leaves, info, next_component_id)) {
+                for (int ti = 0; ti <= last; ++ti) {
+                    if (!isComponentValid(infos[ti], leaves)) {
+                        if (split_component_by_tree(component_of_leaf, leaves, infos[ti], next_component_id)) {
                             changed = true;
                             any_change = true;
                         }
@@ -774,9 +840,9 @@ bool repair_all_components(
                 continue;
             }
 
-            if (!component_topology_valid_across_trees(leaves, infos)) {
+            if (!component_topology_valid_across_trees(leaves, infos, upto_tree)) {
                 bool split = false;
-                for (size_t i = 1; i < infos.size(); ++i) {
+                for (int i = 1; i <= last; ++i) {
                     if (split_component_by_two_trees(component_of_leaf, leaves, infos[0], infos[i], next_component_id)) {
                         split = true;
                         changed = true;
@@ -879,9 +945,10 @@ std::vector<std::string> build_forest_from_partition(
 
 bool validate_forest(
     const std::vector<int>& component_of_leaf,
-    const std::vector<TreeInfo>& infos
+    const std::vector<TreeInfo>& infos,
+    int upto_tree
 ) {
-    return partition_valid_across_all_trees(component_of_leaf, infos);
+    return partition_valid_across_all_trees(component_of_leaf, infos, upto_tree);
 }
 
 bool can_merge_components(
@@ -900,8 +967,45 @@ bool can_merge_components(
     return true;
 }
 
-bool canMerge(const std::vector<int>& leaves, const std::vector<TreeInfo>& all_trees) {
-    return component_topology_valid_across_trees(leaves, all_trees);
+bool canMerge(const std::vector<int>& leaves, const std::vector<TreeInfo>& all_trees, int upto_tree) {
+    return component_topology_valid_across_trees(leaves, all_trees, upto_tree);
+}
+
+bool canMerge_relaxed_cluster_only(
+    const std::vector<int>& leaves,
+    const std::vector<TreeInfo>& infos,
+    int upto_tree
+) {
+    const int last = std::min(upto_tree, static_cast<int>(infos.size()) - 1);
+    for (int ti = 0; ti <= last; ++ti) {
+        if (!component_valid_in_tree(leaves, infos[ti])) return false;
+    }
+    return true;
+}
+
+bool try_speculative_merge(
+    std::vector<int>& comp_of_leaf,
+    const std::vector<int>& union_leaves,
+    int upto_tree,
+    const std::vector<TreeInfo>& infos,
+    int& next_comp_id
+) {
+    std::vector<int> backup = comp_of_leaf;
+    const int before = count_components(backup);
+
+    const int new_id = next_comp_id++;
+    for (int leaf : union_leaves) comp_of_leaf[leaf] = new_id;
+
+    bool changed;
+    do {
+        changed = repair_all_components(comp_of_leaf, infos, upto_tree, next_comp_id);
+    } while (changed);
+
+    const int after = count_components(comp_of_leaf);
+    if (after < before && validate_forest(comp_of_leaf, infos, upto_tree)) return true;
+
+    comp_of_leaf.swap(backup);
+    return false;
 }
 
 double read_stride_timeout_seconds(double default_value) {
@@ -931,88 +1035,15 @@ std::vector<std::string> solve(const PaceInstance& instance) {
     for (const auto& t : parsed_trees) {
         infos.push_back(build_tree_info(t, n));
     }
-
-    std::vector<int> component_of_leaf(n + 1, -1);
-    int next_component_id = n + 1;
-
-    // Phase 1: Cluster extraction and greedy disjoint packing for first two trees.
-    if (m >= 2) {
-        const std::vector<Bitmask> clusters_t1 = getClusters(infos[0], n);
-        const std::vector<Bitmask> clusters_t2 = getClusters(infos[1], n);
-
-        ClusterMap cluster_map_t2;
-        for (const Bitmask& c : clusters_t2) {
-            cluster_map_t2[hashLeafSet(c)].push_back(c);
-        }
-
-        std::vector<Bitmask> compatible_clusters;
-        compatible_clusters.reserve(clusters_t1.size());
-        for (const Bitmask& c : clusters_t1) {
-            if (isClusterCompatible(c, cluster_map_t2)) {
-                compatible_clusters.push_back(c);
-            }
-        }
-
-        std::sort(compatible_clusters.begin(), compatible_clusters.end(), [](const Bitmask& a, const Bitmask& b) {
-            return bitmask_count(a) > bitmask_count(b);
-        });
-
-        Bitmask used_leaf = make_empty_bitmask(n);
-        for (const Bitmask& c : compatible_clusters) {
-            if (bitmask_intersects(c, used_leaf)) continue;
-            const std::vector<int> leaves = bitmask_to_leaves(c, n);
-            if (leaves.size() <= 1) continue;
-
-            const int cid = next_component_id++;
-            for (int leaf : leaves) component_of_leaf[leaf] = cid;
-            bitmask_or_assign(used_leaf, c);
+    std::vector<std::vector<Bitmask>> clusters_by_tree(m);
+    std::vector<ClusterMap> cluster_maps(m);
+    for (int t = 0; t < m; ++t) {
+        clusters_by_tree[t] = getClusters(infos[t], n);
+        for (const Bitmask& c : clusters_by_tree[t]) {
+            cluster_maps[t][hashLeafSet(c)].push_back(c);
         }
     }
 
-    // Leftover leaves become singletons.
-    for (int leaf = 1; leaf <= n; ++leaf) {
-        if (component_of_leaf[leaf] == -1) component_of_leaf[leaf] = next_component_id++;
-    }
-
-    std::vector<std::string> best = build_singleton_forest(n);
-    int best_size = static_cast<int>(best.size());
-
-    auto maybe_publish_better = [&]() {
-        repair_all_components(component_of_leaf, infos, next_component_id);
-        if (!validate_forest(component_of_leaf, infos)) return;
-        std::vector<std::string> candidate = build_forest_from_partition(component_of_leaf, infos[0], n);
-        const int sz = static_cast<int>(candidate.size());
-        if (sz < best_size) {
-            best = std::move(candidate);
-            best_size = sz;
-            publish_best_solution(best);
-        }
-    };
-
-    maybe_publish_better();
-
-    // Phase 2: refine forest against additional trees (and ensure first two if present).
-    if (m >= 2) {
-        enforce_validity_for_trees(component_of_leaf, infos, 1, next_component_id);
-        repair_all_components(component_of_leaf, infos, next_component_id);
-        maybe_publish_better();
-    } else {
-        enforce_validity_for_trees(component_of_leaf, infos, 0, next_component_id);
-        repair_all_components(component_of_leaf, infos, next_component_id);
-        maybe_publish_better();
-    }
-
-    for (int ti = 2; ti < m; ++ti) {
-        enforce_validity_for_trees(component_of_leaf, infos, ti, next_component_id);
-        repair_all_components(component_of_leaf, infos, next_component_id);
-        maybe_publish_better();
-    }
-
-    enforce_validity_for_trees(component_of_leaf, infos, m - 1, next_component_id);
-    repair_all_components(component_of_leaf, infos, next_component_id);
-    maybe_publish_better();
-
-    // Phase 3: targeted merge rounds over internal nodes of tree 1, randomized order.
     const auto pivot_subtree_leaves = compute_subtree_leaf_lists(infos[0]);
     std::vector<int> pivot_internal_nodes;
     pivot_internal_nodes.reserve(infos[0].node_count);
@@ -1023,62 +1054,133 @@ std::vector<std::string> solve(const PaceInstance& instance) {
     const auto start = std::chrono::steady_clock::now();
     const double soft_timeout = read_stride_timeout_seconds(30.0);
     const auto deadline = start + std::chrono::milliseconds(static_cast<long long>(soft_timeout * 850.0));
-    std::mt19937 rng(static_cast<uint32_t>(start.time_since_epoch().count()));
 
-    const int max_rounds = 10;
-    for (int round = 0; round < max_rounds && std::chrono::steady_clock::now() < deadline; ++round) {
-        std::shuffle(pivot_internal_nodes.begin(), pivot_internal_nodes.end(), rng);
-        bool improved_round = false;
+    auto run_one_attempt = [&](uint64_t seed) -> std::vector<int> {
+        std::mt19937_64 rng(seed);
+        std::vector<int> component_of_leaf(n + 1, -1);
+        int next_component_id = n + 1;
+        const int upto_tree = m - 1;
 
-        for (int u : pivot_internal_nodes) {
-            if (std::chrono::steady_clock::now() >= deadline) break;
-
-            const std::vector<int>& leaves_u = pivot_subtree_leaves[u];
-            if (leaves_u.size() <= 1) continue;
-
-            std::unordered_set<int> comp_ids_set;
-            comp_ids_set.reserve(leaves_u.size());
-            for (int leaf : leaves_u) comp_ids_set.insert(component_of_leaf[leaf]);
-            if (comp_ids_set.size() <= 1) continue;
-
-            const auto components = build_components(component_of_leaf);
-            std::vector<int> union_leaves;
-            for (int cid : comp_ids_set) {
-                auto it = components.find(cid);
-                if (it == components.end()) continue;
-                union_leaves.insert(union_leaves.end(), it->second.begin(), it->second.end());
+        // Phase 1: support-weighted compatible cluster packing.
+        if (m >= 2) {
+            std::vector<Bitmask> compatible_clusters;
+            compatible_clusters.reserve(clusters_by_tree[0].size());
+            for (const Bitmask& c : clusters_by_tree[0]) {
+                if (isClusterCompatible(c, cluster_maps[1])) compatible_clusters.push_back(c);
             }
-            std::sort(union_leaves.begin(), union_leaves.end());
-            union_leaves.erase(std::unique(union_leaves.begin(), union_leaves.end()), union_leaves.end());
 
-            if (!canMerge(union_leaves, infos)) continue;
+            std::shuffle(compatible_clusters.begin(), compatible_clusters.end(), rng);
+            auto cluster_score = [&](const Bitmask& c) -> long long {
+                int support = 0;
+                for (int t = 0; t < m; ++t) {
+                    if (isClusterCompatible(c, cluster_maps[t])) ++support;
+                }
+                return (static_cast<long long>(support) << 20) + bitmask_count(c);
+            };
+            std::sort(compatible_clusters.begin(), compatible_clusters.end(), [&](const Bitmask& a, const Bitmask& b) {
+                const long long sa = cluster_score(a);
+                const long long sb = cluster_score(b);
+                if (sa != sb) return sa > sb;
+                return bitmask_count(a) > bitmask_count(b);
+            });
 
-            const int merged_id = next_component_id++;
-            for (int leaf : union_leaves) component_of_leaf[leaf] = merged_id;
-            improved_round = true;
+            Bitmask used_leaf = make_empty_bitmask(n);
+            for (const Bitmask& c : compatible_clusters) {
+                if (bitmask_intersects(c, used_leaf)) continue;
+                std::vector<int> leaves = bitmask_to_leaves(c, n);
+                if (leaves.size() <= 1) continue;
+                const int cid = next_component_id++;
+                for (int leaf : leaves) component_of_leaf[leaf] = cid;
+                bitmask_or_assign(used_leaf, c);
+            }
         }
 
-        repair_all_components(component_of_leaf, infos, next_component_id);
-        maybe_publish_better();
-        if (!improved_round) break;
+        for (int leaf = 1; leaf <= n; ++leaf) {
+            if (component_of_leaf[leaf] == -1) component_of_leaf[leaf] = next_component_id++;
+        }
+
+        // Phase 2: incremental refinement.
+        if (m >= 2) {
+            enforce_validity_for_trees(component_of_leaf, infos, 1, next_component_id);
+            while (repair_all_components(component_of_leaf, infos, 1, next_component_id)) {}
+        } else {
+            enforce_validity_for_trees(component_of_leaf, infos, 0, next_component_id);
+            while (repair_all_components(component_of_leaf, infos, 0, next_component_id)) {}
+        }
+        for (int ti = 2; ti < m; ++ti) {
+            enforce_validity_for_trees(component_of_leaf, infos, ti, next_component_id);
+            while (repair_all_components(component_of_leaf, infos, ti, next_component_id)) {}
+        }
+        while (repair_all_components(component_of_leaf, infos, upto_tree, next_component_id)) {}
+
+        // Phase 3: targeted merge with speculative merge + repair.
+        std::vector<int> node_order = pivot_internal_nodes;
+        const int max_rounds = 10;
+        for (int round = 0; round < max_rounds && std::chrono::steady_clock::now() < deadline; ++round) {
+            std::shuffle(node_order.begin(), node_order.end(), rng);
+            bool improved_round = false;
+
+            for (int u : node_order) {
+                if (std::chrono::steady_clock::now() >= deadline) break;
+                const std::vector<int>& leaves_u = pivot_subtree_leaves[u];
+                if (leaves_u.size() <= 1) continue;
+
+                std::unordered_set<int> comp_ids_set;
+                comp_ids_set.reserve(leaves_u.size());
+                for (int leaf : leaves_u) comp_ids_set.insert(component_of_leaf[leaf]);
+                if (comp_ids_set.size() <= 1) continue;
+
+                const auto components = build_components(component_of_leaf);
+                std::vector<int> union_leaves;
+                for (int cid : comp_ids_set) {
+                    auto it = components.find(cid);
+                    if (it != components.end()) {
+                        union_leaves.insert(union_leaves.end(), it->second.begin(), it->second.end());
+                    }
+                }
+                std::sort(union_leaves.begin(), union_leaves.end());
+                union_leaves.erase(std::unique(union_leaves.begin(), union_leaves.end()), union_leaves.end());
+                if (union_leaves.size() <= 1) continue;
+
+                if (!canMerge_relaxed_cluster_only(union_leaves, infos, upto_tree)) continue;
+                if (try_speculative_merge(component_of_leaf, union_leaves, upto_tree, infos, next_component_id)) {
+                    improved_round = true;
+                }
+            }
+
+            if (!improved_round) break;
+        }
+
+        while (repair_all_components(component_of_leaf, infos, upto_tree, next_component_id)) {}
+        if (!validate_forest(component_of_leaf, infos, upto_tree)) {
+            std::vector<int> singleton(n + 1, 0);
+            for (int leaf = 1; leaf <= n; ++leaf) singleton[leaf] = leaf;
+            return singleton;
+        }
+        return component_of_leaf;
+    };
+
+    std::vector<int> best_comp(n + 1, 0);
+    for (int leaf = 1; leaf <= n; ++leaf) best_comp[leaf] = leaf;
+    int best_k = n;
+    std::vector<std::string> best_forest = build_singleton_forest(n);
+
+    const int attempts = (n <= 1500 ? 5 : (n <= 4000 ? 2 : 1));
+    uint64_t base_seed = static_cast<uint64_t>(start.time_since_epoch().count());
+    for (int a = 0; a < attempts && std::chrono::steady_clock::now() < deadline; ++a) {
+        const uint64_t seed = base_seed + static_cast<uint64_t>(a) * 0x9e3779b97f4a7c15ULL;
+        std::vector<int> comp = run_one_attempt(seed);
+        const int k = count_components(comp);
+        if (k < best_k) {
+            best_k = k;
+            best_comp = std::move(comp);
+            best_forest = build_forest_from_partition(best_comp, infos[0], n);
+            publish_best_solution(best_forest);  // publish only strict improvements
+        }
     }
-    while (repair_all_components(component_of_leaf, infos, next_component_id)) {}
-    if (validate_forest(component_of_leaf, infos)) {
-        std::vector<std::string> final_forest = build_forest_from_partition(component_of_leaf, infos[0], n);
-        if (static_cast<int>(final_forest.size()) <= best_size) {
-            best = std::move(final_forest);
-            best_size = static_cast<int>(best.size());
-            publish_best_solution(best);
-        }
-    } else if (!validate_forest(component_of_leaf, infos)) {
-        // Keep last known valid published solution; fallback to singleton if best was never improved.
-        if (best.empty()) {
-            best = build_singleton_forest(n);
-            publish_best_solution(best);
-        }
-    }
 
-    return best;
+    if (best_k >= n) return build_singleton_forest(n);
+    return best_forest;
 }
 
 }  // namespace
