@@ -1,23 +1,35 @@
-11-02-2026 14:45:
+11-02-2026 14:45 (all_2trees.lst):
 Valid:   3477 | Empty:         0 | Infeas:      0 | Timeout:      0 | SyntErr:      0 | SolvErr:       0 | SystemErr:       0 | Running: 0
 Best:       0 | New Best:      0 | Subopt:   3477 | Heuristic Score: 1814.00000 | Transmit Queue:      0 | NoResponse:      0 | STRIDE Instances:   3477
 ⠙ Postprocessing ... this may take a few seconds                                                                       
 Valid:   3477 | Empty:         0 | Infeas:      0 | Timeout:      0 | SyntErr:      0 | SolvErr:       0 | SystemErr:       0 | Running: 0
 
-11-02-2026 15:12:
+11-02-2026 15:12 (all_2trees.lst):
 Valid:   3477 | Empty:         0 | Infeas:      0 | Timeout:      0 | SyntErr:      0 | SolvErr:       0 | SystemErr:       0 | Running: 0
 Best:      21 | New Best:      0 | Subopt:   3456 | Heuristic Score: 1337.99902 | Transmit Queue:      0 | NoResponse:      0 | STRIDE Instances:   3477
 ⠴ Postprocessing ... this may take a few seconds
 Valid:   3477 | Empty:         0 | Infeas:      0 | Timeout:      0 | SyntErr:      0 | SolvErr:       0 | SystemErr:       0 | Running: 0
 
-11-02-26 22:27:
+11-02-26 22:27 (all_2trees.lst):
 Valid:   3477 | Empty:         0 | Infeas:      0 | Timeout:      0 | SyntErr:      0 | SolvErr:       0 | SystemErr:       0 | Running: 0
 Best:      25 | New Best:      0 | Subopt:   3452 | Heuristic Score: 1336.22955 | Transmit Queue:      0 | NoResponse:      0 | STRIDE Instances:   3477
 ⠈ Postprocessing ... this may take a few seconds
 Valid:   3477 | Empty:         0 | Infeas:      0 | Timeout:      0 | SyntErr:      0 | SolvErr:       0 | SystemErr:       0 | Running: 0
 
-11-02-26 23:40:
+11-02-26 23:40 (all_2trees.lst):
 Valid:   3477 | Empty:         0 | Infeas:      0 | Timeout:      0 | SyntErr:      0 | SolvErr:       0 | SystemErr:       0 | Running: 0
 Best:      25 | New Best:      0 | Subopt:   3452 | Heuristic Score: 1335.79144 | Transmit Queue:      0 | NoResponse:      0 | STRIDE Instances:   3477
 ⠄ Postprocessing ... this may take a few seconds
 Valid:   3477 | Empty:         0 | Infeas:      0 | Timeout:      0 | SyntErr:      0 | SolvErr:       0 | SystemErr:       0 | Running: 0
+
+28-02-26 19:30 (pace26_heuristic_pub.lst):
+Valid:    100 | Empty:         0 | Infeas:      0 | Timeout:      0 | SyntErr:      0 | SolvErr:       0 | SystemErr:       0 | Running: 0
+Best:       2 | New Best:      2 | Subopt:     98 | Heuristic Score:    6.42377 | Transmit Queue:      0 | NoResponse:      0 | STRIDE Instances:    100
+⠲ Postprocessing ... this may take a few seconds
+Valid:    100 | Empty:         0 | Infeas:      0 | Timeout:      0 | SyntErr:      0 | SolvErr:       0 | SystemErr:       0 | Running: 0
+
+02-03-26 (pace26_heuristic_pub.lst):
+Valid:    100 | Empty:         0 | Infeas:      0 | Timeout:      0 | SyntErr:      0 | SolvErr:       0 | SystemErr:       0 | Running: 0
+Best:       0 | New Best:      0 | Subopt:    100 | Heuristic Score:    8.71904 | Transmit Queue:      0 | NoResponse:      0 | STRIDE Instances:    100
+⠒ Postprocessing ... this may take a few seconds
+Valid:    100 | Empty:         0 | Infeas:      0 | Timeout:      0 | SyntErr:      0 | SolvErr:       0 | SystemErr:       0 | Running: 0
