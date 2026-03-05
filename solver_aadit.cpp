@@ -648,6 +648,25 @@ std::vector<std::pair<int, int>> cherries_by_label(const DynamicTree& t) {
     return out;
 }
 
+bool contract_all_common_cherries(DynamicTree& t1, DynamicTree& t2, int& next_label) {
+    bool any = false;
+    while (true) {
+        auto cherries = cherries_by_label(t1);
+        bool contracted = false;
+        for (auto [a, b] : cherries) {
+            if (!are_siblings_by_label(t1, a, b) || !are_siblings_by_label(t2, a, b)) continue;
+            int nl = next_label++;
+            if (contract_cherry(t1, a, b, nl) && contract_cherry(t2, a, b, nl)) {
+                contracted = true;
+                any = true;
+                break; // restart scan; cherry set changed
+            }
+        }
+        if (!contracted) break;
+    }
+    return any;
+}
+
 int root_of(const DynamicTree& t, int u) {
     int x = u;
     while (x != -1 && t.nodes[x].active && t.nodes[x].parent != -1) x = t.nodes[x].parent;
@@ -739,6 +758,9 @@ ThreeApproxResult run_three_approx(
     int next_label = n + 1;
     uint64_t rng = seed ^ 0x9e3779b97f4a7c15ULL;
     bool timed_out_or_terminated = false;
+
+    // Common-subtree precontraction (light): exhaust common cherries before branching.
+    contract_all_common_cherries(t1, f, next_label);
 
     while (!g_terminate && Clock::now() < deadline && active_leaf_count(t1) > 2) {
         // --- Step 1: remove singleton leaves in F that are roots ---
