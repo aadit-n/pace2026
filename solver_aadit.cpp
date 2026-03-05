@@ -297,6 +297,19 @@ uint64_t mix64(uint64_t x) {
     return x ^ (x >> 31);
 }
 
+uint64_t instance_seed(const PaceInstance& inst) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    h ^= static_cast<uint64_t>(inst.leaf_count) + 0x9e3779b97f4a7c15ULL;
+    for (const auto& s : inst.newick_lines) {
+        for (unsigned char c : s) {
+            h ^= static_cast<uint64_t>(c);
+            h *= 0x100000001b3ULL;
+        }
+        h = mix64(h);
+    }
+    return h;
+}
+
 bool build_tree_data(const SimpleTree& st, int n, const std::vector<uint64_t>& zob, TreeData& td) {
     td.n_nodes = static_cast<int>(st.children.size());
     td.root = st.root;
@@ -702,13 +715,21 @@ void collect_component_leaves(const DynamicTree& t, int u, std::vector<int>& out
     if (t.nodes[u].right != -1) collect_component_leaves(t, t.nodes[u].right, out);
 }
 
-std::vector<std::vector<int>> run_three_approx(
+struct ThreeApproxResult {
+    std::vector<std::vector<int>> comps;
+    bool complete = false;
+};
+
+ThreeApproxResult run_three_approx(
     DynamicTree t1,
     DynamicTree f,
     Clock::time_point deadline,
-    int n
+    int n,
+    uint64_t seed
 ) {
     int next_label = n + 1;
+    uint64_t rng = seed ^ 0x9e3779b97f4a7c15ULL;
+    bool timed_out_or_terminated = false;
 
     while (!g_terminate && Clock::now() < deadline && active_leaf_count(t1) > 2) {
         // --- Step 1: remove singleton leaves in F that are roots ---
@@ -729,7 +750,10 @@ std::vector<std::vector<int>> run_three_approx(
         if (cherries.empty()) break;
 
         bool did_common_contract = false;
-        for (auto [a, b] : cherries) {
+        rng = mix64(rng + 0x9e3779b97f4a7c15ULL);
+        size_t start_idx = cherries.empty() ? 0 : static_cast<size_t>(rng % cherries.size());
+        for (size_t step = 0; step < cherries.size(); ++step) {
+            auto [a, b] = cherries[(start_idx + step) % cherries.size()];
             if (are_siblings_by_label(f, a, b)) {
                 int nl = next_label++;
                 if (contract_cherry(t1, a, b, nl) && contract_cherry(f, a, b, nl)) {
@@ -740,7 +764,8 @@ std::vector<std::vector<int>> run_three_approx(
         }
         if (did_common_contract) continue;
 
-        auto [a, b] = cherries[0];
+        rng = mix64(rng + 0x517cc1b727220a95ULL);
+        auto [a, b] = cherries[static_cast<size_t>(rng % cherries.size())];
         auto ia = f.label_to_node.find(a);
         auto ib = f.label_to_node.find(b);
         if (ia == f.label_to_node.end() || ib == f.label_to_node.end()) break;
@@ -768,8 +793,11 @@ std::vector<std::vector<int>> run_three_approx(
             for (int c : pendants) cut_edge_above(f, c);
         }
     }
+    if (g_terminate || Clock::now() >= deadline) {
+        timed_out_or_terminated = true;
+    }
 
-    std::vector<std::vector<int>> comps;
+    ThreeApproxResult res;
     for (int u = 0; u < static_cast<int>(f.nodes.size()); ++u) {
         if (!f.nodes[u].active || f.nodes[u].parent != -1) continue;
         std::vector<int> leaves;
@@ -777,9 +805,12 @@ std::vector<std::vector<int>> run_three_approx(
         collect_component_leaves(f, u, leaves);
         std::sort(leaves.begin(), leaves.end());
         leaves.erase(std::unique(leaves.begin(), leaves.end()), leaves.end());
-        if (!leaves.empty()) comps.push_back(std::move(leaves));
+        if (!leaves.empty()) res.comps.push_back(std::move(leaves));
     }
-    return comps;
+    // Only suppress publication for runs interrupted by timeout/signal.
+    // Natural algorithmic termination paths remain publishable.
+    res.complete = !timed_out_or_terminated;
+    return res;
 }
 
 std::vector<std::string> solve(const PaceInstance& inst) {
@@ -806,30 +837,39 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     }
 
     const auto start = Clock::now();
-    double timeout_sec = 30.0;
+    double timeout_sec = 295.0;
     if (const char* env = std::getenv("STRIDE_TIMEOUT")) {
         char* end = nullptr;
         double v = std::strtod(env, &end);
-        if (end != env && v > 0.0) timeout_sec = v;
+        if (end != env && v > 0.0) {
+            timeout_sec = (v > 1000.0 ? (v / 1000.0) : v);
+        }
     }
-    auto soft_deadline = start + std::chrono::milliseconds(static_cast<long long>(timeout_sec * 1000.0) - 50);
+    auto soft_deadline = start + std::chrono::milliseconds(
+        std::max<long long>(1, static_cast<long long>(timeout_sec * 1000.0) - 200)
+    );
 
     auto best_out = singleton_forest(n);
     publish_best_solution(best_out);
 
-    DynamicTree dt1 = build_dynamic_tree(parsed[0]);
-    DynamicTree dt2 = build_dynamic_tree(parsed[1]);
+    DynamicTree dt1_base = build_dynamic_tree(parsed[0]);
+    DynamicTree dt2_base = build_dynamic_tree(parsed[1]);
 
-    auto comps = run_three_approx(std::move(dt1), std::move(dt2), soft_deadline, n);
-    if (comps.empty()) return best_out;
-
-    // SAFETY VALIDATION REMOVED – it was too strict and rejected valid forests.
-    // We trust the algorithm to produce a valid agreement forest.
-
-    auto out = forest_from_partition(comps, n, trees[0]);
-    if (out.empty()) return best_out;
-    if (static_cast<int>(out.size()) < n) {
-        best_out = out;
+    uint64_t base_seed = instance_seed(inst);
+    uint64_t iter = 0;
+    while (!g_terminate && Clock::now() < soft_deadline) {
+        uint64_t seed = mix64(base_seed ^ iter);
+        auto res = run_three_approx(dt1_base, dt2_base, soft_deadline, n, seed);
+        if (!res.complete || res.comps.empty()) {
+            ++iter;
+            continue;
+        }
+        auto out = forest_from_partition(res.comps, n, trees[0]);
+        if (!out.empty() && static_cast<int>(out.size()) < static_cast<int>(best_out.size())) {
+            best_out = out;
+            publish_best_solution(best_out);
+        }
+        ++iter;
     }
     return best_out;
 }
