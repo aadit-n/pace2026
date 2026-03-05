@@ -698,6 +698,15 @@ std::vector<int> pendant_children_on_path(const DynamicTree& t, const std::vecto
     return out;
 }
 
+int count_common_cherries(const DynamicTree& t1, const DynamicTree& f) {
+    auto cherries = cherries_by_label(t1);
+    int cnt = 0;
+    for (auto [a, b] : cherries) {
+        if (are_siblings_by_label(f, a, b)) ++cnt;
+    }
+    return cnt;
+}
+
 int active_leaf_count(const DynamicTree& t) {
     int c = 0;
     for (const auto& n : t.nodes) if (n.active && n.left == -1 && n.right == -1) ++c;
@@ -778,8 +787,23 @@ ThreeApproxResult run_three_approx(
         if (ra == -1 || rb == -1) break;
 
         if (ra != rb) {
-            cut_edge_above(f, na);
-            cut_edge_above(f, nb);
+            // One-cut trial in separated-components case:
+            // try cutting a-only vs b-only and keep the branch with better immediate cherry potential.
+            DynamicTree fa = f;
+            DynamicTree fb = f;
+            cut_edge_above(fa, na);
+            cut_edge_above(fb, nb);
+            int ma = count_common_cherries(t1, fa);
+            int mb = count_common_cherries(t1, fb);
+            if (ma > mb) {
+                f = std::move(fa);
+            } else if (mb > ma) {
+                f = std::move(fb);
+            } else {
+                rng = mix64(rng + 0x94d049bb133111ebULL);
+                if ((rng & 1ULL) == 0ULL) f = std::move(fa);
+                else f = std::move(fb);
+            }
             continue;
         }
 
