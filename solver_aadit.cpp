@@ -1,7 +1,6 @@
 #include "genesis/genesis.hpp"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -499,85 +498,6 @@ std::vector<std::string> forest_from_partition(
     return out;
 }
 
-std::vector<std::vector<int>> local_search_merge(
-    std::vector<std::vector<int>> comps,
-    const std::vector<uint64_t>& zob,
-    const std::vector<TreeData>& trees,
-    uint64_t seed,
-    Clock::time_point deadline
-) {
-    if (comps.size() < 2) return comps;
-    for (auto& c : comps) std::sort(c.begin(), c.end());
-
-    uint64_t rng = seed ^ 0xd6e8feb86659fd93ULL;
-    const int max_moves = 24;
-    int moves = 0;
-
-    while (!g_terminate && Clock::now() < deadline && moves < max_moves && comps.size() >= 2) {
-        size_t m = comps.size();
-        rng = mix64(rng + 0x9e3779b97f4a7c15ULL);
-        size_t i = static_cast<size_t>(rng % m);
-        rng = mix64(rng + 0xbf58476d1ce4e5b9ULL);
-        size_t j = static_cast<size_t>(rng % (m - 1));
-        if (j >= i) ++j;
-
-        // Skip very large unions to keep local search cheap.
-        if (comps[i].size() + comps[j].size() > 4096) {
-            ++moves;
-            continue;
-        }
-
-        std::vector<int> uni;
-        uni.reserve(comps[i].size() + comps[j].size());
-        std::set_union(
-            comps[i].begin(), comps[i].end(),
-            comps[j].begin(), comps[j].end(),
-            std::back_inserter(uni)
-        );
-        if (component_valid_both_trees(uni, zob, trees)) {
-            comps[i] = std::move(uni);
-            comps.erase(comps.begin() + static_cast<long long>(j));
-            continue;
-        }
-
-        // Occasionally try a small 3-way merge.
-        if ((moves % 6) == 0 && comps.size() >= 3) {
-            m = comps.size();
-            rng = mix64(rng + 0x94d049bb133111ebULL);
-            size_t k = static_cast<size_t>(rng % (m - 2));
-            size_t a = std::min(i, j), b = std::max(i, j);
-            if (k >= a) ++k;
-            if (k >= b) ++k;
-
-            if (comps[i].size() + comps[j].size() + comps[k].size() <= 4096) {
-                std::vector<int> u12;
-                u12.reserve(comps[i].size() + comps[j].size());
-                std::set_union(
-                    comps[i].begin(), comps[i].end(),
-                    comps[j].begin(), comps[j].end(),
-                    std::back_inserter(u12)
-                );
-                std::vector<int> u123;
-                u123.reserve(u12.size() + comps[k].size());
-                std::set_union(
-                    u12.begin(), u12.end(),
-                    comps[k].begin(), comps[k].end(),
-                    std::back_inserter(u123)
-                );
-                if (component_valid_both_trees(u123, zob, trees)) {
-                    comps[i] = std::move(u123);
-                    std::array<size_t, 2> rem = {std::max(j, k), std::min(j, k)};
-                    comps.erase(comps.begin() + static_cast<long long>(rem[0]));
-                    comps.erase(comps.begin() + static_cast<long long>(rem[1]));
-                    continue;
-                }
-            }
-        }
-        ++moves;
-    }
-    return comps;
-}
-
 DynamicTree build_dynamic_tree(const SimpleTree& st) {
     DynamicTree dt;
     dt.nodes.resize(st.children.size());
@@ -990,8 +910,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
             ++iter;
             continue;
         }
-        auto improved = local_search_merge(std::move(res.comps), zob, trees, seed, soft_deadline);
-        auto out = forest_from_partition(improved, n, trees[0]);
+        auto out = forest_from_partition(res.comps, n, trees[0]);
         if (!out.empty() && static_cast<int>(out.size()) < static_cast<int>(best_out.size())) {
             best_out = out;
             publish_best_solution(best_out);
