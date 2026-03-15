@@ -1341,21 +1341,29 @@ std::vector<int> choose_cut_plan(
         plans.push_back({cand.na});
         plans.push_back({cand.nb});
     } else {
-        for (int u : cand.pendants) plans.push_back({u});
+        auto f_mass = compute_active_leaf_masses(f);
+        std::vector<int> sorted = cand.pendants;
+        std::sort(sorted.begin(), sorted.end(), [&](int x, int y) {
+            return f_mass[x] < f_mass[y];
+        });
+
+        // On harder same-component conflicts, scoring every pendant cut is
+        // expensive and tends to hurt completed-run count more than it helps.
+        size_t individual_limit = std::min<size_t>(4, sorted.size());
+        for (size_t i = 0; i < individual_limit; ++i) {
+            plans.push_back({sorted[i]});
+        }
         plans.push_back({cand.na});
         plans.push_back({cand.nb});
         if (cand.pendants.size() > 1) {
-            auto f_mass = compute_active_leaf_masses(f);
-            std::vector<int> sorted = cand.pendants;
-            std::sort(sorted.begin(), sorted.end(), [&](int x, int y) {
-                return f_mass[x] < f_mass[y];
-            });
             std::vector<int> bundle;
             for (size_t i = 0; i < (sorted.size() + 1) / 2; ++i) bundle.push_back(sorted[i]);
             plans.push_back(std::move(bundle));
-            std::vector<int> classic{cand.na, cand.nb};
-            classic.insert(classic.end(), cand.pendants.begin(), cand.pendants.end());
-            plans.push_back(std::move(classic));
+            if (cand.pendants.size() <= 6) {
+                std::vector<int> classic{cand.na, cand.nb};
+                classic.insert(classic.end(), cand.pendants.begin(), cand.pendants.end());
+                plans.push_back(std::move(classic));
+            }
         }
     }
     if (plans.empty()) return {};
