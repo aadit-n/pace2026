@@ -1,7 +1,6 @@
 #include "genesis/genesis.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -11,8 +10,6 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
-#include <map>
-#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -105,37 +102,6 @@ struct DynamicTree {
     std::vector<char> is_cherry;
     std::vector<int> cherry_pos;
     std::vector<int> cherry_nodes;
-};
-
-struct ReducedSubtreeSig {
-    uint64_t leafset_hash = 0;
-    int leaf_count = 0;
-    uint64_t topo_a = 0;
-    uint64_t topo_b = 0;
-};
-
-struct ReducedSubtreeKey {
-    uint64_t leafset_hash = 0;
-    int leaf_count = 0;
-    uint64_t topo_a = 0;
-    uint64_t topo_b = 0;
-
-    bool operator==(const ReducedSubtreeKey& o) const {
-        return leafset_hash == o.leafset_hash &&
-               leaf_count == o.leaf_count &&
-               topo_a == o.topo_a &&
-               topo_b == o.topo_b;
-    }
-};
-
-struct ReducedSubtreeKeyHasher {
-    size_t operator()(const ReducedSubtreeKey& s) const {
-        uint64_t x = s.leafset_hash;
-        x ^= mix64(static_cast<uint64_t>(s.leaf_count) + 0x9e3779b97f4a7c15ULL);
-        x ^= mix64(s.topo_a + 0x517cc1b727220a95ULL);
-        x ^= mix64(s.topo_b + 0x94d049bb133111ebULL);
-        return static_cast<size_t>(mix64(x));
-    }
 };
 
 volatile sig_atomic_t g_terminate = 0;
@@ -957,8 +923,10 @@ void collect_active_postorder(const DynamicTree& t, std::vector<int>& order) {
     st.reserve(t.nodes.size());
     st.push_back({t.root, 0});
     while (!st.empty()) {
-        auto [u, phase] = st.back();
+        const auto node_phase = st.back();
         st.pop_back();
+        int u = node_phase.first;
+        int phase = node_phase.second;
         if (u == -1 || !t.nodes[u].active) continue;
         if (phase == 1) {
             order.push_back(u);
@@ -985,190 +953,6 @@ std::vector<int> compute_active_leaf_masses(const DynamicTree& t) {
         }
     }
     return mass;
-}
-
-void compute_active_subtree_signatures(
-    const DynamicTree& t,
-    std::vector<ReducedSubtreeSig>& sigs
-) {
-    sigs.assign(t.nodes.size(), ReducedSubtreeSig{});
-    std::vector<int> order;
-    collect_active_postorder(t, order);
-    for (int u : order) {
-        if (is_leaflike(t, u)) {
-            sigs[u].leafset_hash = t.nodes[u].leafset_hash;
-            sigs[u].leaf_count = t.nodes[u].payload_size;
-            sigs[u].topo_a = t.nodes[u].topo_a;
-            sigs[u].topo_b = t.nodes[u].topo_b;
-        } else {
-            int l = t.nodes[u].left;
-            int r = t.nodes[u].right;
-            if (l == -1 || r == -1 || !t.nodes[l].active || !t.nodes[r].active) continue;
-            sigs[u].leaf_count = sigs[l].leaf_count + sigs[r].leaf_count;
-            sigs[u].leafset_hash = sigs[l].leafset_hash ^ sigs[r].leafset_hash;
-            uint64_t aa = sigs[l].topo_a, ab = sigs[r].topo_a;
-            uint64_t ba = sigs[l].topo_b, bb = sigs[r].topo_b;
-            if (aa > ab) std::swap(aa, ab);
-            if (ba > bb) std::swap(ba, bb);
-            sigs[u].topo_a = mix64(aa ^ (ab + 0x9e3779b97f4a7c15ULL));
-            sigs[u].topo_b = mix64(ba ^ (bb + 0x517cc1b727220a95ULL));
-        }
-    }
-}
-
-void mark_active_subtree(const DynamicTree& t, int u, std::vector<char>& blocked) {
-    if (u == -1 || !t.nodes[u].active || blocked[u]) return;
-    std::vector<int> st{u};
-    while (!st.empty()) {
-        int x = st.back();
-        st.pop_back();
-        if (x == -1 || !t.nodes[x].active || blocked[x]) continue;
-        blocked[x] = 1;
-        if (t.nodes[x].left != -1) st.push_back(t.nodes[x].left);
-        if (t.nodes[x].right != -1) st.push_back(t.nodes[x].right);
-    }
-}
-
-void deactivate_active_subtree(DynamicTree& t, int u) {
-    if (u == -1 || !t.nodes[u].active) return;
-    std::vector<int> st{u};
-    while (!st.empty()) {
-        int x = st.back();
-        st.pop_back();
-        if (x == -1 || !t.nodes[x].active) continue;
-        remove_cherry_node(t, x);
-        if (is_leaflike(t, x)) t.label_to_node.erase(t.nodes[x].label);
-        int l = t.nodes[x].left;
-        int r = t.nodes[x].right;
-        t.nodes[x].active = false;
-        t.nodes[x].parent = -1;
-        if (l != -1) st.push_back(l);
-        if (r != -1) st.push_back(r);
-    }
-}
-
-bool contract_active_subtree_root(
-    DynamicTree& t,
-    int u,
-    int new_label,
-    const ReducedSubtreeSig& sig
-) {
-    if (u == -1 || !t.nodes[u].active) return false;
-
-    std::vector<int> leaves;
-    leaves.reserve(sig.leaf_count);
-    collect_component_leaves(t, u, leaves);
-    std::sort(leaves.begin(), leaves.end());
-    leaves.erase(std::unique(leaves.begin(), leaves.end()), leaves.end());
-    if (leaves.empty()) return false;
-
-    int p = t.nodes[u].parent;
-    int nid = static_cast<int>(t.nodes.size());
-    t.nodes.push_back(DynNode{});
-    ensure_cherry_storage(t);
-
-    DynNode& nn = t.nodes[nid];
-    nn.parent = p;
-    nn.left = -1;
-    nn.right = -1;
-    nn.label = new_label;
-    nn.active = true;
-    nn.comp_left = u;
-    nn.comp_right = -1;
-    nn.merged_original = std::move(leaves);
-    nn.leafset_hash = sig.leafset_hash;
-    nn.payload_size = sig.leaf_count;
-    nn.topo_a = sig.topo_a;
-    nn.topo_b = sig.topo_b;
-
-    if (p == -1) {
-        t.root = nid;
-    } else {
-        replace_child(t, p, u, nid);
-    }
-
-    deactivate_active_subtree(t, u);
-    t.label_to_node[new_label] = nid;
-    t.cherry_pos[nid] = -1;
-    t.is_cherry[nid] = 0;
-    refresh_cherry_neighborhood(t, nid);
-    if (p != -1) refresh_cherry_neighborhood(t, p);
-    return true;
-}
-
-bool contract_all_common_pendant_subtrees(
-    DynamicTree& t1,
-    DynamicTree& t2,
-    int& next_label,
-    const std::vector<uint64_t>& zob,
-    const std::vector<TreeData>& trees
-) {
-    std::vector<ReducedSubtreeSig> sig1, sig2;
-    compute_active_subtree_signatures(t1, sig1);
-    compute_active_subtree_signatures(t2, sig2);
-
-    std::unordered_map<ReducedSubtreeKey, int, ReducedSubtreeKeyHasher> map1;
-    std::unordered_map<ReducedSubtreeKey, int, ReducedSubtreeKeyHasher> map2;
-    for (int u = 0; u < static_cast<int>(t1.nodes.size()); ++u) {
-        if (!t1.nodes[u].active || is_leaflike(t1, u) || sig1[u].leaf_count < 2) continue;
-        map1[ReducedSubtreeKey{sig1[u].leafset_hash, sig1[u].leaf_count, sig1[u].topo_a, sig1[u].topo_b}] = u;
-    }
-    for (int u = 0; u < static_cast<int>(t2.nodes.size()); ++u) {
-        if (!t2.nodes[u].active || is_leaflike(t2, u) || sig2[u].leaf_count < 2) continue;
-        map2[ReducedSubtreeKey{sig2[u].leafset_hash, sig2[u].leaf_count, sig2[u].topo_a, sig2[u].topo_b}] = u;
-    }
-
-    struct Match { int u1; int u2; ReducedSubtreeSig sig; };
-    std::vector<Match> matches;
-    matches.reserve(std::min(map1.size(), map2.size()));
-    for (const auto& [key, u1] : map1) {
-        auto it = map2.find(key);
-        if (it == map2.end()) continue;
-        matches.push_back(Match{u1, it->second, sig1[u1]});
-    }
-    std::sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) {
-        return a.sig.leaf_count > b.sig.leaf_count;
-    });
-
-    std::vector<char> blocked1(t1.nodes.size(), 0), blocked2(t2.nodes.size(), 0);
-    bool any = false;
-    for (const auto& m : matches) {
-        if (blocked1[m.u1] || blocked2[m.u2]) continue;
-        std::vector<int> leaves;
-        leaves.reserve(m.sig.leaf_count);
-        collect_component_leaves(t1, m.u1, leaves);
-        std::sort(leaves.begin(), leaves.end());
-        leaves.erase(std::unique(leaves.begin(), leaves.end()), leaves.end());
-        if (static_cast<int>(leaves.size()) != m.sig.leaf_count) continue;
-        if (!component_valid_both_trees(leaves, zob, trees)) continue;
-
-        int nl = next_label++;
-        mark_active_subtree(t1, m.u1, blocked1);
-        mark_active_subtree(t2, m.u2, blocked2);
-        if (contract_active_subtree_root(t1, m.u1, nl, m.sig) &&
-            contract_active_subtree_root(t2, m.u2, nl, m.sig)) {
-            any = true;
-        }
-    }
-    return any;
-}
-
-bool exhaust_common_reductions(
-    DynamicTree& t1,
-    DynamicTree& t2,
-    int& next_label,
-    const std::vector<uint64_t>& zob,
-    const std::vector<TreeData>& trees
-) {
-    bool any = false;
-    while (true) {
-        bool changed = false;
-        changed |= contract_all_common_cherries(t1, t2, next_label);
-        changed |= contract_all_common_pendant_subtrees(t1, t2, next_label, zob, trees);
-        any |= changed;
-        if (!changed) break;
-    }
-    return any;
 }
 
 struct CherryCandidate {
@@ -1246,41 +1030,6 @@ CherryCandidate build_cherry_candidate(
 
     (void)t1;
     return cand;
-}
-
-CherryCandidate select_scored_cherry(
-    const DynamicTree& t1,
-    const DynamicTree& f,
-    uint64_t& rng,
-    double alpha
-) {
-    auto cherries = cherries_by_label(t1);
-    if (cherries.empty()) return {};
-
-    auto f_mass = compute_active_leaf_masses(f);
-    std::vector<CherryCandidate> candidates;
-    candidates.reserve(cherries.size());
-    double best = -std::numeric_limits<double>::infinity();
-    double worst = std::numeric_limits<double>::infinity();
-    for (auto [a, b] : cherries) {
-        auto cand = build_cherry_candidate(t1, f, f_mass, a, b);
-        if (cand.na == -1 || cand.nb == -1) continue;
-        best = std::max(best, cand.score);
-        worst = std::min(worst, cand.score);
-        candidates.push_back(std::move(cand));
-    }
-    if (candidates.empty()) return {};
-
-    double cutoff = best - alpha * (best - worst);
-    std::vector<int> rcl;
-    rcl.reserve(candidates.size());
-    for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
-        if (candidates[i].score >= cutoff) rcl.push_back(i);
-    }
-    if (rcl.empty()) rcl.push_back(0);
-
-    rng = mix64(rng + 0x6a09e667f3bcc909ULL);
-    return candidates[rcl[static_cast<size_t>(rng % rcl.size())]];
 }
 
 void apply_cut_plan(DynamicTree& f, const std::vector<int>& cuts) {
@@ -1413,15 +1162,13 @@ ThreeApproxResult run_three_approx(
     Clock::time_point deadline,
     int n,
     int incumbent_components,
-    uint64_t seed,
-    double alpha
+    uint64_t seed
 ) {
-    (void)alpha;
     int next_label = n + 1;
     uint64_t rng = seed ^ 0x9e3779b97f4a7c15ULL;
     bool timed_out_or_terminated = false;
 
-    // Common-subtree precontraction (light): exhaust common cherries before branching.
+    // Exhaust common cherries before branching.
     contract_all_common_cherries(t1, f, next_label);
 
     while (!g_terminate && Clock::now() < deadline && active_leaf_count(t1) > 2) {
@@ -1574,7 +1321,6 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     );
 
     auto best_out = singleton_forest(n);
-    publish_best_solution(best_out);
 
     DynamicTree dt1_base = build_dynamic_tree(parsed[0]);
     DynamicTree dt2_base = build_dynamic_tree(parsed[1]);
@@ -1589,8 +1335,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
             soft_deadline,
             n,
             static_cast<int>(best_out.size()),
-            seed,
-            0.15
+            seed
         );
         if (!res.complete || res.comps.empty()) {
             ++iter;
