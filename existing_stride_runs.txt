@@ -75,3 +75,9 @@ Valid:    100 | Empty:         0 | Infeas:      0 | Timeout:      0 | SyntErr:  
 Best:       0 | New Best:      0 | Subopt:    100 | Heuristic Score:   44.45953 | Transmit Queue:      0 | NoResponse:      0 | STRIDE Instances:    100
 ⠖ Postprocessing ... this may take a few seconds
 Valid:    100 | Empty:         0 | Infeas:      0 | Timeout:      0 | SyntErr:      0 | SolvErr:       0 | SystemErr:       0 | Running: 0
+
+15-03-26 15:53(pace26_heuristic_pub.lst)(improving on the 44 score):
+Valid:    100 | Empty:         0 | Infeas:      0 | Timeout:      0 | SyntErr:      0 | SolvErr:       0 | SystemErr:       0 | Running: 0
+Best:       0 | New Best:      0 | Subopt:    100 | Heuristic Score:   46.00897 | Transmit Queue:      0 | NoResponse:      0 | STRIDE Instances:    100
+⠄ Postprocessing ... this may take a few seconds
+Valid:    100 | Empty:         0 | Infeas:      0 | Timeout:      0 | SyntErr:      0 | SolvErr:       0 | SystemErr:       0 | Running: 0

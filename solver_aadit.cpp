@@ -1404,6 +1404,7 @@ ThreeApproxResult run_three_approx(
     DynamicTree f,
     Clock::time_point deadline,
     int n,
+    int incumbent_components,
     uint64_t seed,
     double alpha
 ) {
@@ -1428,6 +1429,13 @@ ThreeApproxResult run_three_approx(
                     cut_edge_above(t1, v);
                 }
             }
+        }
+
+        // Cuts never decrease the number of forest components, so once the
+        // current forest cannot beat the incumbent we can abandon this restart.
+        if (incumbent_components < std::numeric_limits<int>::max() &&
+            count_root_components(f) >= incumbent_components) {
+            break;
         }
 
         auto cherries = cherries_by_label(t1);
@@ -1567,7 +1575,15 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     uint64_t iter = 0;
     while (!g_terminate && Clock::now() < soft_deadline) {
         uint64_t seed = mix64(base_seed ^ iter);
-        auto res = run_three_approx(dt1_base, dt2_base, soft_deadline, n, seed, 0.15);
+        auto res = run_three_approx(
+            dt1_base,
+            dt2_base,
+            soft_deadline,
+            n,
+            static_cast<int>(best_out.size()),
+            seed,
+            0.15
+        );
         if (!res.complete || res.comps.empty()) {
             ++iter;
             continue;
