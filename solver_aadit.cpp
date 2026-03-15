@@ -1381,6 +1381,19 @@ std::vector<int> choose_cut_plan(
     return plans[best_indices[static_cast<size_t>(rng % best_indices.size())]];
 }
 
+bool use_expensive_same_component_plan(
+    int total_leaves,
+    const std::vector<int>& path,
+    const std::vector<int>& pendants
+) {
+    // The rollout-style chooser pays off on small/medium instances,
+    // but on the largest instances it can prevent any completed run.
+    if (total_leaves > 4000) return false;
+    if (path.size() > 64) return false;
+    if (pendants.size() > 10) return false;
+    return true;
+}
+
 struct ThreeApproxResult {
     std::vector<std::vector<int>> comps;
     bool complete = false;
@@ -1472,12 +1485,16 @@ ThreeApproxResult run_three_approx(
         if (pendants.size() == 1) {
             cut_edge_above(f, pendants[0]);
         } else {
-            auto f_mass = compute_active_leaf_masses(f);
-            auto cand = build_cherry_candidate(t1, f, f_mass, a, b);
-            auto plan = choose_cut_plan(t1, f, cand, next_label, rng);
-            if (!plan.empty()) {
-                apply_cut_plan(f, plan);
-            } else {
+            if (use_expensive_same_component_plan(n, path, pendants)) {
+                auto f_mass = compute_active_leaf_masses(f);
+                auto cand = build_cherry_candidate(t1, f, f_mass, a, b);
+                auto plan = choose_cut_plan(t1, f, cand, next_label, rng);
+                if (!plan.empty()) {
+                    apply_cut_plan(f, plan);
+                    continue;
+                }
+            }
+            {
                 cut_edge_above(f, na);
                 cut_edge_above(f, nb);
                 for (int c : pendants) cut_edge_above(f, c);
