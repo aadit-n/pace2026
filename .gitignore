@@ -5,3 +5,5 @@
 /stride-logs
 /.vscode
 /Makefile
+/tmp
+/solver_aadit_primary

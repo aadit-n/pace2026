@@ -4,11 +4,13 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
@@ -24,6 +26,8 @@ namespace {
 
 using genesis::tree::Tree;
 using Clock = std::chrono::steady_clock;
+
+uint64_t mix64(uint64_t x);
 
 struct PaceInstance {
     int tree_count = 0;
@@ -86,12 +90,52 @@ struct DynNode {
     int comp_left = -1;
     int comp_right = -1;
     std::vector<int> merged_original; // non-empty iff this node is a pseudo leaf
+
+    // Rooted subtree signature for active pseudo leaves.
+    uint64_t leafset_hash = 0;
+    int payload_size = 0;
+    uint64_t topo_a = 0;
+    uint64_t topo_b = 0;
 };
 
 struct DynamicTree {
     int root = -1;
     std::vector<DynNode> nodes;
     std::unordered_map<int, int> label_to_node; // active pseudo-label -> node
+    std::vector<char> is_cherry;
+    std::vector<int> cherry_pos;
+    std::vector<int> cherry_nodes;
+};
+
+struct ReducedSubtreeSig {
+    uint64_t leafset_hash = 0;
+    int leaf_count = 0;
+    uint64_t topo_a = 0;
+    uint64_t topo_b = 0;
+};
+
+struct ReducedSubtreeKey {
+    uint64_t leafset_hash = 0;
+    int leaf_count = 0;
+    uint64_t topo_a = 0;
+    uint64_t topo_b = 0;
+
+    bool operator==(const ReducedSubtreeKey& o) const {
+        return leafset_hash == o.leafset_hash &&
+               leaf_count == o.leaf_count &&
+               topo_a == o.topo_a &&
+               topo_b == o.topo_b;
+    }
+};
+
+struct ReducedSubtreeKeyHasher {
+    size_t operator()(const ReducedSubtreeKey& s) const {
+        uint64_t x = s.leafset_hash;
+        x ^= mix64(static_cast<uint64_t>(s.leaf_count) + 0x9e3779b97f4a7c15ULL);
+        x ^= mix64(s.topo_a + 0x517cc1b727220a95ULL);
+        x ^= mix64(s.topo_b + 0x94d049bb133111ebULL);
+        return static_cast<size_t>(mix64(x));
+    }
 };
 
 volatile sig_atomic_t g_terminate = 0;
@@ -501,6 +545,8 @@ std::vector<std::string> forest_from_partition(
 DynamicTree build_dynamic_tree(const SimpleTree& st) {
     DynamicTree dt;
     dt.nodes.resize(st.children.size());
+    dt.is_cherry.assign(st.children.size(), 0);
+    dt.cherry_pos.assign(st.children.size(), -1);
     dt.root = st.root;
     for (size_t u = 0; u < st.children.size(); ++u) {
         DynNode& dn = dt.nodes[u];
@@ -514,6 +560,10 @@ DynamicTree build_dynamic_tree(const SimpleTree& st) {
         if (st.children[u].empty()) {
             dn.label = st.leaf_label[u];
             dn.merged_original = {st.leaf_label[u]};
+            dn.leafset_hash = mix64(static_cast<uint64_t>(st.leaf_label[u]) * 0x9e3779b97f4a7c15ULL + 0xabcULL);
+            dn.payload_size = 1;
+            dn.topo_a = mix64(static_cast<uint64_t>(st.leaf_label[u]) + 0x1111111111111111ULL);
+            dn.topo_b = mix64(static_cast<uint64_t>(st.leaf_label[u]) + 0x2222222222222222ULL);
             dt.label_to_node[dn.label] = static_cast<int>(u);
         } else {
             dn.label = 0;
@@ -521,11 +571,81 @@ DynamicTree build_dynamic_tree(const SimpleTree& st) {
             dn.right = st.children[u][1];
         }
     }
+    for (int u = 0; u < static_cast<int>(dt.nodes.size()); ++u) {
+        int l = dt.nodes[u].left;
+        int r = dt.nodes[u].right;
+        if (l != -1 && r != -1 &&
+            dt.nodes[l].active && dt.nodes[r].active &&
+            dt.nodes[l].left == -1 && dt.nodes[l].right == -1 &&
+            dt.nodes[r].left == -1 && dt.nodes[r].right == -1) {
+            dt.is_cherry[u] = 1;
+            dt.cherry_pos[u] = static_cast<int>(dt.cherry_nodes.size());
+            dt.cherry_nodes.push_back(u);
+        }
+    }
     return dt;
 }
 
+bool is_leaflike(const DynamicTree& t, int u) {
+    return u >= 0 && u < static_cast<int>(t.nodes.size()) &&
+           t.nodes[u].active && t.nodes[u].left == -1 && t.nodes[u].right == -1;
+}
+
+void ensure_cherry_storage(DynamicTree& t) {
+    if (t.is_cherry.size() < t.nodes.size()) t.is_cherry.resize(t.nodes.size(), 0);
+    if (t.cherry_pos.size() < t.nodes.size()) t.cherry_pos.resize(t.nodes.size(), -1);
+}
+
+void remove_cherry_node(DynamicTree& t, int u) {
+    if (u < 0 || u >= static_cast<int>(t.cherry_pos.size())) return;
+    int pos = t.cherry_pos[u];
+    if (pos == -1) return;
+    int last = t.cherry_nodes.back();
+    t.cherry_nodes[pos] = last;
+    t.cherry_pos[last] = pos;
+    t.cherry_nodes.pop_back();
+    t.cherry_pos[u] = -1;
+    t.is_cherry[u] = 0;
+}
+
+void refresh_local_cherry_status(DynamicTree& t, int u) {
+    if (u < 0 || u >= static_cast<int>(t.nodes.size())) return;
+    ensure_cherry_storage(t);
+
+    bool now = false;
+    if (t.nodes[u].active) {
+        int l = t.nodes[u].left;
+        int r = t.nodes[u].right;
+        now = (l != -1 && r != -1 && is_leaflike(t, l) && is_leaflike(t, r));
+    }
+    if (now) {
+        if (t.cherry_pos[u] == -1) {
+            t.cherry_pos[u] = static_cast<int>(t.cherry_nodes.size());
+            t.cherry_nodes.push_back(u);
+        }
+        t.is_cherry[u] = 1;
+    } else {
+        remove_cherry_node(t, u);
+    }
+}
+
+void refresh_cherry_neighborhood(DynamicTree& t, int u) {
+    if (u < 0 || u >= static_cast<int>(t.nodes.size())) return;
+    refresh_local_cherry_status(t, u);
+    int p = t.nodes[u].parent;
+    if (p != -1) {
+        refresh_local_cherry_status(t, p);
+        int gp = t.nodes[p].parent;
+        if (gp != -1) refresh_local_cherry_status(t, gp);
+    }
+    int l = t.nodes[u].left;
+    int r = t.nodes[u].right;
+    if (l != -1) refresh_local_cherry_status(t, l);
+    if (r != -1) refresh_local_cherry_status(t, r);
+}
+
 bool is_active_leaf(const DynamicTree& t, int u) {
-    return u >= 0 && u < static_cast<int>(t.nodes.size()) && t.nodes[u].active && t.nodes[u].left == -1 && t.nodes[u].right == -1;
+    return is_leaflike(t, u);
 }
 
 int degree_children(const DynamicTree& t, int u) {
@@ -545,6 +665,7 @@ void suppress_up(DynamicTree& t, int u) {
     while (u != -1 && t.nodes[u].active) {
         int deg = degree_children(t, u);
         if (deg != 1) break;
+        remove_cherry_node(t, u);
         int child = (t.nodes[u].left != -1 && t.nodes[t.nodes[u].left].active) ? t.nodes[u].left : t.nodes[u].right;
         int p = t.nodes[u].parent;
         if (p == -1) {
@@ -552,14 +673,18 @@ void suppress_up(DynamicTree& t, int u) {
             t.root = child;
             t.nodes[u].active = false;
             t.nodes[u].left = t.nodes[u].right = -1;
+            refresh_cherry_neighborhood(t, child);
             break;
         }
         replace_child(t, p, u, child);
         t.nodes[child].parent = p;
         t.nodes[u].active = false;
         t.nodes[u].left = t.nodes[u].right = -1;
+        refresh_cherry_neighborhood(t, child);
+        refresh_local_cherry_status(t, p);
         u = p;
     }
+    if (u != -1) refresh_cherry_neighborhood(t, u);
 }
 
 void cut_edge_above(DynamicTree& t, int child) {
@@ -567,8 +692,10 @@ void cut_edge_above(DynamicTree& t, int child) {
     if (!t.nodes[child].active) return;
     int p = t.nodes[child].parent;
     if (p == -1) return;
+    remove_cherry_node(t, p);
     replace_child(t, p, child, -1);
     t.nodes[child].parent = -1;
+    refresh_cherry_neighborhood(t, child);
     suppress_up(t, p);
 }
 
@@ -598,6 +725,7 @@ bool contract_cherry(DynamicTree& t, int la, int lb, int new_label) {
 
     int nid = static_cast<int>(t.nodes.size());
     t.nodes.push_back(DynNode{});
+    ensure_cherry_storage(t);
     DynNode& nn = t.nodes[nid];
     nn.parent = p;
     nn.left = -1;
@@ -608,10 +736,20 @@ bool contract_cherry(DynamicTree& t, int la, int lb, int new_label) {
     nn.comp_right = b;
     nn.merged_original = t.nodes[a].merged_original;
     nn.merged_original.insert(nn.merged_original.end(), t.nodes[b].merged_original.begin(), t.nodes[b].merged_original.end());
+    nn.leafset_hash = t.nodes[a].leafset_hash ^ t.nodes[b].leafset_hash;
+    nn.payload_size = t.nodes[a].payload_size + t.nodes[b].payload_size;
+    uint64_t aa = t.nodes[a].topo_a, ab = t.nodes[b].topo_a;
+    uint64_t ba = t.nodes[a].topo_b, bb = t.nodes[b].topo_b;
+    if (aa > ab) std::swap(aa, ab);
+    if (ba > bb) std::swap(ba, bb);
+    nn.topo_a = mix64(aa ^ (ab + 0x9e3779b97f4a7c15ULL));
+    nn.topo_b = mix64(ba ^ (bb + 0x517cc1b727220a95ULL));
 
     t.label_to_node.erase(la);
     t.label_to_node.erase(lb);
     t.label_to_node[new_label] = nid;
+    t.cherry_pos[nid] = -1;
+    t.is_cherry[nid] = 0;
 
     int left = t.nodes[p].left;
     int right = t.nodes[p].right;
@@ -622,28 +760,32 @@ bool contract_cherry(DynamicTree& t, int la, int lb, int new_label) {
         return false;
     }
 
+    remove_cherry_node(t, p);
+    remove_cherry_node(t, a);
+    remove_cherry_node(t, b);
     t.nodes[a].active = false;
     t.nodes[b].active = false;
     t.nodes[a].parent = -1;
     t.nodes[b].parent = -1;
 
+    refresh_cherry_neighborhood(t, nid);
     suppress_up(t, p);
     return true;
 }
 
 std::vector<std::pair<int, int>> cherries_by_label(const DynamicTree& t) {
     std::vector<std::pair<int, int>> out;
-    for (int u = 0; u < static_cast<int>(t.nodes.size()); ++u) {
+    out.reserve(t.cherry_nodes.size());
+    for (int u : t.cherry_nodes) {
+        if (u < 0 || u >= static_cast<int>(t.nodes.size())) continue;
         if (!t.nodes[u].active) continue;
         int l = t.nodes[u].left;
         int r = t.nodes[u].right;
-        if (l == -1 || r == -1) continue;
-        if (is_active_leaf(t, l) && is_active_leaf(t, r)) {
-            int a = t.nodes[l].label;
-            int b = t.nodes[r].label;
-            if (a > b) std::swap(a, b);
-            out.push_back({a, b});
-        }
+        if (!is_active_leaf(t, l) || !is_active_leaf(t, r)) continue;
+        int a = t.nodes[l].label;
+        int b = t.nodes[r].label;
+        if (a > b) std::swap(a, b);
+        out.push_back({a, b});
     }
     return out;
 }
@@ -732,6 +874,70 @@ int active_leaf_count(const DynamicTree& t) {
     return c;
 }
 
+int count_root_components(const DynamicTree& t) {
+    int c = 0;
+    for (const auto& n : t.nodes) if (n.active && n.parent == -1) ++c;
+    return c;
+}
+
+std::vector<int> merge_sorted_components(const std::vector<int>& a, const std::vector<int>& b) {
+    std::vector<int> out;
+    out.reserve(a.size() + b.size());
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        if (a[i] < b[j]) out.push_back(a[i++]);
+        else if (b[j] < a[i]) out.push_back(b[j++]);
+        else {
+            out.push_back(a[i]);
+            ++i;
+            ++j;
+        }
+    }
+    while (i < a.size()) out.push_back(a[i++]);
+    while (j < b.size()) out.push_back(b[j++]);
+    return out;
+}
+
+std::vector<std::vector<int>> greedy_merge_partition(
+    std::vector<std::vector<int>> comps,
+    const std::vector<uint64_t>& zob,
+    const std::vector<TreeData>& trees
+) {
+    for (auto& comp : comps) {
+        std::sort(comp.begin(), comp.end());
+        comp.erase(std::unique(comp.begin(), comp.end()), comp.end());
+    }
+
+    if (comps.size() > 256) return comps;
+
+    while (true) {
+        int best_i = -1;
+        int best_j = -1;
+        size_t best_union_size = 0;
+
+        for (int i = 0; i < static_cast<int>(comps.size()); ++i) {
+            if (comps[i].empty()) continue;
+            for (int j = i + 1; j < static_cast<int>(comps.size()); ++j) {
+                if (comps[j].empty()) continue;
+                size_t max_possible = comps[i].size() + comps[j].size();
+                if (max_possible <= best_union_size) continue;
+                auto merged = merge_sorted_components(comps[i], comps[j]);
+                if (merged.size() <= best_union_size) continue;
+                if (!component_valid_both_trees(merged, zob, trees)) continue;
+                best_union_size = merged.size();
+                best_i = i;
+                best_j = j;
+            }
+        }
+
+        if (best_i == -1) break;
+        comps[best_i] = merge_sorted_components(comps[best_i], comps[best_j]);
+        comps.erase(comps.begin() + best_j);
+    }
+
+    return comps;
+}
+
 void collect_component_leaves(const DynamicTree& t, int u, std::vector<int>& out) {
     if (u == -1 || !t.nodes[u].active) return;
     if (t.nodes[u].left == -1 && t.nodes[u].right == -1) {
@@ -741,6 +947,438 @@ void collect_component_leaves(const DynamicTree& t, int u, std::vector<int>& out
     }
     if (t.nodes[u].left != -1) collect_component_leaves(t, t.nodes[u].left, out);
     if (t.nodes[u].right != -1) collect_component_leaves(t, t.nodes[u].right, out);
+}
+
+void collect_active_postorder(const DynamicTree& t, std::vector<int>& order) {
+    order.clear();
+    if (t.root == -1 || t.root >= static_cast<int>(t.nodes.size()) || !t.nodes[t.root].active) return;
+
+    std::vector<std::pair<int, int>> st;
+    st.reserve(t.nodes.size());
+    st.push_back({t.root, 0});
+    while (!st.empty()) {
+        auto [u, phase] = st.back();
+        st.pop_back();
+        if (u == -1 || !t.nodes[u].active) continue;
+        if (phase == 1) {
+            order.push_back(u);
+            continue;
+        }
+        st.push_back({u, 1});
+        if (t.nodes[u].right != -1) st.push_back({t.nodes[u].right, 0});
+        if (t.nodes[u].left != -1) st.push_back({t.nodes[u].left, 0});
+    }
+}
+
+std::vector<int> compute_active_leaf_masses(const DynamicTree& t) {
+    std::vector<int> mass(t.nodes.size(), 0);
+    std::vector<int> order;
+    collect_active_postorder(t, order);
+    for (int u : order) {
+        if (is_leaflike(t, u)) {
+            mass[u] = t.nodes[u].payload_size;
+        } else {
+            int total = 0;
+            if (t.nodes[u].left != -1 && t.nodes[t.nodes[u].left].active) total += mass[t.nodes[u].left];
+            if (t.nodes[u].right != -1 && t.nodes[t.nodes[u].right].active) total += mass[t.nodes[u].right];
+            mass[u] = total;
+        }
+    }
+    return mass;
+}
+
+void compute_active_subtree_signatures(
+    const DynamicTree& t,
+    std::vector<ReducedSubtreeSig>& sigs
+) {
+    sigs.assign(t.nodes.size(), ReducedSubtreeSig{});
+    std::vector<int> order;
+    collect_active_postorder(t, order);
+    for (int u : order) {
+        if (is_leaflike(t, u)) {
+            sigs[u].leafset_hash = t.nodes[u].leafset_hash;
+            sigs[u].leaf_count = t.nodes[u].payload_size;
+            sigs[u].topo_a = t.nodes[u].topo_a;
+            sigs[u].topo_b = t.nodes[u].topo_b;
+        } else {
+            int l = t.nodes[u].left;
+            int r = t.nodes[u].right;
+            if (l == -1 || r == -1 || !t.nodes[l].active || !t.nodes[r].active) continue;
+            sigs[u].leaf_count = sigs[l].leaf_count + sigs[r].leaf_count;
+            sigs[u].leafset_hash = sigs[l].leafset_hash ^ sigs[r].leafset_hash;
+            uint64_t aa = sigs[l].topo_a, ab = sigs[r].topo_a;
+            uint64_t ba = sigs[l].topo_b, bb = sigs[r].topo_b;
+            if (aa > ab) std::swap(aa, ab);
+            if (ba > bb) std::swap(ba, bb);
+            sigs[u].topo_a = mix64(aa ^ (ab + 0x9e3779b97f4a7c15ULL));
+            sigs[u].topo_b = mix64(ba ^ (bb + 0x517cc1b727220a95ULL));
+        }
+    }
+}
+
+void mark_active_subtree(const DynamicTree& t, int u, std::vector<char>& blocked) {
+    if (u == -1 || !t.nodes[u].active || blocked[u]) return;
+    std::vector<int> st{u};
+    while (!st.empty()) {
+        int x = st.back();
+        st.pop_back();
+        if (x == -1 || !t.nodes[x].active || blocked[x]) continue;
+        blocked[x] = 1;
+        if (t.nodes[x].left != -1) st.push_back(t.nodes[x].left);
+        if (t.nodes[x].right != -1) st.push_back(t.nodes[x].right);
+    }
+}
+
+void deactivate_active_subtree(DynamicTree& t, int u) {
+    if (u == -1 || !t.nodes[u].active) return;
+    std::vector<int> st{u};
+    while (!st.empty()) {
+        int x = st.back();
+        st.pop_back();
+        if (x == -1 || !t.nodes[x].active) continue;
+        remove_cherry_node(t, x);
+        if (is_leaflike(t, x)) t.label_to_node.erase(t.nodes[x].label);
+        int l = t.nodes[x].left;
+        int r = t.nodes[x].right;
+        t.nodes[x].active = false;
+        t.nodes[x].parent = -1;
+        if (l != -1) st.push_back(l);
+        if (r != -1) st.push_back(r);
+    }
+}
+
+bool contract_active_subtree_root(
+    DynamicTree& t,
+    int u,
+    int new_label,
+    const ReducedSubtreeSig& sig
+) {
+    if (u == -1 || !t.nodes[u].active) return false;
+
+    std::vector<int> leaves;
+    leaves.reserve(sig.leaf_count);
+    collect_component_leaves(t, u, leaves);
+    std::sort(leaves.begin(), leaves.end());
+    leaves.erase(std::unique(leaves.begin(), leaves.end()), leaves.end());
+    if (leaves.empty()) return false;
+
+    int p = t.nodes[u].parent;
+    int nid = static_cast<int>(t.nodes.size());
+    t.nodes.push_back(DynNode{});
+    ensure_cherry_storage(t);
+
+    DynNode& nn = t.nodes[nid];
+    nn.parent = p;
+    nn.left = -1;
+    nn.right = -1;
+    nn.label = new_label;
+    nn.active = true;
+    nn.comp_left = u;
+    nn.comp_right = -1;
+    nn.merged_original = std::move(leaves);
+    nn.leafset_hash = sig.leafset_hash;
+    nn.payload_size = sig.leaf_count;
+    nn.topo_a = sig.topo_a;
+    nn.topo_b = sig.topo_b;
+
+    if (p == -1) {
+        t.root = nid;
+    } else {
+        replace_child(t, p, u, nid);
+    }
+
+    deactivate_active_subtree(t, u);
+    t.label_to_node[new_label] = nid;
+    t.cherry_pos[nid] = -1;
+    t.is_cherry[nid] = 0;
+    refresh_cherry_neighborhood(t, nid);
+    if (p != -1) refresh_cherry_neighborhood(t, p);
+    return true;
+}
+
+bool contract_all_common_pendant_subtrees(
+    DynamicTree& t1,
+    DynamicTree& t2,
+    int& next_label,
+    const std::vector<uint64_t>& zob,
+    const std::vector<TreeData>& trees
+) {
+    std::vector<ReducedSubtreeSig> sig1, sig2;
+    compute_active_subtree_signatures(t1, sig1);
+    compute_active_subtree_signatures(t2, sig2);
+
+    std::unordered_map<ReducedSubtreeKey, int, ReducedSubtreeKeyHasher> map1;
+    std::unordered_map<ReducedSubtreeKey, int, ReducedSubtreeKeyHasher> map2;
+    for (int u = 0; u < static_cast<int>(t1.nodes.size()); ++u) {
+        if (!t1.nodes[u].active || is_leaflike(t1, u) || sig1[u].leaf_count < 2) continue;
+        map1[ReducedSubtreeKey{sig1[u].leafset_hash, sig1[u].leaf_count, sig1[u].topo_a, sig1[u].topo_b}] = u;
+    }
+    for (int u = 0; u < static_cast<int>(t2.nodes.size()); ++u) {
+        if (!t2.nodes[u].active || is_leaflike(t2, u) || sig2[u].leaf_count < 2) continue;
+        map2[ReducedSubtreeKey{sig2[u].leafset_hash, sig2[u].leaf_count, sig2[u].topo_a, sig2[u].topo_b}] = u;
+    }
+
+    struct Match { int u1; int u2; ReducedSubtreeSig sig; };
+    std::vector<Match> matches;
+    matches.reserve(std::min(map1.size(), map2.size()));
+    for (const auto& [key, u1] : map1) {
+        auto it = map2.find(key);
+        if (it == map2.end()) continue;
+        matches.push_back(Match{u1, it->second, sig1[u1]});
+    }
+    std::sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) {
+        return a.sig.leaf_count > b.sig.leaf_count;
+    });
+
+    std::vector<char> blocked1(t1.nodes.size(), 0), blocked2(t2.nodes.size(), 0);
+    bool any = false;
+    for (const auto& m : matches) {
+        if (blocked1[m.u1] || blocked2[m.u2]) continue;
+        std::vector<int> leaves;
+        leaves.reserve(m.sig.leaf_count);
+        collect_component_leaves(t1, m.u1, leaves);
+        std::sort(leaves.begin(), leaves.end());
+        leaves.erase(std::unique(leaves.begin(), leaves.end()), leaves.end());
+        if (static_cast<int>(leaves.size()) != m.sig.leaf_count) continue;
+        if (!component_valid_both_trees(leaves, zob, trees)) continue;
+
+        int nl = next_label++;
+        mark_active_subtree(t1, m.u1, blocked1);
+        mark_active_subtree(t2, m.u2, blocked2);
+        if (contract_active_subtree_root(t1, m.u1, nl, m.sig) &&
+            contract_active_subtree_root(t2, m.u2, nl, m.sig)) {
+            any = true;
+        }
+    }
+    return any;
+}
+
+bool exhaust_common_reductions(
+    DynamicTree& t1,
+    DynamicTree& t2,
+    int& next_label,
+    const std::vector<uint64_t>& zob,
+    const std::vector<TreeData>& trees
+) {
+    bool any = false;
+    while (true) {
+        bool changed = false;
+        changed |= contract_all_common_cherries(t1, t2, next_label);
+        changed |= contract_all_common_pendant_subtrees(t1, t2, next_label, zob, trees);
+        any |= changed;
+        if (!changed) break;
+    }
+    return any;
+}
+
+struct CherryCandidate {
+    int a = -1;
+    int b = -1;
+    double score = -std::numeric_limits<double>::infinity();
+    bool common = false;
+    bool same_component = false;
+    int na = -1;
+    int nb = -1;
+    int ra = -1;
+    int rb = -1;
+    int distance = 0;
+    int pendant_count = 0;
+    int conflict_mass = 0;
+    int component_size = 0;
+    int immediate_gain = 0;
+    std::vector<int> path;
+    std::vector<int> pendants;
+};
+
+CherryCandidate build_cherry_candidate(
+    const DynamicTree& t1,
+    const DynamicTree& f,
+    const std::vector<int>& f_mass,
+    int a,
+    int b
+) {
+    CherryCandidate cand;
+    cand.a = a;
+    cand.b = b;
+    cand.common = are_siblings_by_label(f, a, b);
+    cand.same_component = false;
+    cand.immediate_gain = cand.common ? 2 : 0;
+
+    auto ia = f.label_to_node.find(a);
+    auto ib = f.label_to_node.find(b);
+    if (ia == f.label_to_node.end() || ib == f.label_to_node.end()) return cand;
+
+    cand.na = ia->second;
+    cand.nb = ib->second;
+    if (!is_active_leaf(f, cand.na) || !is_active_leaf(f, cand.nb)) return cand;
+
+    cand.ra = root_of(f, cand.na);
+    cand.rb = root_of(f, cand.nb);
+    if (cand.ra == -1 || cand.rb == -1) return cand;
+
+    cand.same_component = (cand.ra == cand.rb);
+    if (cand.same_component) {
+        cand.path = path_nodes(f, cand.na, cand.nb);
+        cand.distance = cand.path.empty() ? 0 : static_cast<int>(cand.path.size()) - 1;
+        cand.pendants = pendant_children_on_path(f, cand.path);
+        cand.pendant_count = static_cast<int>(cand.pendants.size());
+        for (int u : cand.pendants) {
+            if (u >= 0 && u < static_cast<int>(f_mass.size())) cand.conflict_mass += f_mass[u];
+        }
+        if (cand.ra >= 0 && cand.ra < static_cast<int>(f_mass.size())) cand.component_size = f_mass[cand.ra];
+        if (cand.pendant_count == 1) cand.immediate_gain += 1;
+    } else {
+        int ma = (cand.ra >= 0 && cand.ra < static_cast<int>(f_mass.size())) ? f_mass[cand.ra] : 0;
+        int mb = (cand.rb >= 0 && cand.rb < static_cast<int>(f_mass.size())) ? f_mass[cand.rb] : 0;
+        cand.component_size = std::min(ma, mb);
+        cand.conflict_mass = cand.component_size;
+        cand.immediate_gain += 1;
+    }
+
+    cand.score =
+        (cand.common ? 12.0 : 0.0) +
+        (cand.same_component ? 0.0 : 4.0) -
+        1.5 * static_cast<double>(cand.distance) -
+        2.0 * static_cast<double>(cand.pendant_count) -
+        0.02 * static_cast<double>(cand.conflict_mass) +
+        3.0 * static_cast<double>(cand.immediate_gain) -
+        0.01 * static_cast<double>(cand.component_size);
+
+    (void)t1;
+    return cand;
+}
+
+CherryCandidate select_scored_cherry(
+    const DynamicTree& t1,
+    const DynamicTree& f,
+    uint64_t& rng,
+    double alpha
+) {
+    auto cherries = cherries_by_label(t1);
+    if (cherries.empty()) return {};
+
+    auto f_mass = compute_active_leaf_masses(f);
+    std::vector<CherryCandidate> candidates;
+    candidates.reserve(cherries.size());
+    double best = -std::numeric_limits<double>::infinity();
+    double worst = std::numeric_limits<double>::infinity();
+    for (auto [a, b] : cherries) {
+        auto cand = build_cherry_candidate(t1, f, f_mass, a, b);
+        if (cand.na == -1 || cand.nb == -1) continue;
+        best = std::max(best, cand.score);
+        worst = std::min(worst, cand.score);
+        candidates.push_back(std::move(cand));
+    }
+    if (candidates.empty()) return {};
+
+    double cutoff = best - alpha * (best - worst);
+    std::vector<int> rcl;
+    rcl.reserve(candidates.size());
+    for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
+        if (candidates[i].score >= cutoff) rcl.push_back(i);
+    }
+    if (rcl.empty()) rcl.push_back(0);
+
+    rng = mix64(rng + 0x6a09e667f3bcc909ULL);
+    return candidates[rcl[static_cast<size_t>(rng % rcl.size())]];
+}
+
+void apply_cut_plan(DynamicTree& f, const std::vector<int>& cuts) {
+    for (int u : cuts) cut_edge_above(f, u);
+}
+
+double evaluate_reduced_state(
+    const DynamicTree& t1,
+    const DynamicTree& f
+) {
+    auto cherries = cherries_by_label(t1);
+    auto f_mass = compute_active_leaf_masses(f);
+    int comp_count = count_root_components(f);
+    int sampled_pendants = 0;
+    int sampled_conflict_mass = 0;
+
+    int sample_limit = std::min<int>(6, cherries.size());
+    for (int i = 0; i < sample_limit; ++i) {
+        auto [a, b] = cherries[i];
+        auto ia = f.label_to_node.find(a);
+        auto ib = f.label_to_node.find(b);
+        if (ia == f.label_to_node.end() || ib == f.label_to_node.end()) continue;
+        int na = ia->second;
+        int nb = ib->second;
+        if (!is_active_leaf(f, na) || !is_active_leaf(f, nb)) continue;
+
+        int ra = root_of(f, na);
+        int rb = root_of(f, nb);
+        if (ra == -1 || rb == -1) continue;
+
+        if (ra != rb) {
+            sampled_conflict_mass += std::min(f_mass[ra], f_mass[rb]);
+            continue;
+        }
+
+        auto path = path_nodes(f, na, nb);
+        auto pendants = pendant_children_on_path(f, path);
+        sampled_pendants += static_cast<int>(pendants.size());
+        for (int u : pendants) sampled_conflict_mass += f_mass[u];
+    }
+
+    return
+        -20.0 * static_cast<double>(comp_count) +
+         0.75 * static_cast<double>(cherries.size()) -
+         1.75 * static_cast<double>(sampled_pendants) -
+         0.02 * static_cast<double>(sampled_conflict_mass);
+}
+
+std::vector<int> choose_cut_plan(
+    const DynamicTree& t1,
+    const DynamicTree& f,
+    const CherryCandidate& cand,
+    int next_label,
+    uint64_t& rng
+) {
+    std::vector<std::vector<int>> plans;
+    if (!cand.same_component) {
+        plans.push_back({cand.na});
+        plans.push_back({cand.nb});
+    } else {
+        for (int u : cand.pendants) plans.push_back({u});
+        plans.push_back({cand.na});
+        plans.push_back({cand.nb});
+        if (cand.pendants.size() > 1) {
+            auto f_mass = compute_active_leaf_masses(f);
+            std::vector<int> sorted = cand.pendants;
+            std::sort(sorted.begin(), sorted.end(), [&](int x, int y) {
+                return f_mass[x] < f_mass[y];
+            });
+            std::vector<int> bundle;
+            for (size_t i = 0; i < (sorted.size() + 1) / 2; ++i) bundle.push_back(sorted[i]);
+            plans.push_back(std::move(bundle));
+            std::vector<int> classic{cand.na, cand.nb};
+            classic.insert(classic.end(), cand.pendants.begin(), cand.pendants.end());
+            plans.push_back(std::move(classic));
+        }
+    }
+    if (plans.empty()) return {};
+
+    double best = -std::numeric_limits<double>::infinity();
+    std::vector<int> best_indices;
+    for (int i = 0; i < static_cast<int>(plans.size()); ++i) {
+        DynamicTree tt = t1;
+        DynamicTree ff = f;
+        int nl = next_label;
+        apply_cut_plan(ff, plans[i]);
+        contract_all_common_cherries(tt, ff, nl);
+        double val = evaluate_reduced_state(tt, ff);
+        if (val > best + 1e-9) {
+            best = val;
+            best_indices = {i};
+        } else if (std::abs(val - best) <= 1e-9) {
+            best_indices.push_back(i);
+        }
+    }
+
+    rng = mix64(rng + 0x94d049bb133111ebULL);
+    return plans[best_indices[static_cast<size_t>(rng % best_indices.size())]];
 }
 
 struct ThreeApproxResult {
@@ -753,8 +1391,10 @@ ThreeApproxResult run_three_approx(
     DynamicTree f,
     Clock::time_point deadline,
     int n,
-    uint64_t seed
+    uint64_t seed,
+    double alpha
 ) {
+    (void)alpha;
     int next_label = n + 1;
     uint64_t rng = seed ^ 0x9e3779b97f4a7c15ULL;
     bool timed_out_or_terminated = false;
@@ -809,8 +1449,6 @@ ThreeApproxResult run_three_approx(
         if (ra == -1 || rb == -1) break;
 
         if (ra != rb) {
-            // One-cut trial in separated-components case:
-            // try cutting a-only vs b-only and keep the branch with better immediate cherry potential.
             DynamicTree fa = f;
             DynamicTree fb = f;
             cut_edge_above(fa, na);
@@ -834,9 +1472,16 @@ ThreeApproxResult run_three_approx(
         if (pendants.size() == 1) {
             cut_edge_above(f, pendants[0]);
         } else {
-            cut_edge_above(f, na);
-            cut_edge_above(f, nb);
-            for (int c : pendants) cut_edge_above(f, c);
+            auto f_mass = compute_active_leaf_masses(f);
+            auto cand = build_cherry_candidate(t1, f, f_mass, a, b);
+            auto plan = choose_cut_plan(t1, f, cand, next_label, rng);
+            if (!plan.empty()) {
+                apply_cut_plan(f, plan);
+            } else {
+                cut_edge_above(f, na);
+                cut_edge_above(f, nb);
+                for (int c : pendants) cut_edge_above(f, c);
+            }
         }
     }
     if (g_terminate || Clock::now() >= deadline) {
@@ -905,7 +1550,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     uint64_t iter = 0;
     while (!g_terminate && Clock::now() < soft_deadline) {
         uint64_t seed = mix64(base_seed ^ iter);
-        auto res = run_three_approx(dt1_base, dt2_base, soft_deadline, n, seed);
+        auto res = run_three_approx(dt1_base, dt2_base, soft_deadline, n, seed, 0.15);
         if (!res.complete || res.comps.empty()) {
             ++iter;
             continue;
