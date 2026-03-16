@@ -965,6 +965,21 @@ std::vector<std::pair<int, int>> cherries_by_label(const DynamicTree& t) {
     return out;
 }
 
+template <typename Fn>
+void for_each_cherry_label_pair(const DynamicTree& t, Fn&& fn) {
+    for (int u : t.cherry_nodes) {
+        if (u < 0 || u >= static_cast<int>(t.nodes.size())) continue;
+        if (!t.nodes[u].active) continue;
+        int l = t.nodes[u].left;
+        int r = t.nodes[u].right;
+        if (!is_active_leaf(t, l) || !is_active_leaf(t, r)) continue;
+        int a = t.nodes[l].label;
+        int b = t.nodes[r].label;
+        if (a > b) std::swap(a, b);
+        if (!fn(a, b)) break;
+    }
+}
+
 bool contract_all_common_cherries(DynamicTree& t1, DynamicTree& t2, int& next_label, UndoLog* log = nullptr) {
     bool any = false;
     while (true) {
@@ -1035,11 +1050,11 @@ std::vector<int> pendant_children_on_path(const DynamicTree& t, const std::vecto
 }
 
 int count_common_cherries(const DynamicTree& t1, const DynamicTree& f) {
-    auto cherries = cherries_by_label(t1);
     int cnt = 0;
-    for (auto [a, b] : cherries) {
+    for_each_cherry_label_pair(t1, [&](int a, int b) {
         if (are_siblings_by_label(f, a, b)) ++cnt;
-    }
+        return true;
+    });
     return cnt;
 }
 
@@ -1256,38 +1271,41 @@ double evaluate_reduced_state(
     const DynamicTree& t1,
     const DynamicTree& f
 ) {
-    auto cherries = cherries_by_label(t1);
     auto f_mass = compute_active_leaf_masses(f);
     int comp_count = count_root_components(f);
     int sampled_pendants = 0;
     int sampled_conflict_mass = 0;
 
-    int sample_limit = std::min<int>(6, cherries.size());
-    for (int i = 0; i < sample_limit; ++i) {
-        auto [a, b] = cherries[i];
+    int cherry_count = 0;
+    int sampled = 0;
+    for_each_cherry_label_pair(t1, [&](int a, int b) {
+        ++cherry_count;
+        if (sampled >= 6) return true;
+        ++sampled;
         int na = find_node_of_label(f, a);
         int nb = find_node_of_label(f, b);
-        if (na == -1 || nb == -1) continue;
-        if (!is_active_leaf(f, na) || !is_active_leaf(f, nb)) continue;
+        if (na == -1 || nb == -1) return true;
+        if (!is_active_leaf(f, na) || !is_active_leaf(f, nb)) return true;
 
         int ra = root_of(f, na);
         int rb = root_of(f, nb);
-        if (ra == -1 || rb == -1) continue;
+        if (ra == -1 || rb == -1) return true;
 
         if (ra != rb) {
             sampled_conflict_mass += std::min(f_mass[ra], f_mass[rb]);
-            continue;
+            return true;
         }
 
         auto path = path_nodes(f, na, nb);
         auto pendants = pendant_children_on_path(f, path);
         sampled_pendants += static_cast<int>(pendants.size());
         for (int u : pendants) sampled_conflict_mass += f_mass[u];
-    }
+        return true;
+    });
 
     return
         -20.0 * static_cast<double>(comp_count) +
-         0.75 * static_cast<double>(cherries.size()) -
+         0.75 * static_cast<double>(cherry_count) -
          1.75 * static_cast<double>(sampled_pendants) -
          0.02 * static_cast<double>(sampled_conflict_mass);
 }
