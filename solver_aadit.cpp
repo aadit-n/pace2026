@@ -98,11 +98,101 @@ struct DynNode {
 struct DynamicTree {
     int root = -1;
     std::vector<DynNode> nodes;
-    std::unordered_map<int, int> label_to_node; // active pseudo-label -> node
+    std::vector<int> label_to_node; // active pseudo-label -> node, -1 if inactive
     std::vector<char> is_cherry;
     std::vector<int> cherry_pos;
     std::vector<int> cherry_nodes;
 };
+
+struct UndoLog {
+    enum class Kind {
+        Root,
+        NodeParent,
+        NodeLeft,
+        NodeRight,
+        NodeActive,
+        LabelSlot,
+        IsCherrySlot,
+        CherryPosSlot,
+        CherryNodeSlot,
+        NodesSize,
+        LabelSize,
+        IsCherrySize,
+        CherryPosSize,
+        CherryNodesSize
+    };
+
+    struct Entry {
+        Kind kind;
+        DynamicTree* tree;
+        int index;
+        int old_value;
+        int aux;
+    };
+
+    std::vector<Entry> entries;
+
+    size_t mark() const { return entries.size(); }
+
+    void undo_to(size_t mark) {
+        while (entries.size() > mark) {
+            Entry e = entries.back();
+            entries.pop_back();
+            switch (e.kind) {
+                case Kind::Root:
+                    e.tree->root = e.old_value;
+                    break;
+                case Kind::NodeParent:
+                    e.tree->nodes[e.index].parent = e.old_value;
+                    break;
+                case Kind::NodeLeft:
+                    e.tree->nodes[e.index].left = e.old_value;
+                    break;
+                case Kind::NodeRight:
+                    e.tree->nodes[e.index].right = e.old_value;
+                    break;
+                case Kind::NodeActive:
+                    e.tree->nodes[e.index].active = static_cast<bool>(e.old_value);
+                    break;
+                case Kind::LabelSlot:
+                    e.tree->label_to_node[e.index] = e.old_value;
+                    break;
+                case Kind::IsCherrySlot:
+                    e.tree->is_cherry[e.index] = static_cast<char>(e.old_value);
+                    break;
+                case Kind::CherryPosSlot:
+                    e.tree->cherry_pos[e.index] = e.old_value;
+                    break;
+                case Kind::CherryNodeSlot:
+                    e.tree->cherry_nodes[e.index] = e.old_value;
+                    break;
+                case Kind::NodesSize:
+                    e.tree->nodes.resize(static_cast<size_t>(e.old_value));
+                    break;
+                case Kind::LabelSize:
+                    e.tree->label_to_node.resize(static_cast<size_t>(e.old_value));
+                    break;
+                case Kind::IsCherrySize:
+                    e.tree->is_cherry.resize(static_cast<size_t>(e.old_value));
+                    break;
+                case Kind::CherryPosSize:
+                    e.tree->cherry_pos.resize(static_cast<size_t>(e.old_value));
+                    break;
+                case Kind::CherryNodesSize:
+                    e.tree->cherry_nodes.resize(static_cast<size_t>(e.old_value));
+                    if (e.old_value > 0) {
+                        e.tree->cherry_nodes[static_cast<size_t>(e.old_value - 1)] = e.aux;
+                    }
+                    break;
+            }
+        }
+    }
+};
+
+int find_node_of_label(const DynamicTree& t, int label) {
+    if (label < 0 || label >= static_cast<int>(t.label_to_node.size())) return -1;
+    return t.label_to_node[label];
+}
 
 volatile sig_atomic_t g_terminate = 0;
 volatile sig_atomic_t g_output_written = 0;
@@ -514,6 +604,9 @@ DynamicTree build_dynamic_tree(const SimpleTree& st) {
     dt.is_cherry.assign(st.children.size(), 0);
     dt.cherry_pos.assign(st.children.size(), -1);
     dt.root = st.root;
+    int max_label = 0;
+    for (int x : st.leaf_label) max_label = std::max(max_label, x);
+    dt.label_to_node.assign(static_cast<size_t>(max_label + 1), -1);
     for (size_t u = 0; u < st.children.size(); ++u) {
         DynNode& dn = dt.nodes[u];
         dn.parent = st.parent[u];
@@ -530,7 +623,7 @@ DynamicTree build_dynamic_tree(const SimpleTree& st) {
             dn.payload_size = 1;
             dn.topo_a = mix64(static_cast<uint64_t>(st.leaf_label[u]) + 0x1111111111111111ULL);
             dn.topo_b = mix64(static_cast<uint64_t>(st.leaf_label[u]) + 0x2222222222222222ULL);
-            dt.label_to_node[dn.label] = static_cast<int>(u);
+            dt.label_to_node[static_cast<size_t>(dn.label)] = static_cast<int>(u);
         } else {
             dn.label = 0;
             dn.left = st.children[u][0];
@@ -557,26 +650,124 @@ bool is_leaflike(const DynamicTree& t, int u) {
            t.nodes[u].active && t.nodes[u].left == -1 && t.nodes[u].right == -1;
 }
 
-void ensure_cherry_storage(DynamicTree& t) {
-    if (t.is_cherry.size() < t.nodes.size()) t.is_cherry.resize(t.nodes.size(), 0);
-    if (t.cherry_pos.size() < t.nodes.size()) t.cherry_pos.resize(t.nodes.size(), -1);
+void push_undo(UndoLog* log, UndoLog::Kind kind, DynamicTree* tree, int index, int old_value, int aux = 0) {
+    if (log) log->entries.push_back({kind, tree, index, old_value, aux});
 }
 
-void remove_cherry_node(DynamicTree& t, int u) {
+void ensure_label_storage(DynamicTree& t, int label, UndoLog* log = nullptr) {
+    if (label < static_cast<int>(t.label_to_node.size())) return;
+    push_undo(log, UndoLog::Kind::LabelSize, &t, -1, static_cast<int>(t.label_to_node.size()));
+    t.label_to_node.resize(static_cast<size_t>(label + 1), -1);
+}
+
+void ensure_cherry_storage(DynamicTree& t, UndoLog* log = nullptr) {
+    if (t.is_cherry.size() < t.nodes.size()) {
+        push_undo(log, UndoLog::Kind::IsCherrySize, &t, -1, static_cast<int>(t.is_cherry.size()));
+        t.is_cherry.resize(t.nodes.size(), 0);
+    }
+    if (t.cherry_pos.size() < t.nodes.size()) {
+        push_undo(log, UndoLog::Kind::CherryPosSize, &t, -1, static_cast<int>(t.cherry_pos.size()));
+        t.cherry_pos.resize(t.nodes.size(), -1);
+    }
+}
+
+void set_root(DynamicTree& t, int value, UndoLog* log = nullptr) {
+    if (t.root == value) return;
+    push_undo(log, UndoLog::Kind::Root, &t, -1, t.root);
+    t.root = value;
+}
+
+void set_node_parent(DynamicTree& t, int u, int value, UndoLog* log = nullptr) {
+    if (t.nodes[u].parent == value) return;
+    push_undo(log, UndoLog::Kind::NodeParent, &t, u, t.nodes[u].parent);
+    t.nodes[u].parent = value;
+}
+
+void set_node_left(DynamicTree& t, int u, int value, UndoLog* log = nullptr) {
+    if (t.nodes[u].left == value) return;
+    push_undo(log, UndoLog::Kind::NodeLeft, &t, u, t.nodes[u].left);
+    t.nodes[u].left = value;
+}
+
+void set_node_right(DynamicTree& t, int u, int value, UndoLog* log = nullptr) {
+    if (t.nodes[u].right == value) return;
+    push_undo(log, UndoLog::Kind::NodeRight, &t, u, t.nodes[u].right);
+    t.nodes[u].right = value;
+}
+
+void set_node_active(DynamicTree& t, int u, bool value, UndoLog* log = nullptr) {
+    if (t.nodes[u].active == value) return;
+    push_undo(log, UndoLog::Kind::NodeActive, &t, u, static_cast<int>(t.nodes[u].active));
+    t.nodes[u].active = value;
+}
+
+void set_label_slot(DynamicTree& t, int label, int value, UndoLog* log = nullptr) {
+    ensure_label_storage(t, label, log);
+    if (t.label_to_node[static_cast<size_t>(label)] == value) return;
+    push_undo(log, UndoLog::Kind::LabelSlot, &t, label, t.label_to_node[static_cast<size_t>(label)]);
+    t.label_to_node[static_cast<size_t>(label)] = value;
+}
+
+void set_is_cherry_slot(DynamicTree& t, int u, char value, UndoLog* log = nullptr) {
+    ensure_cherry_storage(t, log);
+    if (t.is_cherry[static_cast<size_t>(u)] == value) return;
+    push_undo(log, UndoLog::Kind::IsCherrySlot, &t, u, t.is_cherry[static_cast<size_t>(u)]);
+    t.is_cherry[static_cast<size_t>(u)] = value;
+}
+
+void set_cherry_pos_slot(DynamicTree& t, int u, int value, UndoLog* log = nullptr) {
+    ensure_cherry_storage(t, log);
+    if (t.cherry_pos[static_cast<size_t>(u)] == value) return;
+    push_undo(log, UndoLog::Kind::CherryPosSlot, &t, u, t.cherry_pos[static_cast<size_t>(u)]);
+    t.cherry_pos[static_cast<size_t>(u)] = value;
+}
+
+void set_cherry_node_slot(DynamicTree& t, int idx, int value, UndoLog* log = nullptr) {
+    if (t.cherry_nodes[static_cast<size_t>(idx)] == value) return;
+    push_undo(log, UndoLog::Kind::CherryNodeSlot, &t, idx, t.cherry_nodes[static_cast<size_t>(idx)]);
+    t.cherry_nodes[static_cast<size_t>(idx)] = value;
+}
+
+void push_node(DynamicTree& t, DynNode node, UndoLog* log = nullptr) {
+    push_undo(log, UndoLog::Kind::NodesSize, &t, -1, static_cast<int>(t.nodes.size()));
+    t.nodes.push_back(std::move(node));
+}
+
+void resize_nodes(DynamicTree& t, size_t new_size, UndoLog* log = nullptr) {
+    if (t.nodes.size() == new_size) return;
+    push_undo(log, UndoLog::Kind::NodesSize, &t, -1, static_cast<int>(t.nodes.size()));
+    t.nodes.resize(new_size);
+}
+
+void push_cherry_node(DynamicTree& t, int value, UndoLog* log = nullptr) {
+    int old_size = static_cast<int>(t.cherry_nodes.size());
+    int old_tail = old_size > 0 ? t.cherry_nodes.back() : 0;
+    push_undo(log, UndoLog::Kind::CherryNodesSize, &t, -1, old_size, old_tail);
+    t.cherry_nodes.push_back(value);
+}
+
+void pop_cherry_node(DynamicTree& t, UndoLog* log = nullptr) {
+    int old_size = static_cast<int>(t.cherry_nodes.size());
+    int old_tail = old_size > 0 ? t.cherry_nodes.back() : 0;
+    push_undo(log, UndoLog::Kind::CherryNodesSize, &t, -1, old_size, old_tail);
+    t.cherry_nodes.pop_back();
+}
+
+void remove_cherry_node(DynamicTree& t, int u, UndoLog* log = nullptr) {
     if (u < 0 || u >= static_cast<int>(t.cherry_pos.size())) return;
     int pos = t.cherry_pos[u];
     if (pos == -1) return;
     int last = t.cherry_nodes.back();
-    t.cherry_nodes[pos] = last;
-    t.cherry_pos[last] = pos;
-    t.cherry_nodes.pop_back();
-    t.cherry_pos[u] = -1;
-    t.is_cherry[u] = 0;
+    set_cherry_node_slot(t, pos, last, log);
+    set_cherry_pos_slot(t, last, pos, log);
+    pop_cherry_node(t, log);
+    set_cherry_pos_slot(t, u, -1, log);
+    set_is_cherry_slot(t, u, 0, log);
 }
 
-void refresh_local_cherry_status(DynamicTree& t, int u) {
+void refresh_local_cherry_status(DynamicTree& t, int u, UndoLog* log = nullptr) {
     if (u < 0 || u >= static_cast<int>(t.nodes.size())) return;
-    ensure_cherry_storage(t);
+    ensure_cherry_storage(t, log);
 
     bool now = false;
     if (t.nodes[u].active) {
@@ -586,28 +777,28 @@ void refresh_local_cherry_status(DynamicTree& t, int u) {
     }
     if (now) {
         if (t.cherry_pos[u] == -1) {
-            t.cherry_pos[u] = static_cast<int>(t.cherry_nodes.size());
-            t.cherry_nodes.push_back(u);
+            set_cherry_pos_slot(t, u, static_cast<int>(t.cherry_nodes.size()), log);
+            push_cherry_node(t, u, log);
         }
-        t.is_cherry[u] = 1;
+        set_is_cherry_slot(t, u, 1, log);
     } else {
-        remove_cherry_node(t, u);
+        remove_cherry_node(t, u, log);
     }
 }
 
-void refresh_cherry_neighborhood(DynamicTree& t, int u) {
+void refresh_cherry_neighborhood(DynamicTree& t, int u, UndoLog* log = nullptr) {
     if (u < 0 || u >= static_cast<int>(t.nodes.size())) return;
-    refresh_local_cherry_status(t, u);
+    refresh_local_cherry_status(t, u, log);
     int p = t.nodes[u].parent;
     if (p != -1) {
-        refresh_local_cherry_status(t, p);
+        refresh_local_cherry_status(t, p, log);
         int gp = t.nodes[p].parent;
-        if (gp != -1) refresh_local_cherry_status(t, gp);
+        if (gp != -1) refresh_local_cherry_status(t, gp, log);
     }
     int l = t.nodes[u].left;
     int r = t.nodes[u].right;
-    if (l != -1) refresh_local_cherry_status(t, l);
-    if (r != -1) refresh_local_cherry_status(t, r);
+    if (l != -1) refresh_local_cherry_status(t, l, log);
+    if (r != -1) refresh_local_cherry_status(t, r, log);
 }
 
 bool is_active_leaf(const DynamicTree& t, int u) {
@@ -621,56 +812,56 @@ int degree_children(const DynamicTree& t, int u) {
     return d;
 }
 
-void replace_child(DynamicTree& t, int p, int oldc, int newc) {
+void replace_child(DynamicTree& t, int p, int oldc, int newc, UndoLog* log = nullptr) {
     if (p == -1) return;
-    if (t.nodes[p].left == oldc) t.nodes[p].left = newc;
-    else if (t.nodes[p].right == oldc) t.nodes[p].right = newc;
+    if (t.nodes[p].left == oldc) set_node_left(t, p, newc, log);
+    else if (t.nodes[p].right == oldc) set_node_right(t, p, newc, log);
 }
 
-void suppress_up(DynamicTree& t, int u) {
+void suppress_up(DynamicTree& t, int u, UndoLog* log = nullptr) {
     while (u != -1 && t.nodes[u].active) {
         int deg = degree_children(t, u);
         if (deg != 1) break;
-        remove_cherry_node(t, u);
+        remove_cherry_node(t, u, log);
         int child = (t.nodes[u].left != -1 && t.nodes[t.nodes[u].left].active) ? t.nodes[u].left : t.nodes[u].right;
         int p = t.nodes[u].parent;
         if (p == -1) {
-            t.nodes[child].parent = -1;
-            t.root = child;
-            t.nodes[u].active = false;
-            t.nodes[u].left = t.nodes[u].right = -1;
-            refresh_cherry_neighborhood(t, child);
+            set_node_parent(t, child, -1, log);
+            set_root(t, child, log);
+            set_node_active(t, u, false, log);
+            set_node_left(t, u, -1, log);
+            set_node_right(t, u, -1, log);
+            refresh_cherry_neighborhood(t, child, log);
             break;
         }
-        replace_child(t, p, u, child);
-        t.nodes[child].parent = p;
-        t.nodes[u].active = false;
-        t.nodes[u].left = t.nodes[u].right = -1;
-        refresh_cherry_neighborhood(t, child);
-        refresh_local_cherry_status(t, p);
+        replace_child(t, p, u, child, log);
+        set_node_parent(t, child, p, log);
+        set_node_active(t, u, false, log);
+        set_node_left(t, u, -1, log);
+        set_node_right(t, u, -1, log);
+        refresh_cherry_neighborhood(t, child, log);
+        refresh_local_cherry_status(t, p, log);
         u = p;
     }
-    if (u != -1) refresh_cherry_neighborhood(t, u);
+    if (u != -1) refresh_cherry_neighborhood(t, u, log);
 }
 
-void cut_edge_above(DynamicTree& t, int child) {
+void cut_edge_above(DynamicTree& t, int child, UndoLog* log = nullptr) {
     if (child < 0 || child >= static_cast<int>(t.nodes.size())) return;
     if (!t.nodes[child].active) return;
     int p = t.nodes[child].parent;
     if (p == -1) return;
-    remove_cherry_node(t, p);
-    replace_child(t, p, child, -1);
-    t.nodes[child].parent = -1;
-    refresh_cherry_neighborhood(t, child);
-    suppress_up(t, p);
+    remove_cherry_node(t, p, log);
+    replace_child(t, p, child, -1, log);
+    set_node_parent(t, child, -1, log);
+    refresh_cherry_neighborhood(t, child, log);
+    suppress_up(t, p, log);
 }
 
 bool are_siblings_by_label(const DynamicTree& t, int la, int lb) {
-    auto ia = t.label_to_node.find(la);
-    auto ib = t.label_to_node.find(lb);
-    if (ia == t.label_to_node.end() || ib == t.label_to_node.end()) return false;
-    int a = ia->second;
-    int b = ib->second;
+    int a = find_node_of_label(t, la);
+    int b = find_node_of_label(t, lb);
+    if (a == -1 || b == -1) return false;
     if (!is_active_leaf(t, a) || !is_active_leaf(t, b)) return false;
     int pa = t.nodes[a].parent;
     int pb = t.nodes[b].parent;
@@ -679,20 +870,18 @@ bool are_siblings_by_label(const DynamicTree& t, int la, int lb) {
     return (l == a && r == b) || (l == b && r == a);
 }
 
-bool contract_cherry(DynamicTree& t, int la, int lb, int new_label) {
-    auto ia = t.label_to_node.find(la);
-    auto ib = t.label_to_node.find(lb);
-    if (ia == t.label_to_node.end() || ib == t.label_to_node.end()) return false;
-    int a = ia->second;
-    int b = ib->second;
+bool contract_cherry(DynamicTree& t, int la, int lb, int new_label, UndoLog* log = nullptr) {
+    int a = find_node_of_label(t, la);
+    int b = find_node_of_label(t, lb);
+    if (a == -1 || b == -1) return false;
     if (!is_active_leaf(t, a) || !is_active_leaf(t, b)) return false;
     int p = t.nodes[a].parent;
     if (p == -1 || t.nodes[b].parent != p) return false;
+    int left = t.nodes[p].left;
+    int right = t.nodes[p].right;
+    if (!((left == a && right == b) || (left == b && right == a))) return false;
 
-    int nid = static_cast<int>(t.nodes.size());
-    t.nodes.push_back(DynNode{});
-    ensure_cherry_storage(t);
-    DynNode& nn = t.nodes[nid];
+    DynNode nn;
     nn.parent = p;
     nn.left = -1;
     nn.right = -1;
@@ -711,31 +900,27 @@ bool contract_cherry(DynamicTree& t, int la, int lb, int new_label) {
     nn.topo_a = mix64(aa ^ (ab + 0x9e3779b97f4a7c15ULL));
     nn.topo_b = mix64(ba ^ (bb + 0x517cc1b727220a95ULL));
 
-    t.label_to_node.erase(la);
-    t.label_to_node.erase(lb);
-    t.label_to_node[new_label] = nid;
-    t.cherry_pos[nid] = -1;
-    t.is_cherry[nid] = 0;
+    int nid = static_cast<int>(t.nodes.size());
+    push_node(t, std::move(nn), log);
+    ensure_cherry_storage(t, log);
+    ensure_label_storage(t, new_label, log);
+    set_label_slot(t, la, -1, log);
+    set_label_slot(t, lb, -1, log);
+    set_label_slot(t, new_label, nid, log);
 
-    int left = t.nodes[p].left;
-    int right = t.nodes[p].right;
-    if ((left == a && right == b) || (left == b && right == a)) {
-        t.nodes[p].left = nid;
-        t.nodes[p].right = -1;
-    } else {
-        return false;
-    }
+    set_node_left(t, p, nid, log);
+    set_node_right(t, p, -1, log);
 
-    remove_cherry_node(t, p);
-    remove_cherry_node(t, a);
-    remove_cherry_node(t, b);
-    t.nodes[a].active = false;
-    t.nodes[b].active = false;
-    t.nodes[a].parent = -1;
-    t.nodes[b].parent = -1;
+    remove_cherry_node(t, p, log);
+    remove_cherry_node(t, a, log);
+    remove_cherry_node(t, b, log);
+    set_node_active(t, a, false, log);
+    set_node_active(t, b, false, log);
+    set_node_parent(t, a, -1, log);
+    set_node_parent(t, b, -1, log);
 
-    refresh_cherry_neighborhood(t, nid);
-    suppress_up(t, p);
+    refresh_cherry_neighborhood(t, nid, log);
+    suppress_up(t, p, log);
     return true;
 }
 
@@ -756,7 +941,7 @@ std::vector<std::pair<int, int>> cherries_by_label(const DynamicTree& t) {
     return out;
 }
 
-bool contract_all_common_cherries(DynamicTree& t1, DynamicTree& t2, int& next_label) {
+bool contract_all_common_cherries(DynamicTree& t1, DynamicTree& t2, int& next_label, UndoLog* log = nullptr) {
     bool any = false;
     while (true) {
         auto cherries = cherries_by_label(t1);
@@ -764,7 +949,7 @@ bool contract_all_common_cherries(DynamicTree& t1, DynamicTree& t2, int& next_la
         for (auto [a, b] : cherries) {
             if (!are_siblings_by_label(t1, a, b) || !are_siblings_by_label(t2, a, b)) continue;
             int nl = next_label++;
-            if (contract_cherry(t1, a, b, nl) && contract_cherry(t2, a, b, nl)) {
+            if (contract_cherry(t1, a, b, nl, log) && contract_cherry(t2, a, b, nl, log)) {
                 contracted = true;
                 any = true;
                 break; // restart scan; cherry set changed
@@ -988,12 +1173,9 @@ CherryCandidate build_cherry_candidate(
     cand.same_component = false;
     cand.immediate_gain = cand.common ? 2 : 0;
 
-    auto ia = f.label_to_node.find(a);
-    auto ib = f.label_to_node.find(b);
-    if (ia == f.label_to_node.end() || ib == f.label_to_node.end()) return cand;
-
-    cand.na = ia->second;
-    cand.nb = ib->second;
+    cand.na = find_node_of_label(f, a);
+    cand.nb = find_node_of_label(f, b);
+    if (cand.na == -1 || cand.nb == -1) return cand;
     if (!is_active_leaf(f, cand.na) || !is_active_leaf(f, cand.nb)) return cand;
 
     cand.ra = root_of(f, cand.na);
@@ -1032,8 +1214,8 @@ CherryCandidate build_cherry_candidate(
     return cand;
 }
 
-void apply_cut_plan(DynamicTree& f, const std::vector<int>& cuts) {
-    for (int u : cuts) cut_edge_above(f, u);
+void apply_cut_plan(DynamicTree& f, const std::vector<int>& cuts, UndoLog* log = nullptr) {
+    for (int u : cuts) cut_edge_above(f, u, log);
 }
 
 double evaluate_reduced_state(
@@ -1049,11 +1231,9 @@ double evaluate_reduced_state(
     int sample_limit = std::min<int>(6, cherries.size());
     for (int i = 0; i < sample_limit; ++i) {
         auto [a, b] = cherries[i];
-        auto ia = f.label_to_node.find(a);
-        auto ib = f.label_to_node.find(b);
-        if (ia == f.label_to_node.end() || ib == f.label_to_node.end()) continue;
-        int na = ia->second;
-        int nb = ib->second;
+        int na = find_node_of_label(f, a);
+        int nb = find_node_of_label(f, b);
+        if (na == -1 || nb == -1) continue;
         if (!is_active_leaf(f, na) || !is_active_leaf(f, nb)) continue;
 
         int ra = root_of(f, na);
@@ -1079,8 +1259,8 @@ double evaluate_reduced_state(
 }
 
 std::vector<int> choose_cut_plan(
-    const DynamicTree& t1,
-    const DynamicTree& f,
+    DynamicTree& t1,
+    DynamicTree& f,
     const CherryCandidate& cand,
     int next_label,
     uint64_t& rng
@@ -1119,13 +1299,14 @@ std::vector<int> choose_cut_plan(
 
     double best = -std::numeric_limits<double>::infinity();
     std::vector<int> best_indices;
+    UndoLog undo;
     for (int i = 0; i < static_cast<int>(plans.size()); ++i) {
-        DynamicTree tt = t1;
-        DynamicTree ff = f;
+        size_t mark = undo.mark();
         int nl = next_label;
-        apply_cut_plan(ff, plans[i]);
-        contract_all_common_cherries(tt, ff, nl);
-        double val = evaluate_reduced_state(tt, ff);
+        apply_cut_plan(f, plans[i], &undo);
+        contract_all_common_cherries(t1, f, nl, &undo);
+        double val = evaluate_reduced_state(t1, f);
+        undo.undo_to(mark);
         if (val > best + 1e-9) {
             best = val;
             best_indices = {i};
@@ -1178,9 +1359,8 @@ ThreeApproxResult run_three_approx(
             if (!f.nodes[u].active) continue;
             if (f.nodes[u].left == -1 && f.nodes[u].right == -1 && f.nodes[u].parent == -1) {
                 int lbl = f.nodes[u].label;
-                auto it = t1.label_to_node.find(lbl);
-                if (it != t1.label_to_node.end()) {
-                    int v = it->second;
+                int v = find_node_of_label(t1, lbl);
+                if (v != -1) {
                     cut_edge_above(t1, v);
                 }
             }
@@ -1213,11 +1393,9 @@ ThreeApproxResult run_three_approx(
 
         rng = mix64(rng + 0x517cc1b727220a95ULL);
         auto [a, b] = cherries[static_cast<size_t>(rng % cherries.size())];
-        auto ia = f.label_to_node.find(a);
-        auto ib = f.label_to_node.find(b);
-        if (ia == f.label_to_node.end() || ib == f.label_to_node.end()) break;
-        int na = ia->second;
-        int nb = ib->second;
+        int na = find_node_of_label(f, a);
+        int nb = find_node_of_label(f, b);
+        if (na == -1 || nb == -1) break;
         if (!is_active_leaf(f, na) || !is_active_leaf(f, nb)) continue;
 
         int ra = root_of(f, na);
@@ -1225,20 +1403,25 @@ ThreeApproxResult run_three_approx(
         if (ra == -1 || rb == -1) break;
 
         if (ra != rb) {
-            DynamicTree fa = f;
-            DynamicTree fb = f;
-            cut_edge_above(fa, na);
-            cut_edge_above(fb, nb);
-            int ma = count_common_cherries(t1, fa);
-            int mb = count_common_cherries(t1, fb);
+            UndoLog undo;
+            size_t mark = undo.mark();
+            cut_edge_above(f, na, &undo);
+            int ma = count_common_cherries(t1, f);
+            undo.undo_to(mark);
+
+            mark = undo.mark();
+            cut_edge_above(f, nb, &undo);
+            int mb = count_common_cherries(t1, f);
+            undo.undo_to(mark);
+
             if (ma > mb) {
-                f = std::move(fa);
+                cut_edge_above(f, na);
             } else if (mb > ma) {
-                f = std::move(fb);
+                cut_edge_above(f, nb);
             } else {
                 rng = mix64(rng + 0x94d049bb133111ebULL);
-                if ((rng & 1ULL) == 0ULL) f = std::move(fa);
-                else f = std::move(fb);
+                if ((rng & 1ULL) == 0ULL) cut_edge_above(f, na);
+                else cut_edge_above(f, nb);
             }
             continue;
         }
