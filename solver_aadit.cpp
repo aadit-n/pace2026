@@ -76,6 +76,13 @@ struct TreeData {
     std::unordered_set<Signature, SignatureHasher> cluster_sigs;
 };
 
+struct PayloadNode {
+    int left = -1;
+    int right = -1;
+    int leaf_label = -1;
+    int size = 0;
+};
+
 struct DynNode {
     int parent = -1;
     int left = -1;
@@ -83,10 +90,8 @@ struct DynNode {
     int label = 0; // current active pseudo-leaf label, 0 for internal
     bool active = true;
 
-    // Contraction history tree for expansion to original labels.
-    int comp_left = -1;
-    int comp_right = -1;
-    std::vector<int> merged_original; // non-empty iff this node is a pseudo leaf
+    // Expansion payload for active pseudo leaves.
+    int payload_id = -1;
 
     // Rooted subtree signature for active pseudo leaves.
     uint64_t leafset_hash = 0;
@@ -98,6 +103,7 @@ struct DynNode {
 struct DynamicTree {
     int root = -1;
     std::vector<DynNode> nodes;
+    std::vector<PayloadNode> payloads;
     std::vector<int> label_to_node; // active pseudo-label -> node, -1 if inactive
     std::vector<char> is_cherry;
     std::vector<int> cherry_pos;
@@ -116,6 +122,7 @@ struct UndoLog {
         CherryPosSlot,
         CherryNodeSlot,
         NodesSize,
+        PayloadsSize,
         LabelSize,
         IsCherrySize,
         CherryPosSize,
@@ -169,6 +176,9 @@ struct UndoLog {
                 case Kind::NodesSize:
                     e.tree->nodes.resize(static_cast<size_t>(e.old_value));
                     break;
+                case Kind::PayloadsSize:
+                    e.tree->payloads.resize(static_cast<size_t>(e.old_value));
+                    break;
                 case Kind::LabelSize:
                     e.tree->label_to_node.resize(static_cast<size_t>(e.old_value));
                     break;
@@ -192,6 +202,14 @@ struct UndoLog {
 int find_node_of_label(const DynamicTree& t, int label) {
     if (label < 0 || label >= static_cast<int>(t.label_to_node.size())) return -1;
     return t.label_to_node[label];
+}
+
+void push_undo(UndoLog* log, UndoLog::Kind kind, DynamicTree* tree, int index, int old_value, int aux = 0);
+
+int push_payload(DynamicTree& t, PayloadNode payload, UndoLog* log = nullptr) {
+    push_undo(log, UndoLog::Kind::PayloadsSize, &t, -1, static_cast<int>(t.payloads.size()));
+    t.payloads.push_back(std::move(payload));
+    return static_cast<int>(t.payloads.size()) - 1;
 }
 
 volatile sig_atomic_t g_terminate = 0;
@@ -601,6 +619,7 @@ std::vector<std::string> forest_from_partition(
 DynamicTree build_dynamic_tree(const SimpleTree& st) {
     DynamicTree dt;
     dt.nodes.resize(st.children.size());
+    dt.payloads.reserve(st.children.size());
     dt.is_cherry.assign(st.children.size(), 0);
     dt.cherry_pos.assign(st.children.size(), -1);
     dt.root = st.root;
@@ -613,12 +632,11 @@ DynamicTree build_dynamic_tree(const SimpleTree& st) {
         dn.left = -1;
         dn.right = -1;
         dn.active = true;
-        dn.comp_left = -1;
-        dn.comp_right = -1;
+        dn.payload_id = -1;
 
         if (st.children[u].empty()) {
             dn.label = st.leaf_label[u];
-            dn.merged_original = {st.leaf_label[u]};
+            dn.payload_id = push_payload(dt, PayloadNode{-1, -1, st.leaf_label[u], 1});
             dn.leafset_hash = mix64(static_cast<uint64_t>(st.leaf_label[u]) * 0x9e3779b97f4a7c15ULL + 0xabcULL);
             dn.payload_size = 1;
             dn.topo_a = mix64(static_cast<uint64_t>(st.leaf_label[u]) + 0x1111111111111111ULL);
@@ -650,7 +668,7 @@ bool is_leaflike(const DynamicTree& t, int u) {
            t.nodes[u].active && t.nodes[u].left == -1 && t.nodes[u].right == -1;
 }
 
-void push_undo(UndoLog* log, UndoLog::Kind kind, DynamicTree* tree, int index, int old_value, int aux = 0) {
+void push_undo(UndoLog* log, UndoLog::Kind kind, DynamicTree* tree, int index, int old_value, int aux) {
     if (log) log->entries.push_back({kind, tree, index, old_value, aux});
 }
 
@@ -887,10 +905,16 @@ bool contract_cherry(DynamicTree& t, int la, int lb, int new_label, UndoLog* log
     nn.right = -1;
     nn.label = new_label;
     nn.active = true;
-    nn.comp_left = a;
-    nn.comp_right = b;
-    nn.merged_original = t.nodes[a].merged_original;
-    nn.merged_original.insert(nn.merged_original.end(), t.nodes[b].merged_original.begin(), t.nodes[b].merged_original.end());
+    nn.payload_id = push_payload(
+        t,
+        PayloadNode{
+            t.nodes[a].payload_id,
+            t.nodes[b].payload_id,
+            -1,
+            t.nodes[a].payload_size + t.nodes[b].payload_size
+        },
+        log
+    );
     nn.leafset_hash = t.nodes[a].leafset_hash ^ t.nodes[b].leafset_hash;
     nn.payload_size = t.nodes[a].payload_size + t.nodes[b].payload_size;
     uint64_t aa = t.nodes[a].topo_a, ab = t.nodes[b].topo_a;
@@ -1089,11 +1113,21 @@ std::vector<std::vector<int>> greedy_merge_partition(
     return comps;
 }
 
+void collect_payload_leaves(const DynamicTree& t, int payload_id, std::vector<int>& out) {
+    if (payload_id < 0 || payload_id >= static_cast<int>(t.payloads.size())) return;
+    const auto& payload = t.payloads[static_cast<size_t>(payload_id)];
+    if (payload.leaf_label != -1) {
+        out.push_back(payload.leaf_label);
+        return;
+    }
+    collect_payload_leaves(t, payload.left, out);
+    collect_payload_leaves(t, payload.right, out);
+}
+
 void collect_component_leaves(const DynamicTree& t, int u, std::vector<int>& out) {
     if (u == -1 || !t.nodes[u].active) return;
     if (t.nodes[u].left == -1 && t.nodes[u].right == -1) {
-        const auto& m = t.nodes[u].merged_original;
-        out.insert(out.end(), m.begin(), m.end());
+        collect_payload_leaves(t, t.nodes[u].payload_id, out);
         return;
     }
     if (t.nodes[u].left != -1) collect_component_leaves(t, t.nodes[u].left, out);
