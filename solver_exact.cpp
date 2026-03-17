@@ -29,7 +29,14 @@ uint64_t mix64(uint64_t x);
 struct PaceInstance {
     int tree_count = 0;
     int leaf_count = 0;
+    bool has_aux_root = false;
     std::vector<std::string> newick_lines;
+    struct TreeDecomposition {
+        int width = -1;
+        std::vector<std::vector<int>> bags;
+        std::vector<std::pair<int, int>> edges;
+        bool valid = false;
+    } treedecomp;
 };
 
 struct Signature {
@@ -204,6 +211,7 @@ int find_node_of_label(const DynamicTree& t, int label) {
     return t.label_to_node[label];
 }
 
+void collect_active_postorder(const DynamicTree& t, std::vector<int>& order);
 void push_undo(UndoLog* log, UndoLog::Kind kind, DynamicTree* tree, int index, int old_value, int aux = 0);
 
 int push_payload(DynamicTree& t, PayloadNode payload, UndoLog* log = nullptr) {
@@ -381,6 +389,99 @@ private:
     }
 };
 
+class IntArrayParser {
+public:
+    explicit IntArrayParser(std::string s) : s_(std::move(s)) {}
+
+    bool parse_treedecomp(PaceInstance::TreeDecomposition& td) {
+        try {
+            skip_ws();
+            expect('[');
+            td.width = parse_int();
+            expect(',');
+            td.bags = parse_nested_int_lists();
+            expect(',');
+            td.edges.clear();
+            auto raw_edges = parse_nested_int_lists();
+            for (const auto& edge : raw_edges) {
+                if (edge.size() != 2) return false;
+                td.edges.push_back({edge[0], edge[1]});
+            }
+            expect(']');
+            skip_ws();
+            td.valid = (pos_ == s_.size());
+            return td.valid;
+        } catch (...) {
+            return false;
+        }
+    }
+
+private:
+    std::string s_;
+    size_t pos_ = 0;
+
+    void skip_ws() {
+        while (pos_ < s_.size() && std::isspace(static_cast<unsigned char>(s_[pos_]))) ++pos_;
+    }
+
+    void expect(char c) {
+        skip_ws();
+        if (pos_ >= s_.size() || s_[pos_] != c) throw std::runtime_error("unexpected token");
+        ++pos_;
+    }
+
+    int parse_int() {
+        skip_ws();
+        size_t start = pos_;
+        if (pos_ < s_.size() && (s_[pos_] == '-' || s_[pos_] == '+')) ++pos_;
+        while (pos_ < s_.size() && std::isdigit(static_cast<unsigned char>(s_[pos_]))) ++pos_;
+        if (start == pos_) throw std::runtime_error("expected int");
+        return std::stoi(s_.substr(start, pos_ - start));
+    }
+
+    std::vector<int> parse_int_list() {
+        std::vector<int> out;
+        expect('[');
+        skip_ws();
+        if (pos_ < s_.size() && s_[pos_] == ']') {
+            ++pos_;
+            return out;
+        }
+        while (true) {
+            out.push_back(parse_int());
+            skip_ws();
+            if (pos_ < s_.size() && s_[pos_] == ',') {
+                ++pos_;
+                continue;
+            }
+            break;
+        }
+        expect(']');
+        return out;
+    }
+
+    std::vector<std::vector<int>> parse_nested_int_lists() {
+        std::vector<std::vector<int>> out;
+        expect('[');
+        skip_ws();
+        if (pos_ < s_.size() && s_[pos_] == ']') {
+            ++pos_;
+            return out;
+        }
+        while (true) {
+            out.push_back(parse_int_list());
+            skip_ws();
+            if (pos_ < s_.size() && s_[pos_] == ',') {
+                ++pos_;
+                continue;
+            }
+            break;
+        }
+        expect(']');
+        return out;
+    }
+};
+
 bool read_instance(PaceInstance& inst) {
     std::string line;
     bool have_p = false;
@@ -395,6 +496,14 @@ bool read_instance(PaceInstance& inst) {
                 if (inst.tree_count > 0 && inst.leaf_count > 0) {
                     have_p = true;
                     g_last_leaf_count = inst.leaf_count;
+                }
+            } else if (line.rfind("#x treedecomp", 0) == 0) {
+                size_t pos = line.find('[');
+                if (pos != std::string::npos) {
+                    PaceInstance::TreeDecomposition td;
+                    if (IntArrayParser(line.substr(pos)).parse_treedecomp(td)) {
+                        inst.treedecomp = std::move(td);
+                    }
                 }
             }
             continue;
@@ -613,6 +722,199 @@ std::vector<std::string> forest_from_partition(
     out.reserve(lines.size());
     for (auto& p : lines) out.push_back(std::move(p.second));
     return out;
+}
+
+struct ParsedInstance {
+    int tree_count = 0;
+    int leaf_count = 0;
+    bool has_aux_root = false;
+    std::vector<uint64_t> zob;
+    std::vector<SimpleTree> parsed;
+    std::vector<TreeData> trees;
+    std::vector<std::vector<int>> td_candidates;
+};
+
+struct SolveComponentsResult {
+    bool complete = false;
+    std::vector<std::vector<int>> components;
+};
+
+void collect_subtree_leaves(const TreeData& t, int u, std::vector<int>& out) {
+    if (u == -1) return;
+    if (t.is_leaf[u]) {
+        out.push_back(t.leaf_label[u]);
+        return;
+    }
+    collect_subtree_leaves(t, t.child0[u], out);
+    collect_subtree_leaves(t, t.child1[u], out);
+}
+
+uint64_t hash_of_leaves(const std::vector<int>& leaves, const std::vector<uint64_t>& zob) {
+    uint64_t h = 0;
+    for (int x : leaves) h ^= zob[x];
+    return h;
+}
+
+bool is_common_cluster(
+    const std::vector<int>& leaves,
+    const std::vector<uint64_t>& zob,
+    const std::vector<TreeData>& trees
+) {
+    if (leaves.empty()) return false;
+    uint64_t h = hash_of_leaves(leaves, zob);
+    int sz = static_cast<int>(leaves.size());
+    for (const auto& t : trees) {
+        int r = lca_of_leaves(t, leaves);
+        if (r == -1) return false;
+        if (t.sub_count[r] != sz || t.sub_hash[r] != h) return false;
+    }
+    return true;
+}
+
+std::string restricted_newick_dfs_remap(
+    int u,
+    const TreeData& t,
+    const std::vector<char>& in_subset,
+    const std::vector<int>& remap
+) {
+    if (t.is_leaf[u]) {
+        int x = t.leaf_label[u];
+        return in_subset[x] ? std::to_string(remap[x]) : std::string();
+    }
+    std::string a = restricted_newick_dfs_remap(t.child0[u], t, in_subset, remap);
+    std::string b = restricted_newick_dfs_remap(t.child1[u], t, in_subset, remap);
+    if (a.empty() && b.empty()) return {};
+    if (a.empty()) return b;
+    if (b.empty()) return a;
+    return "(" + a + "," + b + ")";
+}
+
+std::string compress_cluster_newick_dfs(
+    int u,
+    const TreeData& t,
+    uint64_t cluster_hash,
+    int cluster_size,
+    const std::vector<char>& in_cluster,
+    const std::vector<int>& outside_remap,
+    int meta_label
+) {
+    if (t.sub_count[u] == cluster_size && t.sub_hash[u] == cluster_hash) {
+        return std::to_string(meta_label);
+    }
+    if (t.is_leaf[u]) {
+        int x = t.leaf_label[u];
+        if (in_cluster[x]) return {};
+        return std::to_string(outside_remap[x]);
+    }
+    std::string a = compress_cluster_newick_dfs(
+        t.child0[u], t, cluster_hash, cluster_size, in_cluster, outside_remap, meta_label
+    );
+    std::string b = compress_cluster_newick_dfs(
+        t.child1[u], t, cluster_hash, cluster_size, in_cluster, outside_remap, meta_label
+    );
+    if (a.empty() && b.empty()) return {};
+    if (a.empty()) return b;
+    if (b.empty()) return a;
+    return "(" + a + "," + b + ")";
+}
+
+std::vector<std::vector<int>> extract_treedecomp_leaf_candidates(
+    const PaceInstance::TreeDecomposition& td,
+    int n
+) {
+    std::vector<std::vector<int>> out;
+    if (!td.valid || td.bags.empty()) return out;
+
+    std::vector<std::vector<int>> graph(td.bags.size());
+    for (const auto& [a1, b1] : td.edges) {
+        int a = a1 - 1;
+        int b = b1 - 1;
+        if (a < 0 || b < 0 || a >= static_cast<int>(td.bags.size()) || b >= static_cast<int>(td.bags.size())) continue;
+        graph[static_cast<size_t>(a)].push_back(b);
+        graph[static_cast<size_t>(b)].push_back(a);
+    }
+
+    std::vector<std::vector<int>> bag_leafsets(td.bags.size());
+    for (size_t i = 0; i < td.bags.size(); ++i) {
+        for (int x : td.bags[i]) {
+            if (1 <= x && x <= n) bag_leafsets[i].push_back(x);
+        }
+        std::sort(bag_leafsets[i].begin(), bag_leafsets[i].end());
+        bag_leafsets[i].erase(std::unique(bag_leafsets[i].begin(), bag_leafsets[i].end()), bag_leafsets[i].end());
+    }
+
+    for (const auto& [a1, b1] : td.edges) {
+        int a = a1 - 1;
+        int b = b1 - 1;
+        if (a < 0 || b < 0 || a >= static_cast<int>(graph.size()) || b >= static_cast<int>(graph.size())) continue;
+
+        std::vector<char> seen(graph.size(), 0);
+        std::vector<int> stack{a};
+        seen[static_cast<size_t>(a)] = 1;
+        std::vector<char> in_side(n + 1, 0);
+        while (!stack.empty()) {
+            int u = stack.back();
+            stack.pop_back();
+            for (int x : bag_leafsets[static_cast<size_t>(u)]) in_side[x] = 1;
+            for (int v : graph[static_cast<size_t>(u)]) {
+                if ((u == a && v == b) || (u == b && v == a)) continue;
+                if (seen[static_cast<size_t>(v)]) continue;
+                seen[static_cast<size_t>(v)] = 1;
+                stack.push_back(v);
+            }
+        }
+
+        std::vector<int> side;
+        std::vector<int> other;
+        side.reserve(n);
+        other.reserve(n);
+        for (int x = 1; x <= n; ++x) {
+            if (in_side[x]) side.push_back(x);
+            else other.push_back(x);
+        }
+        if (side.empty() || other.empty()) continue;
+        if (side.size() > other.size()) side.swap(other);
+        if (side.size() <= 1 || side.size() >= static_cast<size_t>(n)) continue;
+        out.push_back(std::move(side));
+    }
+
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+        if (a.size() != b.size()) return a.size() > b.size();
+        return a < b;
+    });
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+bool parse_instance_data(const PaceInstance& inst, ParsedInstance& data) {
+    data.tree_count = inst.tree_count;
+    data.leaf_count = inst.leaf_count;
+    data.has_aux_root = inst.has_aux_root;
+
+    int n = inst.leaf_count;
+    if (n <= 0) return false;
+
+    data.zob.assign(n + 1, 0);
+    for (int x = 1; x <= n; ++x) {
+        data.zob[x] = mix64(static_cast<uint64_t>(x) * 0x9e3779b97f4a7c15ULL + 0xabcULL);
+    }
+
+    data.parsed.clear();
+    data.trees.clear();
+    data.parsed.reserve(static_cast<size_t>(inst.tree_count));
+    data.trees.reserve(static_cast<size_t>(inst.tree_count));
+    for (const auto& line : inst.newick_lines) {
+        if (!parse_with_genesis(line)) return false;
+        SimpleTree st;
+        if (!NewickParser(line).parse(st)) return false;
+        TreeData td;
+        if (!build_tree_data(st, n, data.zob, td)) return false;
+        data.parsed.push_back(std::move(st));
+        data.trees.push_back(std::move(td));
+    }
+
+    data.td_candidates = extract_treedecomp_leaf_candidates(inst.treedecomp, n);
+    return true;
 }
 
 DynamicTree build_dynamic_tree(const SimpleTree& st) {
@@ -1048,15 +1350,6 @@ std::vector<int> pendant_children_on_path(const DynamicTree& t, const std::vecto
     return out;
 }
 
-int count_common_cherries(const DynamicTree& t1, const DynamicTree& f) {
-    int cnt = 0;
-    for_each_cherry_label_pair(t1, [&](int a, int b) {
-        if (are_siblings_by_label(f, a, b)) ++cnt;
-        return true;
-    });
-    return cnt;
-}
-
 int active_leaf_count(const DynamicTree& t) {
     int c = 0;
     for (const auto& n : t.nodes) if (n.active && n.left == -1 && n.right == -1) ++c;
@@ -1165,6 +1458,124 @@ std::vector<std::vector<int>> components_from_dynamic(const DynamicTree& t) {
     return comps;
 }
 
+std::string encode_components_state(const std::vector<std::vector<int>>& comps, int next_idx) {
+    size_t reserve = 16;
+    for (const auto& comp : comps) reserve += comp.size() * 4 + 1;
+    std::string key;
+    key.reserve(reserve);
+    key += std::to_string(next_idx);
+    key.push_back('|');
+    for (const auto& comp : comps) {
+        for (int x : comp) {
+            key += std::to_string(x);
+            key.push_back(',');
+        }
+        key.push_back(';');
+    }
+    return key;
+}
+
+void bits_set(std::vector<uint64_t>& bits, int label) {
+    int idx = label - 1;
+    bits[static_cast<size_t>(idx >> 6)] |= (1ULL << (idx & 63));
+}
+
+bool bits_intersect(const std::vector<uint64_t>& a, const std::vector<uint64_t>& b) {
+    for (size_t i = 0; i < a.size(); ++i) {
+        if ((a[i] & b[i]) != 0ULL) return true;
+    }
+    return false;
+}
+
+bool bits_subset_of(const std::vector<uint64_t>& a, const std::vector<uint64_t>& b) {
+    for (size_t i = 0; i < a.size(); ++i) {
+        if ((a[i] & ~b[i]) != 0ULL) return false;
+    }
+    return true;
+}
+
+bool bits_equal(const std::vector<uint64_t>& a, const std::vector<uint64_t>& b) {
+    return a == b;
+}
+
+void bits_or_assign(std::vector<uint64_t>& dst, const std::vector<uint64_t>& src) {
+    for (size_t i = 0; i < dst.size(); ++i) dst[i] |= src[i];
+}
+
+void collect_payload_bits(const DynamicTree& t, int payload_id, std::vector<uint64_t>& bits) {
+    if (payload_id < 0 || payload_id >= static_cast<int>(t.payloads.size())) return;
+    const auto& payload = t.payloads[static_cast<size_t>(payload_id)];
+    if (payload.leaf_label != -1) {
+        bits_set(bits, payload.leaf_label);
+        return;
+    }
+    collect_payload_bits(t, payload.left, bits);
+    collect_payload_bits(t, payload.right, bits);
+}
+
+std::vector<std::vector<uint64_t>> compute_active_leaf_bits(const DynamicTree& t, int n) {
+    const size_t words = static_cast<size_t>((n + 63) >> 6);
+    std::vector<std::vector<uint64_t>> bits(t.nodes.size(), std::vector<uint64_t>(words, 0ULL));
+    std::vector<int> order;
+    collect_active_postorder(t, order);
+    for (int u : order) {
+        if (is_leaflike(t, u)) {
+            collect_payload_bits(t, t.nodes[u].payload_id, bits[static_cast<size_t>(u)]);
+            continue;
+        }
+        int l = t.nodes[u].left;
+        int r = t.nodes[u].right;
+        if (l != -1 && t.nodes[l].active) bits_or_assign(bits[static_cast<size_t>(u)], bits[static_cast<size_t>(l)]);
+        if (r != -1 && t.nodes[r].active) bits_or_assign(bits[static_cast<size_t>(u)], bits[static_cast<size_t>(r)]);
+    }
+    return bits;
+}
+
+bool is_union_of_root_components(
+    const std::vector<uint64_t>& target,
+    const std::vector<std::vector<uint64_t>>& root_bits
+) {
+    std::vector<uint64_t> acc(target.size(), 0ULL);
+    bool used = false;
+    for (const auto& comp : root_bits) {
+        if (!bits_intersect(comp, target)) continue;
+        if (!bits_subset_of(comp, target)) return false;
+        bits_or_assign(acc, comp);
+        used = true;
+    }
+    return used && bits_equal(acc, target);
+}
+
+bool apply_reduction_rule_against(DynamicTree& dst, const DynamicTree& src, int n) {
+    auto src_bits = compute_active_leaf_bits(src, n);
+    std::vector<std::vector<uint64_t>> root_bits;
+    for (int u = 0; u < static_cast<int>(src.nodes.size()); ++u) {
+        if (!src.nodes[u].active || src.nodes[u].parent != -1) continue;
+        root_bits.push_back(src_bits[static_cast<size_t>(u)]);
+    }
+
+    auto dst_bits = compute_active_leaf_bits(dst, n);
+    for (int u = 0; u < static_cast<int>(dst.nodes.size()); ++u) {
+        if (!dst.nodes[u].active || dst.nodes[u].parent == -1) continue;
+        if (!is_union_of_root_components(dst_bits[static_cast<size_t>(u)], root_bits)) continue;
+        cut_edge_above(dst, u);
+        return true;
+    }
+    return false;
+}
+
+bool apply_pair_reduction_rule(DynamicTree& f1, DynamicTree& f2, int n) {
+    bool any = false;
+    while (true) {
+        bool changed = false;
+        changed |= apply_reduction_rule_against(f1, f2, n);
+        changed |= apply_reduction_rule_against(f2, f1, n);
+        if (!changed) break;
+        any = true;
+    }
+    return any;
+}
+
 DynamicTree build_dynamic_forest(const std::vector<SimpleTree>& forest) {
     DynamicTree dt;
     int total_nodes = 0;
@@ -1268,358 +1679,26 @@ void collect_active_postorder(const DynamicTree& t, std::vector<int>& order) {
     }
 }
 
-std::vector<int> compute_active_leaf_masses(const DynamicTree& t) {
-    std::vector<int> mass(t.nodes.size(), 0);
-    std::vector<int> order;
-    collect_active_postorder(t, order);
-    for (int u : order) {
-        if (is_leaflike(t, u)) {
-            mass[u] = t.nodes[u].payload_size;
-        } else {
-            int total = 0;
-            if (t.nodes[u].left != -1 && t.nodes[t.nodes[u].left].active) total += mass[t.nodes[u].left];
-            if (t.nodes[u].right != -1 && t.nodes[t.nodes[u].right].active) total += mass[t.nodes[u].right];
-            mass[u] = total;
-        }
-    }
-    return mass;
-}
-
-struct CherryCandidate {
-    int a = -1;
-    int b = -1;
-    double score = -std::numeric_limits<double>::infinity();
-    bool common = false;
-    bool same_component = false;
-    int na = -1;
-    int nb = -1;
-    int ra = -1;
-    int rb = -1;
-    int distance = 0;
-    int pendant_count = 0;
-    int conflict_mass = 0;
-    int component_size = 0;
-    int immediate_gain = 0;
-    std::vector<int> path;
-    std::vector<int> pendants;
-};
-
-CherryCandidate build_cherry_candidate(
-    const DynamicTree& t1,
-    const DynamicTree& f,
-    const std::vector<int>& f_mass,
-    int a,
-    int b
-) {
-    CherryCandidate cand;
-    cand.a = a;
-    cand.b = b;
-    cand.common = are_siblings_by_label(f, a, b);
-    cand.same_component = false;
-    cand.immediate_gain = cand.common ? 2 : 0;
-
-    cand.na = find_node_of_label(f, a);
-    cand.nb = find_node_of_label(f, b);
-    if (cand.na == -1 || cand.nb == -1) return cand;
-    if (!is_active_leaf(f, cand.na) || !is_active_leaf(f, cand.nb)) return cand;
-
-    cand.ra = root_of(f, cand.na);
-    cand.rb = root_of(f, cand.nb);
-    if (cand.ra == -1 || cand.rb == -1) return cand;
-
-    cand.same_component = (cand.ra == cand.rb);
-    if (cand.same_component) {
-        cand.path = path_nodes(f, cand.na, cand.nb);
-        cand.distance = cand.path.empty() ? 0 : static_cast<int>(cand.path.size()) - 1;
-        cand.pendants = pendant_children_on_path(f, cand.path);
-        cand.pendant_count = static_cast<int>(cand.pendants.size());
-        for (int u : cand.pendants) {
-            if (u >= 0 && u < static_cast<int>(f_mass.size())) cand.conflict_mass += f_mass[u];
-        }
-        if (cand.ra >= 0 && cand.ra < static_cast<int>(f_mass.size())) cand.component_size = f_mass[cand.ra];
-        if (cand.pendant_count == 1) cand.immediate_gain += 1;
-    } else {
-        int ma = (cand.ra >= 0 && cand.ra < static_cast<int>(f_mass.size())) ? f_mass[cand.ra] : 0;
-        int mb = (cand.rb >= 0 && cand.rb < static_cast<int>(f_mass.size())) ? f_mass[cand.rb] : 0;
-        cand.component_size = std::min(ma, mb);
-        cand.conflict_mass = cand.component_size;
-        cand.immediate_gain += 1;
-    }
-
-    cand.score =
-        (cand.common ? 12.0 : 0.0) +
-        (cand.same_component ? 0.0 : 4.0) -
-        1.5 * static_cast<double>(cand.distance) -
-        2.0 * static_cast<double>(cand.pendant_count) -
-        0.02 * static_cast<double>(cand.conflict_mass) +
-        3.0 * static_cast<double>(cand.immediate_gain) -
-        0.01 * static_cast<double>(cand.component_size);
-
-    (void)t1;
-    return cand;
-}
-
-void apply_cut_plan(DynamicTree& f, const std::vector<int>& cuts, UndoLog* log = nullptr) {
-    for (int u : cuts) cut_edge_above(f, u, log);
-}
-
-double evaluate_reduced_state(
-    const DynamicTree& t1,
-    const DynamicTree& f
-) {
-    auto f_mass = compute_active_leaf_masses(f);
-    int comp_count = count_root_components(f);
-    int sampled_pendants = 0;
-    int sampled_conflict_mass = 0;
-
-    int cherry_count = 0;
-    int sampled = 0;
-    for_each_cherry_label_pair(t1, [&](int a, int b) {
-        ++cherry_count;
-        if (sampled >= 6) return true;
-        ++sampled;
-        int na = find_node_of_label(f, a);
-        int nb = find_node_of_label(f, b);
-        if (na == -1 || nb == -1) return true;
-        if (!is_active_leaf(f, na) || !is_active_leaf(f, nb)) return true;
-
-        int ra = root_of(f, na);
-        int rb = root_of(f, nb);
-        if (ra == -1 || rb == -1) return true;
-
-        if (ra != rb) {
-            sampled_conflict_mass += std::min(f_mass[ra], f_mass[rb]);
-            return true;
-        }
-
-        auto path = path_nodes(f, na, nb);
-        auto pendants = pendant_children_on_path(f, path);
-        sampled_pendants += static_cast<int>(pendants.size());
-        for (int u : pendants) sampled_conflict_mass += f_mass[u];
-        return true;
-    });
-
-    return
-        -20.0 * static_cast<double>(comp_count) +
-         0.75 * static_cast<double>(cherry_count) -
-         1.75 * static_cast<double>(sampled_pendants) -
-         0.02 * static_cast<double>(sampled_conflict_mass);
-}
-
-std::vector<int> choose_cut_plan(
-    DynamicTree& t1,
-    DynamicTree& f,
-    const CherryCandidate& cand,
-    int next_label,
-    uint64_t& rng
-) {
-    std::vector<std::vector<int>> plans;
-    if (!cand.same_component) {
-        plans.push_back({cand.na});
-        plans.push_back({cand.nb});
-    } else {
-        auto f_mass = compute_active_leaf_masses(f);
-        std::vector<int> sorted = cand.pendants;
-        std::sort(sorted.begin(), sorted.end(), [&](int x, int y) {
-            return f_mass[x] < f_mass[y];
-        });
-
-        // On harder same-component conflicts, scoring every pendant cut is
-        // expensive and tends to hurt completed-run count more than it helps.
-        size_t individual_limit = std::min<size_t>(4, sorted.size());
-        for (size_t i = 0; i < individual_limit; ++i) {
-            plans.push_back({sorted[i]});
-        }
-        plans.push_back({cand.na});
-        plans.push_back({cand.nb});
-        if (cand.pendants.size() > 1) {
-            std::vector<int> bundle;
-            for (size_t i = 0; i < (sorted.size() + 1) / 2; ++i) bundle.push_back(sorted[i]);
-            plans.push_back(std::move(bundle));
-            if (cand.pendants.size() <= 6) {
-                std::vector<int> classic{cand.na, cand.nb};
-                classic.insert(classic.end(), cand.pendants.begin(), cand.pendants.end());
-                plans.push_back(std::move(classic));
-            }
-        }
-    }
-    if (plans.empty()) return {};
-
-    double best = -std::numeric_limits<double>::infinity();
-    std::vector<int> best_indices;
-    UndoLog undo;
-    for (int i = 0; i < static_cast<int>(plans.size()); ++i) {
-        size_t mark = undo.mark();
-        int nl = next_label;
-        apply_cut_plan(f, plans[i], &undo);
-        contract_all_common_cherries(t1, f, nl, &undo);
-        double val = evaluate_reduced_state(t1, f);
-        undo.undo_to(mark);
-        if (val > best + 1e-9) {
-            best = val;
-            best_indices = {i};
-        } else if (std::abs(val - best) <= 1e-9) {
-            best_indices.push_back(i);
-        }
-    }
-
-    rng = mix64(rng + 0x94d049bb133111ebULL);
-    return plans[best_indices[static_cast<size_t>(rng % best_indices.size())]];
-}
-
-bool use_expensive_same_component_plan(
-    int total_leaves,
-    const std::vector<int>& path,
-    const std::vector<int>& pendants
-) {
-    // The rollout-style chooser pays off on small/medium instances,
-    // but on the largest instances it can prevent any completed run.
-    if (total_leaves > 4000) return false;
-    if (path.size() > 64) return false;
-    if (pendants.size() > 10) return false;
-    return true;
-}
-
-struct ThreeApproxResult {
-    std::vector<std::vector<int>> comps;
-    bool complete = false;
-};
-
-ThreeApproxResult run_three_approx(
-    DynamicTree t1,
-    DynamicTree f,
-    Clock::time_point deadline,
-    int n,
-    int incumbent_components,
-    uint64_t seed
-) {
-    int next_label = n + 1;
-    uint64_t rng = seed ^ 0x9e3779b97f4a7c15ULL;
-    bool timed_out_or_terminated = false;
-
-    // Exhaust common cherries before branching.
-    contract_all_common_cherries(t1, f, next_label);
-
-    while (!g_terminate && Clock::now() < deadline && active_leaf_count(t1) > 2) {
-        // --- Step 1: remove singleton leaves in F that are roots ---
-        // For each leaf in F that is a root, cut its corresponding edge in T1.
-        for (int u = 0; u < static_cast<int>(f.nodes.size()); ++u) {
-            if (!f.nodes[u].active) continue;
-            if (f.nodes[u].left == -1 && f.nodes[u].right == -1 && f.nodes[u].parent == -1) {
-                int lbl = f.nodes[u].label;
-                int v = find_node_of_label(t1, lbl);
-                if (v != -1) {
-                    cut_edge_above(t1, v);
-                }
-            }
-        }
-
-        // Cuts never decrease the number of forest components, so once the
-        // current forest cannot beat the incumbent we can abandon this restart.
-        if (incumbent_components < std::numeric_limits<int>::max() &&
-            count_root_components(f) >= incumbent_components) {
-            break;
-        }
-
-        auto cherries = cherries_by_label(t1);
-        if (cherries.empty()) break;
-
-        bool did_common_contract = false;
-        rng = mix64(rng + 0x9e3779b97f4a7c15ULL);
-        size_t start_idx = cherries.empty() ? 0 : static_cast<size_t>(rng % cherries.size());
-        for (size_t step = 0; step < cherries.size(); ++step) {
-            auto [a, b] = cherries[(start_idx + step) % cherries.size()];
-            if (are_siblings_by_label(f, a, b)) {
-                int nl = next_label++;
-                if (contract_cherry(t1, a, b, nl) && contract_cherry(f, a, b, nl)) {
-                    did_common_contract = true;
-                    break;
-                }
-            }
-        }
-        if (did_common_contract) continue;
-
-        rng = mix64(rng + 0x517cc1b727220a95ULL);
-        auto [a, b] = cherries[static_cast<size_t>(rng % cherries.size())];
-        int na = find_node_of_label(f, a);
-        int nb = find_node_of_label(f, b);
-        if (na == -1 || nb == -1) break;
-        if (!is_active_leaf(f, na) || !is_active_leaf(f, nb)) continue;
-
-        int ra = root_of(f, na);
-        int rb = root_of(f, nb);
-        if (ra == -1 || rb == -1) break;
-
-        if (ra != rb) {
-            UndoLog undo;
-            size_t mark = undo.mark();
-            cut_edge_above(f, na, &undo);
-            int ma = count_common_cherries(t1, f);
-            undo.undo_to(mark);
-
-            mark = undo.mark();
-            cut_edge_above(f, nb, &undo);
-            int mb = count_common_cherries(t1, f);
-            undo.undo_to(mark);
-
-            if (ma > mb) {
-                cut_edge_above(f, na);
-            } else if (mb > ma) {
-                cut_edge_above(f, nb);
-            } else {
-                rng = mix64(rng + 0x94d049bb133111ebULL);
-                if ((rng & 1ULL) == 0ULL) cut_edge_above(f, na);
-                else cut_edge_above(f, nb);
-            }
-            continue;
-        }
-
-        auto path = path_nodes(f, na, nb);
-        auto pendants = pendant_children_on_path(f, path);
-        if (pendants.size() == 1) {
-            cut_edge_above(f, pendants[0]);
-        } else {
-            if (use_expensive_same_component_plan(n, path, pendants)) {
-                auto f_mass = compute_active_leaf_masses(f);
-                auto cand = build_cherry_candidate(t1, f, f_mass, a, b);
-                auto plan = choose_cut_plan(t1, f, cand, next_label, rng);
-                if (!plan.empty()) {
-                    apply_cut_plan(f, plan);
-                    continue;
-                }
-            }
-            {
-                cut_edge_above(f, na);
-                cut_edge_above(f, nb);
-                for (int c : pendants) cut_edge_above(f, c);
-            }
-        }
-    }
-    if (g_terminate || Clock::now() >= deadline) {
-        timed_out_or_terminated = true;
-    }
-
-    ThreeApproxResult res;
-    for (int u = 0; u < static_cast<int>(f.nodes.size()); ++u) {
-        if (!f.nodes[u].active || f.nodes[u].parent != -1) continue;
-        std::vector<int> leaves;
-        leaves.reserve(16);
-        collect_component_leaves(f, u, leaves);
-        std::sort(leaves.begin(), leaves.end());
-        leaves.erase(std::unique(leaves.begin(), leaves.end()), leaves.end());
-        if (!leaves.empty()) res.comps.push_back(std::move(leaves));
-    }
-    // Only suppress publication for runs interrupted by timeout/signal.
-    // Natural algorithmic termination paths remain publishable.
-    res.complete = !timed_out_or_terminated;
-    return res;
-}
-
 struct ExactSearchContext {
     int n = 0;
     Clock::time_point deadline;
     const TreeData* rebuild_tree = nullptr;
     const std::vector<DynamicTree>* original_forests = nullptr;
+    int best_order = std::numeric_limits<int>::max();
+    std::vector<std::vector<int>> best_components;
+    bool complete = true;
+    std::unordered_set<std::string> seen_states;
+};
+
+struct PairSolveResult {
+    bool complete = false;
+    int order = std::numeric_limits<int>::max();
+    std::vector<std::vector<int>> components;
+};
+
+struct PairSearchContext {
+    int n = 0;
+    Clock::time_point deadline;
     int best_order = std::numeric_limits<int>::max();
     std::vector<std::vector<int>> best_components;
     bool complete = true;
@@ -1639,26 +1718,18 @@ void update_exact_best(const std::vector<std::vector<int>>& comps, ExactSearchCo
     ctx.best_components = comps;
 }
 
-bool reduce_singleton_roots_against(DynamicTree& dst, const DynamicTree& src) {
-    bool changed = false;
-    for (int u = 0; u < static_cast<int>(src.nodes.size()); ++u) {
-        if (!src.nodes[u].active || src.nodes[u].parent != -1 || !is_leaflike(src, u)) continue;
-        int lbl = src.nodes[u].label;
-        int v = find_node_of_label(dst, lbl);
-        if (v == -1 || !dst.nodes[v].active || dst.nodes[v].parent == -1) continue;
-        cut_edge_above(dst, v);
-        changed = true;
-    }
-    return changed;
+bool pair_time_expired(PairSearchContext& ctx) {
+    if (!g_terminate && Clock::now() < ctx.deadline) return false;
+    ctx.complete = false;
+    return true;
 }
 
-void apply_pair_singleton_reduction(DynamicTree& f1, DynamicTree& f2) {
-    while (true) {
-        bool changed = false;
-        changed |= reduce_singleton_roots_against(f1, f2);
-        changed |= reduce_singleton_roots_against(f2, f1);
-        if (!changed) break;
-    }
+void update_pair_best(const std::vector<std::vector<int>>& comps, PairSearchContext& ctx) {
+    if (comps.empty()) return;
+    int order = static_cast<int>(comps.size());
+    if (order >= ctx.best_order) return;
+    ctx.best_order = order;
+    ctx.best_components = comps;
 }
 
 bool make_label_singleton(DynamicTree& t, int label) {
@@ -1668,46 +1739,115 @@ bool make_label_singleton(DynamicTree& t, int label) {
     return true;
 }
 
-CherryCandidate choose_exact_branch_candidate(const DynamicTree& f1, const DynamicTree& f2) {
-    CherryCandidate best;
-    bool have = false;
-    auto masses = compute_active_leaf_masses(f1);
-    for_each_cherry_label_pair(f2, [&](int a, int b) {
-        auto cand = build_cherry_candidate(f2, f1, masses, a, b);
-        cand.score += cand.same_component ? 0.0 : 6.0;
-        cand.score += 0.1 * static_cast<double>(cand.conflict_mass);
-        if (!have || cand.score > best.score) {
-            best = std::move(cand);
-            have = true;
-        }
-        return true;
-    });
-    if (!have) {
-        auto cherries = cherries_by_label(f2);
-        if (!cherries.empty()) {
-            best.a = cherries[0].first;
-            best.b = cherries[0].second;
-        }
+void normalize_exact_pair(DynamicTree& f1, DynamicTree& f2, int n, int& next_label) {
+    while (true) {
+        bool changed = false;
+        changed |= apply_pair_reduction_rule(f1, f2, n);
+        changed |= contract_all_common_cherries(f1, f2, next_label);
+        if (!changed) break;
     }
-    return best;
 }
 
 void exact_multi_search(DynamicTree base, int next_idx, ExactSearchContext& ctx);
 
+void exact_pair_only_search(DynamicTree f1, DynamicTree f2, PairSearchContext& ctx) {
+    if (pair_time_expired(ctx)) return;
+
+    int next_label = std::max(
+        ctx.n + 1,
+        std::max(
+            static_cast<int>(f1.label_to_node.size()),
+            static_cast<int>(f2.label_to_node.size())
+        )
+    );
+    normalize_exact_pair(f1, f2, ctx.n, next_label);
+    int roots1 = count_root_components(f1);
+    int roots2 = count_root_components(f2);
+    if (std::max(roots1, roots2) >= ctx.best_order) return;
+    if (pair_time_expired(ctx)) return;
+
+    auto cherries = cherries_by_label(f2);
+    if (cherries.empty()) {
+        update_pair_best(components_from_dynamic(f2), ctx);
+        return;
+    }
+
+    int a = cherries[0].first;
+    int b = cherries[0].second;
+    int na = find_node_of_label(f1, a);
+    int nb = find_node_of_label(f1, b);
+    if (na == -1 || nb == -1 || !is_active_leaf(f1, na) || !is_active_leaf(f1, nb)) return;
+
+    auto branch_make_singleton = [&](int label) {
+        DynamicTree nf1 = f1;
+        DynamicTree nf2 = f2;
+        bool changed1 = make_label_singleton(nf1, label);
+        bool changed2 = make_label_singleton(nf2, label);
+        if (!changed1 && !changed2) return;
+        exact_pair_only_search(std::move(nf1), std::move(nf2), ctx);
+    };
+
+    int ra = root_of(f1, na);
+    int rb = root_of(f1, nb);
+    if (ra == -1 || rb == -1) return;
+    if (ra != rb) {
+        branch_make_singleton(a);
+        if (pair_time_expired(ctx)) return;
+        branch_make_singleton(b);
+        return;
+    }
+
+    auto pendants = pendant_children_on_path(f1, path_nodes(f1, na, nb));
+    branch_make_singleton(a);
+    if (pair_time_expired(ctx)) return;
+    branch_make_singleton(b);
+    if (pair_time_expired(ctx)) return;
+    if (pendants.empty()) return;
+
+    DynamicTree nf1 = f1;
+    for (int u : pendants) cut_edge_above(nf1, u);
+    exact_pair_only_search(std::move(nf1), std::move(f2), ctx);
+}
+
+PairSolveResult solve_pair_exact(
+    DynamicTree f1,
+    DynamicTree f2,
+    int n,
+    Clock::time_point deadline,
+    int initial_best_order = std::numeric_limits<int>::max(),
+    const std::vector<std::vector<int>>* initial_best_components = nullptr
+) {
+    PairSearchContext ctx;
+    ctx.n = n;
+    ctx.deadline = deadline;
+    ctx.best_order = initial_best_order;
+    if (initial_best_components && static_cast<int>(initial_best_components->size()) == initial_best_order) {
+        ctx.best_components = *initial_best_components;
+    }
+
+    exact_pair_only_search(std::move(f1), std::move(f2), ctx);
+
+    PairSolveResult out;
+    out.complete = ctx.complete && !ctx.best_components.empty();
+    out.order = ctx.best_order;
+    if (out.complete) out.components = std::move(ctx.best_components);
+    return out;
+}
+
 void exact_pair_search(DynamicTree f1, DynamicTree f2, int next_idx, ExactSearchContext& ctx) {
     if (exact_time_expired(ctx)) return;
 
-    apply_pair_singleton_reduction(f1, f2);
+    int next_label = std::max(
+        ctx.n + 1,
+        std::max(
+            static_cast<int>(f1.label_to_node.size()),
+            static_cast<int>(f2.label_to_node.size())
+        )
+    );
+    normalize_exact_pair(f1, f2, ctx.n, next_label);
     int roots1 = count_root_components(f1);
     int roots2 = count_root_components(f2);
-    if (roots1 >= ctx.best_order) return;
-
-    int next_label = ctx.n + 1;
-    contract_all_common_cherries(f1, f2, next_label);
-    apply_pair_singleton_reduction(f1, f2);
-    roots1 = count_root_components(f1);
-    roots2 = count_root_components(f2);
-    if (roots1 >= ctx.best_order) return;
+    if (std::max(roots1, roots2) >= ctx.best_order) return;
     if (exact_time_expired(ctx)) return;
 
     auto cherries = cherries_by_label(f2);
@@ -1723,24 +1863,10 @@ void exact_pair_search(DynamicTree f1, DynamicTree f2, int next_idx, ExactSearch
         return;
     }
 
-    CherryCandidate cand = choose_exact_branch_candidate(f1, f2);
-    int a = cand.a;
-    int b = cand.b;
+    int a = cherries[0].first;
+    int b = cherries[0].second;
     int na = find_node_of_label(f1, a);
     int nb = find_node_of_label(f1, b);
-    if (na == -1 || nb == -1 || !is_active_leaf(f1, na) || !is_active_leaf(f1, nb)) {
-        for (auto [x, y] : cherries) {
-            int nx = find_node_of_label(f1, x);
-            int ny = find_node_of_label(f1, y);
-            if (nx != -1 && ny != -1 && is_active_leaf(f1, nx) && is_active_leaf(f1, ny)) {
-                a = x;
-                b = y;
-                na = nx;
-                nb = ny;
-                break;
-            }
-        }
-    }
     if (na == -1 || nb == -1 || !is_active_leaf(f1, na) || !is_active_leaf(f1, nb)) return;
 
     auto branch_make_singleton = [&](int label) {
@@ -1749,37 +1875,39 @@ void exact_pair_search(DynamicTree f1, DynamicTree f2, int next_idx, ExactSearch
         bool changed1 = make_label_singleton(nf1, label);
         bool changed2 = make_label_singleton(nf2, label);
         if (!changed1 && !changed2) return;
-        int new_roots1 = count_root_components(nf1);
-        int new_roots2 = count_root_components(nf2);
-        if (new_roots1 + new_roots2 <= roots1 + roots2) return;
         exact_pair_search(std::move(nf1), std::move(nf2), next_idx, ctx);
     };
 
+    int ra = root_of(f1, na);
+    int rb = root_of(f1, nb);
+    if (ra == -1 || rb == -1) return;
+    if (ra != rb) {
+        branch_make_singleton(a);
+        if (exact_time_expired(ctx)) return;
+        branch_make_singleton(b);
+        return;
+    }
+
+    auto pendants = pendant_children_on_path(f1, path_nodes(f1, na, nb));
     branch_make_singleton(a);
     if (exact_time_expired(ctx)) return;
     branch_make_singleton(b);
     if (exact_time_expired(ctx)) return;
-
-    int ra = root_of(f1, na);
-    int rb = root_of(f1, nb);
-    if (ra == -1 || rb == -1 || ra != rb) return;
-
-    auto path = path_nodes(f1, na, nb);
-    auto pendants = pendant_children_on_path(f1, path);
     if (pendants.empty()) return;
 
     DynamicTree nf1 = f1;
     for (int u : pendants) cut_edge_above(nf1, u);
-    if (count_root_components(nf1) <= roots1) return;
     exact_pair_search(std::move(nf1), std::move(f2), next_idx, ctx);
 }
 
 void exact_multi_search(DynamicTree base, int next_idx, ExactSearchContext& ctx) {
     if (exact_time_expired(ctx)) return;
-    if (count_root_components(base) >= ctx.best_order) return;
+    auto comps = components_from_dynamic(base);
+    if (static_cast<int>(comps.size()) >= ctx.best_order) return;
+    if (!ctx.seen_states.insert(encode_components_state(comps, next_idx)).second) return;
 
     if (next_idx >= static_cast<int>(ctx.original_forests->size())) {
-        update_exact_best(components_from_dynamic(base), ctx);
+        update_exact_best(comps, ctx);
         return;
     }
 
@@ -1791,27 +1919,398 @@ void exact_multi_search(DynamicTree base, int next_idx, ExactSearchContext& ctx)
     );
 }
 
-std::vector<std::string> solve(const PaceInstance& inst) {
-    int n = inst.leaf_count;
-    if (n <= 0) return singleton_forest(1);
+SolveComponentsResult solve_components_basic(const ParsedInstance& data, Clock::time_point deadline) {
+    SolveComponentsResult result;
+    if (g_terminate || Clock::now() >= deadline) return result;
 
-    std::vector<uint64_t> zob(n + 1, 0);
-    for (int x = 1; x <= n; ++x) zob[x] = mix64(static_cast<uint64_t>(x) * 0x9e3779b97f4a7c15ULL + 0xabcULL);
+    int n = data.leaf_count;
+    std::vector<std::vector<int>> initial_partition;
+    initial_partition.reserve(static_cast<size_t>(n));
+    for (int x = 1; x <= n; ++x) initial_partition.push_back({x});
+    initial_partition = greedy_merge_partition(std::move(initial_partition), data.zob, data.trees);
 
-    std::vector<SimpleTree> parsed;
-    std::vector<TreeData> trees;
-    parsed.reserve(static_cast<size_t>(inst.tree_count));
-    trees.reserve(static_cast<size_t>(inst.tree_count));
+    std::vector<DynamicTree> originals;
+    originals.reserve(data.parsed.size());
+    for (const auto& st : data.parsed) originals.push_back(build_dynamic_tree(st));
 
-    for (const auto& line : inst.newick_lines) {
-        if (!parse_with_genesis(line)) return {};
-        SimpleTree st;
-        if (!NewickParser(line).parse(st)) return {};
-        TreeData td;
-        if (!build_tree_data(st, n, zob, td)) return {};
-        parsed.push_back(std::move(st));
-        trees.push_back(std::move(td));
+    if (data.tree_count == 1) {
+        result.complete = true;
+        result.components = std::move(initial_partition);
+        return result;
     }
+
+    const auto now = Clock::now();
+    const auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+    const long long bootstrap_budget_ms = std::min<long long>(
+        20000,
+        std::max<long long>(1000, remaining_ms / 3)
+    );
+    Clock::time_point bootstrap_deadline = std::min(
+        deadline,
+        now + std::chrono::milliseconds(bootstrap_budget_ms)
+    );
+
+    const bool enable_full_pair_bootstrap =
+        (data.tree_count <= 24 && n <= 24) ||
+        (data.tree_count <= 8 && n <= 64);
+
+    int lower_bound = 0;
+    int seed_second = 1;
+    std::vector<int> row0_score(static_cast<size_t>(data.tree_count), 0);
+    bool pair_lb_complete = enable_full_pair_bootstrap;
+
+    for (int j = 1; j < data.tree_count; ++j) {
+        PairSolveResult pair_res = solve_pair_exact(
+            originals[0],
+            originals[static_cast<size_t>(j)],
+            n,
+            bootstrap_deadline,
+            static_cast<int>(initial_partition.size()),
+            &initial_partition
+        );
+        if (!pair_res.complete) {
+            pair_lb_complete = false;
+            break;
+        }
+        row0_score[static_cast<size_t>(j)] = pair_res.order;
+        lower_bound = std::max(lower_bound, pair_res.order);
+        if (pair_res.order > row0_score[static_cast<size_t>(seed_second)]) seed_second = j;
+    }
+
+    if (pair_lb_complete) {
+        for (int i = 1; i < data.tree_count; ++i) {
+            for (int j = i + 1; j < data.tree_count; ++j) {
+                PairSolveResult pair_res = solve_pair_exact(
+                    originals[static_cast<size_t>(i)],
+                    originals[static_cast<size_t>(j)],
+                    n,
+                    bootstrap_deadline,
+                    static_cast<int>(initial_partition.size()),
+                    &initial_partition
+                );
+                if (!pair_res.complete) {
+                    pair_lb_complete = false;
+                    break;
+                }
+                lower_bound = std::max(lower_bound, pair_res.order);
+            }
+            if (!pair_lb_complete) break;
+        }
+    }
+
+    if (pair_lb_complete && lower_bound == static_cast<int>(initial_partition.size())) {
+        result.complete = true;
+        result.components = std::move(initial_partition);
+        return result;
+    }
+
+    std::vector<std::vector<int>> best_upper = initial_partition;
+    int best_upper_order = static_cast<int>(best_upper.size());
+
+    if (seed_second >= 1 && enable_full_pair_bootstrap && Clock::now() < bootstrap_deadline) {
+        std::vector<int> merge_order;
+        merge_order.reserve(data.tree_count);
+        merge_order.push_back(0);
+        merge_order.push_back(seed_second);
+        for (int j = 1; j < data.tree_count; ++j) {
+            if (j == seed_second) continue;
+            merge_order.push_back(j);
+        }
+        std::stable_sort(merge_order.begin() + 2, merge_order.end(), [&](int a, int b) {
+            if (row0_score[static_cast<size_t>(a)] != row0_score[static_cast<size_t>(b)]) {
+                return row0_score[static_cast<size_t>(a)] > row0_score[static_cast<size_t>(b)];
+            }
+            return a < b;
+        });
+
+        PairSolveResult seed_pair = solve_pair_exact(
+            originals[0],
+            originals[static_cast<size_t>(seed_second)],
+            n,
+            bootstrap_deadline
+        );
+        if (seed_pair.complete) {
+            std::vector<std::vector<int>> current_components = std::move(seed_pair.components);
+            DynamicTree current_base;
+            if (build_dynamic_forest_from_components(current_components, n, data.trees[0], current_base)) {
+                bool greedy_complete = true;
+                for (size_t pos = 2; pos < merge_order.size(); ++pos) {
+                    PairSolveResult step_res = solve_pair_exact(
+                        current_base,
+                        originals[static_cast<size_t>(merge_order[pos])],
+                        n,
+                        bootstrap_deadline
+                    );
+                    if (!step_res.complete) {
+                        greedy_complete = false;
+                        break;
+                    }
+                    current_components = std::move(step_res.components);
+                    if (!build_dynamic_forest_from_components(current_components, n, data.trees[0], current_base)) {
+                        greedy_complete = false;
+                        break;
+                    }
+                }
+                if (greedy_complete && static_cast<int>(current_components.size()) < best_upper_order) {
+                    best_upper_order = static_cast<int>(current_components.size());
+                    best_upper = std::move(current_components);
+                }
+            }
+        }
+    }
+
+    if (pair_lb_complete && lower_bound == best_upper_order) {
+        result.complete = true;
+        result.components = std::move(best_upper);
+        return result;
+    }
+
+    std::vector<DynamicTree> ordered_originals;
+    ordered_originals.reserve(originals.size());
+    ordered_originals.push_back(originals[0]);
+    ordered_originals.push_back(originals[static_cast<size_t>(seed_second)]);
+    std::vector<int> remaining;
+    remaining.reserve(originals.size());
+    for (int j = 1; j < data.tree_count; ++j) {
+        if (j == seed_second) continue;
+        remaining.push_back(j);
+    }
+    std::stable_sort(remaining.begin(), remaining.end(), [&](int a, int b) {
+        if (row0_score[static_cast<size_t>(a)] != row0_score[static_cast<size_t>(b)]) {
+            return row0_score[static_cast<size_t>(a)] > row0_score[static_cast<size_t>(b)];
+        }
+        return a < b;
+    });
+    for (int idx : remaining) ordered_originals.push_back(originals[static_cast<size_t>(idx)]);
+
+    ExactSearchContext ctx;
+    ctx.n = n;
+    ctx.deadline = deadline;
+    ctx.rebuild_tree = &data.trees[0];
+    ctx.original_forests = &ordered_originals;
+    ctx.best_order = best_upper_order;
+    ctx.best_components = best_upper;
+
+    exact_multi_search(ordered_originals[0], 1, ctx);
+
+    result.complete = ctx.complete && !ctx.best_components.empty();
+    if (result.complete) result.components = std::move(ctx.best_components);
+    return result;
+}
+
+std::vector<int> choose_cluster_candidate(const ParsedInstance& data) {
+    const int n = data.leaf_count;
+    auto better = [n](const std::vector<int>& a, const std::vector<int>& b) {
+        int ba = std::min<int>(a.size(), n - static_cast<int>(a.size()));
+        int bb = std::min<int>(b.size(), n - static_cast<int>(b.size()));
+        if (ba != bb) return ba > bb;
+        if (a.size() != b.size()) return a.size() > b.size();
+        return a < b;
+    };
+
+    std::vector<int> best;
+    for (const auto& cand : data.td_candidates) {
+        if (cand.size() <= 1 || cand.size() >= static_cast<size_t>(n)) continue;
+        if (!is_common_cluster(cand, data.zob, data.trees)) continue;
+        if (best.empty() || better(cand, best)) best = cand;
+    }
+    if (!best.empty() || data.has_aux_root) return best;
+
+    std::unordered_set<Signature, SignatureHasher> seen;
+    const auto& t0 = data.trees[0];
+    for (int u = 0; u < t0.n_nodes; ++u) {
+        if (t0.is_leaf[u]) continue;
+        int sz = t0.sub_count[u];
+        if (sz <= 1 || sz >= n) continue;
+        Signature sig{t0.sub_hash[u], sz};
+        if (!seen.insert(sig).second) continue;
+        bool maybe = true;
+        for (size_t i = 1; i < data.trees.size(); ++i) {
+            if (!data.trees[i].cluster_sigs.count(sig)) {
+                maybe = false;
+                break;
+            }
+        }
+        if (!maybe) continue;
+        std::vector<int> cand;
+        cand.reserve(static_cast<size_t>(sz));
+        collect_subtree_leaves(t0, u, cand);
+        std::sort(cand.begin(), cand.end());
+        if (!is_common_cluster(cand, data.zob, data.trees)) continue;
+        if (best.empty() || better(cand, best)) best = std::move(cand);
+    }
+    return best;
+}
+
+PaceInstance build_cluster_subinstance(const ParsedInstance& data, const std::vector<int>& cluster) {
+    PaceInstance sub;
+    sub.tree_count = data.tree_count;
+    sub.leaf_count = static_cast<int>(cluster.size()) + 1;
+    sub.has_aux_root = true;
+    sub.newick_lines.reserve(data.trees.size());
+
+    std::vector<char> in_cluster(data.leaf_count + 1, 0);
+    std::vector<int> remap(data.leaf_count + 1, 0);
+    for (size_t i = 0; i < cluster.size(); ++i) {
+        in_cluster[cluster[i]] = 1;
+        remap[cluster[i]] = static_cast<int>(i + 1);
+    }
+    int rho_label = sub.leaf_count;
+
+    for (const auto& t : data.trees) {
+        std::string inner = restricted_newick_dfs_remap(t.root, t, in_cluster, remap);
+        if (inner.empty()) {
+            sub.newick_lines.clear();
+            return sub;
+        }
+        sub.newick_lines.push_back("(" + std::to_string(rho_label) + "," + inner + ");");
+    }
+    return sub;
+}
+
+PaceInstance build_quotient_subinstance(const ParsedInstance& data, const std::vector<int>& cluster) {
+    PaceInstance out;
+    out.tree_count = data.tree_count;
+    out.leaf_count = data.leaf_count - static_cast<int>(cluster.size()) + 1;
+    out.newick_lines.reserve(data.trees.size());
+
+    std::vector<char> in_cluster(data.leaf_count + 1, 0);
+    for (int x : cluster) in_cluster[x] = 1;
+
+    std::vector<int> outside_remap(data.leaf_count + 1, 0);
+    int next = 1;
+    for (int x = 1; x <= data.leaf_count; ++x) {
+        if (!in_cluster[x]) outside_remap[x] = next++;
+    }
+    int meta_label = out.leaf_count;
+    uint64_t cluster_hash = hash_of_leaves(cluster, data.zob);
+    int cluster_size = static_cast<int>(cluster.size());
+
+    for (const auto& t : data.trees) {
+        std::string line = compress_cluster_newick_dfs(
+            t.root, t, cluster_hash, cluster_size, in_cluster, outside_remap, meta_label
+        );
+        if (line.empty()) {
+            out.newick_lines.clear();
+            return out;
+        }
+        if (line.back() != ';') line.push_back(';');
+        out.newick_lines.push_back(std::move(line));
+    }
+    return out;
+}
+
+SolveComponentsResult combine_cluster_results(
+    int original_n,
+    const std::vector<int>& cluster,
+    const SolveComponentsResult& sub_res,
+    const SolveComponentsResult& quotient_res
+) {
+    SolveComponentsResult out;
+    if (!sub_res.complete || !quotient_res.complete) return out;
+
+    std::vector<char> in_cluster(original_n + 1, 0);
+    for (int x : cluster) in_cluster[x] = 1;
+
+    std::vector<int> cluster_new_to_old(cluster.size() + 2, 0);
+    for (size_t i = 0; i < cluster.size(); ++i) cluster_new_to_old[i + 1] = cluster[i];
+    int rho_label = static_cast<int>(cluster.size()) + 1;
+
+    std::vector<int> outside_old;
+    outside_old.reserve(original_n - static_cast<int>(cluster.size()));
+    for (int x = 1; x <= original_n; ++x) if (!in_cluster[x]) outside_old.push_back(x);
+    std::vector<int> quotient_new_to_old(outside_old.size() + 2, 0);
+    for (size_t i = 0; i < outside_old.size(); ++i) quotient_new_to_old[i + 1] = outside_old[i];
+    int meta_label = static_cast<int>(outside_old.size()) + 1;
+
+    std::vector<int> root_attach;
+    std::vector<std::vector<int>> merged;
+    for (const auto& comp : sub_res.components) {
+        bool has_rho = false;
+        std::vector<int> mapped;
+        for (int label : comp) {
+            if (label == rho_label) {
+                has_rho = true;
+                continue;
+            }
+            if (1 <= label && label < static_cast<int>(cluster_new_to_old.size())) {
+                mapped.push_back(cluster_new_to_old[label]);
+            }
+        }
+        std::sort(mapped.begin(), mapped.end());
+        mapped.erase(std::unique(mapped.begin(), mapped.end()), mapped.end());
+        if (has_rho) root_attach = std::move(mapped);
+        else if (!mapped.empty()) merged.push_back(std::move(mapped));
+    }
+    if (root_attach.empty()) return out;
+
+    bool found_meta = false;
+    for (const auto& comp : quotient_res.components) {
+        bool has_meta = false;
+        std::vector<int> mapped;
+        for (int label : comp) {
+            if (label == meta_label) {
+                has_meta = true;
+                continue;
+            }
+            if (1 <= label && label < static_cast<int>(quotient_new_to_old.size())) {
+                mapped.push_back(quotient_new_to_old[label]);
+            }
+        }
+        if (has_meta) {
+            mapped.insert(mapped.end(), root_attach.begin(), root_attach.end());
+            found_meta = true;
+        }
+        std::sort(mapped.begin(), mapped.end());
+        mapped.erase(std::unique(mapped.begin(), mapped.end()), mapped.end());
+        if (!mapped.empty()) merged.push_back(std::move(mapped));
+    }
+    if (!found_meta) return out;
+
+    std::sort(merged.begin(), merged.end(), [](const auto& a, const auto& b) {
+        if (a.empty() || b.empty()) return a.size() < b.size();
+        return a.front() < b.front();
+    });
+    out.complete = true;
+    out.components = std::move(merged);
+    return out;
+}
+
+SolveComponentsResult solve_components_recursive(const PaceInstance& inst, Clock::time_point deadline);
+
+SolveComponentsResult solve_components_recursive(const ParsedInstance& data, Clock::time_point deadline) {
+    if (g_terminate || Clock::now() >= deadline) return {};
+
+    std::vector<int> cluster = choose_cluster_candidate(data);
+    if (!cluster.empty()) {
+        PaceInstance sub_inst = build_cluster_subinstance(data, cluster);
+        PaceInstance quotient_inst = build_quotient_subinstance(data, cluster);
+        if (!sub_inst.newick_lines.empty() && !quotient_inst.newick_lines.empty()) {
+            SolveComponentsResult sub_res = solve_components_recursive(sub_inst, deadline);
+            if (!sub_res.complete) return {};
+            SolveComponentsResult quotient_res = solve_components_recursive(quotient_inst, deadline);
+            if (!quotient_res.complete) return {};
+            SolveComponentsResult combined = combine_cluster_results(
+                data.leaf_count, cluster, sub_res, quotient_res
+            );
+            if (combined.complete) return combined;
+        }
+    }
+
+    return solve_components_basic(data, deadline);
+}
+
+SolveComponentsResult solve_components_recursive(const PaceInstance& inst, Clock::time_point deadline) {
+    ParsedInstance data;
+    if (!parse_instance_data(inst, data)) return {};
+    return solve_components_recursive(data, deadline);
+}
+
+std::vector<std::string> solve(const PaceInstance& inst) {
+    if (inst.leaf_count <= 0) return singleton_forest(1);
+
+    ParsedInstance top;
+    if (!parse_instance_data(inst, top)) return {};
 
     const auto start = Clock::now();
     double timeout_sec = 295.0;
@@ -1826,27 +2325,9 @@ std::vector<std::string> solve(const PaceInstance& inst) {
         std::max<long long>(1, static_cast<long long>(timeout_sec * 1000.0) - 200)
     );
 
-    std::vector<std::vector<int>> initial_partition;
-    initial_partition.reserve(static_cast<size_t>(n));
-    for (int x = 1; x <= n; ++x) initial_partition.push_back({x});
-    initial_partition = greedy_merge_partition(std::move(initial_partition), zob, trees);
-
-    std::vector<DynamicTree> originals;
-    originals.reserve(parsed.size());
-    for (const auto& st : parsed) originals.push_back(build_dynamic_tree(st));
-
-    ExactSearchContext ctx;
-    ctx.n = n;
-    ctx.deadline = soft_deadline;
-    ctx.rebuild_tree = &trees[0];
-    ctx.original_forests = &originals;
-    ctx.best_order = static_cast<int>(initial_partition.size());
-    ctx.best_components = initial_partition;
-
-    exact_multi_search(originals[0], 1, ctx);
-
-    if (!ctx.complete || ctx.best_components.empty()) return {};
-    return forest_from_partition(ctx.best_components, n, trees[0]);
+    SolveComponentsResult res = solve_components_recursive(top, soft_deadline);
+    if (!res.complete || res.components.empty()) return {};
+    return forest_from_partition(res.components, top.leaf_count, top.trees[0]);
 }
 
 } // namespace

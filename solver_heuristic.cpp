@@ -1128,6 +1128,52 @@ std::vector<std::vector<int>> greedy_merge_partition(
     return comps;
 }
 
+struct EliteSolution {
+    int components = 0;
+    uint64_t hash = 0;
+    std::vector<int> comp_of_leaf;
+};
+
+uint64_t elite_partition_hash(const std::vector<int>& comp_of_leaf) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 1; i < comp_of_leaf.size(); ++i) {
+        h ^= mix64((static_cast<uint64_t>(i) << 32) ^ static_cast<uint64_t>(comp_of_leaf[i] + 1));
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+EliteSolution build_elite_solution(const std::vector<std::vector<int>>& comps, int n) {
+    EliteSolution elite;
+    elite.components = static_cast<int>(comps.size());
+    elite.comp_of_leaf.assign(static_cast<size_t>(n + 1), 0);
+    for (int i = 0; i < static_cast<int>(comps.size()); ++i) {
+        for (int x : comps[static_cast<size_t>(i)]) {
+            if (x >= 1 && x <= n) elite.comp_of_leaf[static_cast<size_t>(x)] = i + 1;
+        }
+    }
+    elite.hash = elite_partition_hash(elite.comp_of_leaf);
+    return elite;
+}
+
+void maybe_add_elite_solution(
+    std::vector<EliteSolution>& pool,
+    const std::vector<std::vector<int>>& comps,
+    int n
+) {
+    if (comps.empty()) return;
+    EliteSolution elite = build_elite_solution(comps, n);
+    for (const auto& cur : pool) {
+        if (cur.hash == elite.hash && cur.comp_of_leaf == elite.comp_of_leaf) return;
+    }
+    pool.push_back(std::move(elite));
+    std::sort(pool.begin(), pool.end(), [](const EliteSolution& a, const EliteSolution& b) {
+        if (a.components != b.components) return a.components < b.components;
+        return a.hash < b.hash;
+    });
+    if (pool.size() > 4) pool.resize(4);
+}
+
 void collect_payload_leaves(const DynamicTree& t, int payload_id, std::vector<int>& out) {
     if (payload_id < 0 || payload_id >= static_cast<int>(t.payloads.size())) return;
     const auto& payload = t.payloads[static_cast<size_t>(payload_id)];
@@ -1395,7 +1441,8 @@ ThreeApproxResult run_three_approx(
     Clock::time_point deadline,
     int n,
     int incumbent_components,
-    uint64_t seed
+    uint64_t seed,
+    const std::vector<int>* elite_comp_map = nullptr
 ) {
     int next_label = n + 1;
     uint64_t rng = seed ^ 0x9e3779b97f4a7c15ULL;
@@ -1443,8 +1490,27 @@ ThreeApproxResult run_three_approx(
         }
         if (did_common_contract) continue;
 
-        rng = mix64(rng + 0x517cc1b727220a95ULL);
-        auto [a, b] = cherries[static_cast<size_t>(rng % cherries.size())];
+        size_t chosen_idx = 0;
+        if (elite_comp_map && elite_comp_map->size() > static_cast<size_t>(n)) {
+            std::vector<size_t> guided;
+            guided.reserve(cherries.size());
+            for (size_t i = 0; i < cherries.size(); ++i) {
+                auto [ca, cb] = cherries[i];
+                int ida = (*elite_comp_map)[static_cast<size_t>(ca)];
+                int idb = (*elite_comp_map)[static_cast<size_t>(cb)];
+                if (ida != 0 && ida == idb) guided.push_back(i);
+            }
+            rng = mix64(rng + 0x517cc1b727220a95ULL);
+            if (!guided.empty()) {
+                chosen_idx = guided[static_cast<size_t>(rng % guided.size())];
+            } else {
+                chosen_idx = static_cast<size_t>(rng % cherries.size());
+            }
+        } else {
+            rng = mix64(rng + 0x517cc1b727220a95ULL);
+            chosen_idx = static_cast<size_t>(rng % cherries.size());
+        }
+        auto [a, b] = cherries[chosen_idx];
         int na = find_node_of_label(f, a);
         int nb = find_node_of_label(f, b);
         if (na == -1 || nb == -1) break;
@@ -1560,21 +1626,32 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     DynamicTree dt1_base = build_dynamic_tree(parsed[0]);
     DynamicTree dt2_base = build_dynamic_tree(parsed[1]);
 
+    std::vector<EliteSolution> elite_pool;
     uint64_t base_seed = instance_seed(inst);
     uint64_t iter = 0;
+    auto intensify_start = start + (soft_deadline - start) * 4 / 5;
     while (!g_terminate && Clock::now() < soft_deadline) {
         uint64_t seed = mix64(base_seed ^ iter);
+        const std::vector<int>* elite_comp_map = nullptr;
+        if (Clock::now() >= intensify_start && !elite_pool.empty() && (iter & 1ULL)) {
+            const auto& elite = elite_pool[static_cast<size_t>(iter % elite_pool.size())];
+            elite_comp_map = &elite.comp_of_leaf;
+        }
         auto res = run_three_approx(
             dt1_base,
             dt2_base,
             soft_deadline,
             n,
             static_cast<int>(best_out.size()),
-            seed
+            seed,
+            elite_comp_map
         );
         if (!res.complete || res.comps.empty()) {
             ++iter;
             continue;
+        }
+        if (static_cast<int>(res.comps.size()) <= static_cast<int>(best_out.size()) + 2) {
+            maybe_add_elite_solution(elite_pool, res.comps, n);
         }
         auto out = forest_from_partition(res.comps, n, trees[0]);
         if (!out.empty() && static_cast<int>(out.size()) < static_cast<int>(best_out.size())) {
