@@ -1,9 +1,11 @@
 /instances
 /solver
-/solver_aadit
+/solver_heuristic
 /stride-downloads
 /stride-logs
 /.vscode
 /Makefile
 /tmp
-/solver_aadit_primary
+/solver_exact
+/1-s2.0-S0304397514000176-main.pdf
+/1411.0062v1.pdf
