@@ -237,7 +237,6 @@ void write_best_once() {
 
 void sig_handler(int) {
     g_terminate = 1;
-    write_best_once();
     _Exit(0);
 }
 
@@ -1638,7 +1637,6 @@ void update_exact_best(const std::vector<std::vector<int>>& comps, ExactSearchCo
     if (order >= ctx.best_order) return;
     ctx.best_order = order;
     ctx.best_components = comps;
-    publish_best_solution(forest_from_partition(ctx.best_components, ctx.n, *ctx.rebuild_tree));
 }
 
 bool reduce_singleton_roots_against(DynamicTree& dst, const DynamicTree& src) {
@@ -1806,11 +1804,11 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     trees.reserve(static_cast<size_t>(inst.tree_count));
 
     for (const auto& line : inst.newick_lines) {
-        if (!parse_with_genesis(line)) return singleton_forest(n);
+        if (!parse_with_genesis(line)) return {};
         SimpleTree st;
-        if (!NewickParser(line).parse(st)) return singleton_forest(n);
+        if (!NewickParser(line).parse(st)) return {};
         TreeData td;
-        if (!build_tree_data(st, n, zob, td)) return singleton_forest(n);
+        if (!build_tree_data(st, n, zob, td)) return {};
         parsed.push_back(std::move(st));
         trees.push_back(std::move(td));
     }
@@ -1833,30 +1831,9 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     for (int x = 1; x <= n; ++x) initial_partition.push_back({x});
     initial_partition = greedy_merge_partition(std::move(initial_partition), zob, trees);
 
-    auto best_out = forest_from_partition(initial_partition, n, trees[0]);
-    if (!best_out.empty()) publish_best_solution(best_out);
-
     std::vector<DynamicTree> originals;
     originals.reserve(parsed.size());
     for (const auto& st : parsed) originals.push_back(build_dynamic_tree(st));
-
-    if (inst.tree_count == 2) {
-        uint64_t seed = instance_seed(inst);
-        auto res = run_three_approx(
-            originals[0],
-            originals[1],
-            soft_deadline,
-            n,
-            static_cast<int>(best_out.size()),
-            seed
-        );
-        if (res.complete && !res.comps.empty() &&
-            static_cast<int>(res.comps.size()) < static_cast<int>(initial_partition.size())) {
-            initial_partition = std::move(res.comps);
-            best_out = forest_from_partition(initial_partition, n, trees[0]);
-            if (!best_out.empty()) publish_best_solution(best_out);
-        }
-    }
 
     ExactSearchContext ctx;
     ctx.n = n;
@@ -1868,10 +1845,8 @@ std::vector<std::string> solve(const PaceInstance& inst) {
 
     exact_multi_search(originals[0], 1, ctx);
 
-    if (!ctx.best_components.empty()) {
-        best_out = forest_from_partition(ctx.best_components, n, trees[0]);
-    }
-    return best_out.empty() ? singleton_forest(n) : best_out;
+    if (!ctx.complete || ctx.best_components.empty()) return {};
+    return forest_from_partition(ctx.best_components, n, trees[0]);
 }
 
 } // namespace
@@ -1882,22 +1857,19 @@ int main() {
 
     PaceInstance inst;
     if (!read_instance(inst)) {
-        set_best_output_buffer(normalize_output(singleton_forest(std::max(1, g_last_leaf_count))));
-        write_best_once();
         return 0;
     }
-
-    publish_best_solution(singleton_forest(std::max(1, inst.leaf_count)));
 
     std::vector<std::string> out;
     try {
         out = solve(inst);
     } catch (...) {
-        out = singleton_forest(std::max(1, inst.leaf_count));
+        out.clear();
     }
 
-    if (out.empty()) out = singleton_forest(std::max(1, inst.leaf_count));
-    publish_best_solution(out);
-    write_best_once();
+    if (!out.empty()) {
+        publish_best_solution(out);
+        write_best_once();
+    }
     return 0;
 }
