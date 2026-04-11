@@ -12,7 +12,6 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <unistd.h>
@@ -29,22 +28,6 @@ struct PaceInstance {
     std::vector<std::string> newick_lines;
 };
 
-struct Signature {
-    uint64_t h = 0;
-    int sz = 0;
-    bool operator==(const Signature& o) const { return h == o.h && sz == o.sz; }
-};
-
-struct SignatureHasher {
-    size_t operator()(const Signature& s) const {
-        uint64_t x = s.h ^ (static_cast<uint64_t>(s.sz) * 0x9e3779b97f4a7c15ULL);
-        x ^= x >> 33;
-        x *= 0xff51afd7ed558ccdULL;
-        x ^= x >> 33;
-        return static_cast<size_t>(x);
-    }
-};
-
 struct SimpleTree {
     int root = -1;
     std::vector<std::vector<int>> children;
@@ -53,31 +36,18 @@ struct SimpleTree {
 };
 
 struct TreeData {
-    int n_nodes = 0;
     int root = -1;
     std::vector<int> parent;
     std::vector<int> child0;
     std::vector<int> child1;
     std::vector<char> is_leaf;
     std::vector<int> leaf_label;
-    std::vector<int> node_of_leaf;
-
-    std::vector<int> depth;
-    std::vector<std::vector<int>> up;
-
-    std::vector<int> sub_count;
-    std::vector<uint64_t> sub_hash;
-    std::vector<uint64_t> topo_a;
-    std::vector<uint64_t> topo_b;
-
-    std::unordered_set<Signature, SignatureHasher> cluster_sigs;
 };
 
 struct PayloadNode {
     int left = -1;
     int right = -1;
     int leaf_label = -1;
-    int size = 0;
 };
 
 struct DynNode {
@@ -89,12 +59,7 @@ struct DynNode {
 
     // Expansion payload for active pseudo leaves.
     int payload_id = -1;
-
-    // Rooted subtree signature for active pseudo leaves.
-    uint64_t leafset_hash = 0;
     int payload_size = 0;
-    uint64_t topo_a = 0;
-    uint64_t topo_b = 0;
 };
 
 struct DynamicTree {
@@ -413,25 +378,23 @@ uint64_t instance_seed(const PaceInstance& inst) {
     return h;
 }
 
-bool build_tree_data(const SimpleTree& st, int n, const std::vector<uint64_t>& zob, TreeData& td) {
-    td.n_nodes = static_cast<int>(st.children.size());
+bool build_tree_data(const SimpleTree& st, int n, TreeData& td) {
+    int n_nodes = static_cast<int>(st.children.size());
     td.root = st.root;
     td.parent = st.parent;
-    td.child0.assign(td.n_nodes, -1);
-    td.child1.assign(td.n_nodes, -1);
-    td.is_leaf.assign(td.n_nodes, 0);
+    td.child0.assign(n_nodes, -1);
+    td.child1.assign(n_nodes, -1);
+    td.is_leaf.assign(n_nodes, 0);
     td.leaf_label = st.leaf_label;
-    td.node_of_leaf.assign(n + 1, -1);
 
     int leaves = 0;
     std::vector<int> seen(n + 1, 0);
-    for (int u = 0; u < td.n_nodes; ++u) {
+    for (int u = 0; u < n_nodes; ++u) {
         if (st.children[u].empty()) {
             td.is_leaf[u] = 1;
             int x = st.leaf_label[u];
             if (x < 1 || x > n || seen[x]) return false;
             seen[x] = 1;
-            td.node_of_leaf[x] = u;
             ++leaves;
         } else {
             if (st.children[u].size() != 2) return false;
@@ -441,116 +404,6 @@ bool build_tree_data(const SimpleTree& st, int n, const std::vector<uint64_t>& z
     }
     if (leaves != n) return false;
 
-    td.depth.assign(td.n_nodes, 0);
-    std::vector<int> bfs{td.root};
-    for (size_t i = 0; i < bfs.size(); ++i) {
-        int u = bfs[i];
-        if (!td.is_leaf[u]) {
-            int a = td.child0[u], b = td.child1[u];
-            td.depth[a] = td.depth[u] + 1;
-            td.depth[b] = td.depth[u] + 1;
-            bfs.push_back(a);
-            bfs.push_back(b);
-        }
-    }
-
-    int lg = 1;
-    while ((1 << lg) <= std::max(1, td.n_nodes)) ++lg;
-    td.up.assign(lg, std::vector<int>(td.n_nodes, td.root));
-    for (int v = 0; v < td.n_nodes; ++v) td.up[0][v] = (td.parent[v] == -1 ? v : td.parent[v]);
-    for (int k = 1; k < lg; ++k) {
-        for (int v = 0; v < td.n_nodes; ++v) td.up[k][v] = td.up[k - 1][td.up[k - 1][v]];
-    }
-
-    td.sub_count.assign(td.n_nodes, 0);
-    td.sub_hash.assign(td.n_nodes, 0);
-    td.topo_a.assign(td.n_nodes, 0);
-    td.topo_b.assign(td.n_nodes, 0);
-    td.cluster_sigs.clear();
-
-    std::vector<std::pair<int, int>> stck;
-    stck.reserve(td.n_nodes * 2);
-    stck.push_back({td.root, 0});
-    while (!stck.empty()) {
-        auto [u, phase] = stck.back();
-        stck.pop_back();
-        if (!phase) {
-            stck.push_back({u, 1});
-            if (!td.is_leaf[u]) {
-                stck.push_back({td.child0[u], 0});
-                stck.push_back({td.child1[u], 0});
-            }
-            continue;
-        }
-        if (td.is_leaf[u]) {
-            int x = td.leaf_label[u];
-            td.sub_count[u] = 1;
-            td.sub_hash[u] = zob[x];
-            td.topo_a[u] = mix64(static_cast<uint64_t>(x) + 0x1111111111111111ULL);
-            td.topo_b[u] = mix64(static_cast<uint64_t>(x) + 0x2222222222222222ULL);
-        } else {
-            int a = td.child0[u], b = td.child1[u];
-            td.sub_count[u] = td.sub_count[a] + td.sub_count[b];
-            td.sub_hash[u] = td.sub_hash[a] ^ td.sub_hash[b];
-            uint64_t aa = td.topo_a[a], ab = td.topo_a[b];
-            uint64_t ba = td.topo_b[a], bb = td.topo_b[b];
-            if (aa > ab) std::swap(aa, ab);
-            if (ba > bb) std::swap(ba, bb);
-            td.topo_a[u] = mix64(aa ^ (ab + 0x9e3779b97f4a7c15ULL));
-            td.topo_b[u] = mix64(ba ^ (bb + 0x517cc1b727220a95ULL));
-        }
-        td.cluster_sigs.insert(Signature{td.sub_hash[u], td.sub_count[u]});
-    }
-
-    return true;
-}
-
-int lca_node(const TreeData& t, int a, int b) {
-    if (t.depth[a] < t.depth[b]) std::swap(a, b);
-    int d = t.depth[a] - t.depth[b];
-    for (size_t i = 0; i < t.up.size(); ++i) if (d & (1 << i)) a = t.up[i][a];
-    if (a == b) return a;
-    for (int i = static_cast<int>(t.up.size()) - 1; i >= 0; --i) {
-        if (t.up[i][a] != t.up[i][b]) {
-            a = t.up[i][a];
-            b = t.up[i][b];
-        }
-    }
-    return t.parent[a];
-}
-
-int lca_of_leaves(const TreeData& t, const std::vector<int>& leaves) {
-    int l = t.node_of_leaf[leaves[0]];
-    for (size_t i = 1; i < leaves.size(); ++i) l = lca_node(t, l, t.node_of_leaf[leaves[i]]);
-    return l;
-}
-
-bool component_valid_both_trees(
-    const std::vector<int>& leaves,
-    const std::vector<uint64_t>& zob,
-    const std::vector<TreeData>& trees
-) {
-    if (leaves.empty()) return false;
-    uint64_t h = 0;
-    for (int x : leaves) h ^= zob[x];
-    int sz = static_cast<int>(leaves.size());
-    Signature s{h, sz};
-
-    std::pair<uint64_t, uint64_t> ref{0, 0};
-    bool have_ref = false;
-    for (const auto& t : trees) {
-        if (!t.cluster_sigs.count(s)) return false;
-        if (sz == 1) continue;
-        int r = lca_of_leaves(t, leaves);
-        if (t.sub_count[r] != sz || t.sub_hash[r] != h) return false;
-        std::pair<uint64_t, uint64_t> tp{t.topo_a[r], t.topo_b[r]};
-        if (!have_ref) {
-            ref = tp;
-            have_ref = true;
-        } else if (tp != ref) {
-            return false;
-        }
-    }
     return true;
 }
 
@@ -621,11 +474,8 @@ DynamicTree build_dynamic_tree(const SimpleTree& st) {
 
         if (st.children[u].empty()) {
             dn.label = st.leaf_label[u];
-            dn.payload_id = push_payload(dt, PayloadNode{-1, -1, st.leaf_label[u], 1});
-            dn.leafset_hash = mix64(static_cast<uint64_t>(st.leaf_label[u]) * 0x9e3779b97f4a7c15ULL + 0xabcULL);
+            dn.payload_id = push_payload(dt, PayloadNode{-1, -1, st.leaf_label[u]});
             dn.payload_size = 1;
-            dn.topo_a = mix64(static_cast<uint64_t>(st.leaf_label[u]) + 0x1111111111111111ULL);
-            dn.topo_b = mix64(static_cast<uint64_t>(st.leaf_label[u]) + 0x2222222222222222ULL);
             dt.label_to_node[static_cast<size_t>(dn.label)] = static_cast<int>(u);
         } else {
             dn.label = 0;
@@ -895,19 +745,11 @@ bool contract_cherry(DynamicTree& t, int la, int lb, int new_label, UndoLog* log
         PayloadNode{
             t.nodes[a].payload_id,
             t.nodes[b].payload_id,
-            -1,
-            t.nodes[a].payload_size + t.nodes[b].payload_size
+            -1
         },
         log
     );
-    nn.leafset_hash = t.nodes[a].leafset_hash ^ t.nodes[b].leafset_hash;
     nn.payload_size = t.nodes[a].payload_size + t.nodes[b].payload_size;
-    uint64_t aa = t.nodes[a].topo_a, ab = t.nodes[b].topo_a;
-    uint64_t ba = t.nodes[a].topo_b, bb = t.nodes[b].topo_b;
-    if (aa > ab) std::swap(aa, ab);
-    if (ba > bb) std::swap(ba, bb);
-    nn.topo_a = mix64(aa ^ (ab + 0x9e3779b97f4a7c15ULL));
-    nn.topo_b = mix64(ba ^ (bb + 0x517cc1b727220a95ULL));
 
     int nid = static_cast<int>(t.nodes.size());
     push_node(t, std::move(nn), log);
@@ -1053,64 +895,6 @@ int count_root_components(const DynamicTree& t) {
     int c = 0;
     for (const auto& n : t.nodes) if (n.active && n.parent == -1) ++c;
     return c;
-}
-
-std::vector<int> merge_sorted_components(const std::vector<int>& a, const std::vector<int>& b) {
-    std::vector<int> out;
-    out.reserve(a.size() + b.size());
-    size_t i = 0, j = 0;
-    while (i < a.size() && j < b.size()) {
-        if (a[i] < b[j]) out.push_back(a[i++]);
-        else if (b[j] < a[i]) out.push_back(b[j++]);
-        else {
-            out.push_back(a[i]);
-            ++i;
-            ++j;
-        }
-    }
-    while (i < a.size()) out.push_back(a[i++]);
-    while (j < b.size()) out.push_back(b[j++]);
-    return out;
-}
-
-std::vector<std::vector<int>> greedy_merge_partition(
-    std::vector<std::vector<int>> comps,
-    const std::vector<uint64_t>& zob,
-    const std::vector<TreeData>& trees
-) {
-    for (auto& comp : comps) {
-        std::sort(comp.begin(), comp.end());
-        comp.erase(std::unique(comp.begin(), comp.end()), comp.end());
-    }
-
-    if (comps.size() > 256) return comps;
-
-    while (true) {
-        int best_i = -1;
-        int best_j = -1;
-        size_t best_union_size = 0;
-
-        for (int i = 0; i < static_cast<int>(comps.size()); ++i) {
-            if (comps[i].empty()) continue;
-            for (int j = i + 1; j < static_cast<int>(comps.size()); ++j) {
-                if (comps[j].empty()) continue;
-                size_t max_possible = comps[i].size() + comps[j].size();
-                if (max_possible <= best_union_size) continue;
-                auto merged = merge_sorted_components(comps[i], comps[j]);
-                if (merged.size() <= best_union_size) continue;
-                if (!component_valid_both_trees(merged, zob, trees)) continue;
-                best_union_size = merged.size();
-                best_i = i;
-                best_j = j;
-            }
-        }
-
-        if (best_i == -1) break;
-        comps[best_i] = merge_sorted_components(comps[best_i], comps[best_j]);
-        comps.erase(comps.begin() + best_j);
-    }
-
-    return comps;
 }
 
 struct EliteSolution {
@@ -1575,9 +1359,6 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     if (n <= 0) return singleton_forest(1);
     if (inst.tree_count != 2) return singleton_forest(n);
 
-    std::vector<uint64_t> zob(n + 1, 0);
-    for (int x = 1; x <= n; ++x) zob[x] = mix64(static_cast<uint64_t>(x) * 0x9e3779b97f4a7c15ULL + 0xabcULL);
-
     std::vector<SimpleTree> parsed;
     std::vector<TreeData> trees;
     parsed.reserve(2);
@@ -1587,7 +1368,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
         SimpleTree st;
         if (!NewickParser(line).parse(st)) return singleton_forest(n);
         TreeData td;
-        if (!build_tree_data(st, n, zob, td)) return singleton_forest(n);
+        if (!build_tree_data(st, n, td)) return singleton_forest(n);
         parsed.push_back(std::move(st));
         trees.push_back(std::move(td));
     }
