@@ -1,5 +1,3 @@
-#include "genesis/genesis.hpp"
-
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -21,7 +19,6 @@
 
 namespace {
 
-using genesis::tree::Tree;
 using Clock = std::chrono::steady_clock;
 
 uint64_t mix64(uint64_t x);
@@ -283,18 +280,6 @@ std::string normalize_output(const std::vector<std::string>& lines) {
 
 void publish_best_solution(const std::vector<std::string>& forest) {
     set_best_output_buffer(normalize_output(forest));
-}
-
-bool parse_with_genesis(const std::string& line) {
-    try {
-        genesis::tree::CommonTreeNewickReader reader;
-        auto src = genesis::utils::from_string(line);
-        Tree t = reader.read(src);
-        (void)t;
-        return true;
-    } catch (...) {
-        return false;
-    }
 }
 
 class NewickParser {
@@ -1599,7 +1584,6 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     trees.reserve(2);
 
     for (const auto& line : inst.newick_lines) {
-        if (!parse_with_genesis(line)) return singleton_forest(n);
         SimpleTree st;
         if (!NewickParser(line).parse(st)) return singleton_forest(n);
         TreeData td;
