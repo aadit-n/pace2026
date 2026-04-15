@@ -1960,6 +1960,47 @@ struct ExactKernelResult {
     std::vector<std::vector<int>> comps;
 };
 
+struct ExactSearchStats {
+    int reduced_n = 0;
+    int threshold = 24;
+    int incumbent_before = 0;
+    int incumbent_after = 0;
+    long long elapsed_ms = 0;
+    uint64_t nodes = 0;
+    uint64_t memo_hits = 0;
+    uint64_t bound_prunes = 0;
+    uint64_t deadline_prunes = 0;
+    bool triggered = false;
+    bool improved = false;
+};
+
+bool exact_profile_enabled() {
+    static int enabled = []() {
+        const char* env = std::getenv("STRIDE_EXACT_PROFILE");
+        return (env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
+    }();
+    return enabled != 0;
+}
+
+void emit_exact_profile(const char* phase, const ExactSearchStats& stats) {
+    if (!exact_profile_enabled()) return;
+    std::cerr
+        << "EXACT"
+        << " phase=" << phase
+        << " reduced_n=" << stats.reduced_n
+        << " threshold=" << stats.threshold
+        << " triggered=" << (stats.triggered ? 1 : 0)
+        << " incumbent_before=" << stats.incumbent_before
+        << " incumbent_after=" << stats.incumbent_after
+        << " improved=" << (stats.improved ? 1 : 0)
+        << " ms=" << stats.elapsed_ms
+        << " nodes=" << stats.nodes
+        << " memo_hits=" << stats.memo_hits
+        << " bound_prunes=" << stats.bound_prunes
+        << " deadline_prunes=" << stats.deadline_prunes
+        << '\n';
+}
+
 void collect_current_components(const DynamicTree& f, std::vector<std::vector<int>>& comps) {
     comps.clear();
     for (int u = 0; u < static_cast<int>(f.nodes.size()); ++u) {
@@ -1979,17 +2020,31 @@ void exact_kernel_dfs(
     Clock::time_point deadline,
     int& best_components,
     std::vector<std::vector<int>>& best_comps,
-    std::unordered_map<ExactStateKey, int, ExactStateKeyHash>& memo
+    std::unordered_map<ExactStateKey, int, ExactStateKeyHash>& memo,
+    ExactSearchStats* stats = nullptr
 ) {
-    if (g_terminate || Clock::now() >= deadline) return;
+    if (stats) ++stats->nodes;
+    if (g_terminate || Clock::now() >= deadline) {
+        if (stats) ++stats->deadline_prunes;
+        return;
+    }
 
     contract_all_common_cherries(t1, f, next_label);
     int current_components = count_root_components(f);
-    if (current_components >= best_components) return;
+    if (current_components >= best_components) {
+        if (stats) ++stats->bound_prunes;
+        return;
+    }
 
     ExactStateKey key = exact_state_key(t1, f);
     auto it = memo.find(key);
-    if (it != memo.end() && it->second <= current_components) return;
+    if (it != memo.end() && it->second <= current_components) {
+        if (stats) {
+            ++stats->memo_hits;
+            ++stats->bound_prunes;
+        }
+        return;
+    }
     memo[key] = current_components;
 
     auto cherries = cherries_by_label(t1);
@@ -2045,7 +2100,7 @@ void exact_kernel_dfs(
         const auto& plan = plans[static_cast<size_t>(rank.second)];
         DynamicTree nf = f;
         apply_cut_plan(nf, plan);
-        exact_kernel_dfs(t1, nf, next_label, deadline, best_components, best_comps, memo);
+        exact_kernel_dfs(t1, nf, next_label, deadline, best_components, best_comps, memo, stats);
         if (g_terminate || Clock::now() >= deadline) return;
     }
 }
@@ -2055,23 +2110,58 @@ ExactKernelResult maybe_solve_exact_kernel(
     const DynamicTree& dt2_base,
     int reduced_n,
     int heuristic_components,
-    Clock::time_point soft_deadline
+    Clock::time_point soft_deadline,
+    const char* phase = "initial"
 ) {
     ExactKernelResult res;
-    if (reduced_n > 24) return res;
-    if (heuristic_components <= 1) return res;
-    if (heuristic_components - 1 > 18) return res;
-    if (Clock::now() + std::chrono::milliseconds(50) >= soft_deadline) return res;
+    ExactSearchStats stats;
+    stats.reduced_n = reduced_n;
+    stats.incumbent_before = heuristic_components;
+    stats.incumbent_after = heuristic_components;
+    if (reduced_n > stats.threshold) {
+        emit_exact_profile(phase, stats);
+        return res;
+    }
+    if (heuristic_components <= 1) {
+        emit_exact_profile(phase, stats);
+        return res;
+    }
+    if (heuristic_components - 1 > 18) {
+        emit_exact_profile(phase, stats);
+        return res;
+    }
+    if (Clock::now() + std::chrono::milliseconds(50) >= soft_deadline) {
+        emit_exact_profile(phase, stats);
+        return res;
+    }
 
     int best_components = heuristic_components;
     std::vector<std::vector<int>> best_comps;
     std::unordered_map<ExactStateKey, int, ExactStateKeyHash> memo;
     auto exact_deadline = std::min(soft_deadline, Clock::now() + std::chrono::milliseconds(1200));
-    exact_kernel_dfs(dt1_base, dt2_base, reduced_n + 1, exact_deadline, best_components, best_comps, memo);
+    stats.triggered = true;
+    auto exact_start = Clock::now();
+    ExactSearchStats* stats_ptr = exact_profile_enabled() ? &stats : nullptr;
+    exact_kernel_dfs(
+        dt1_base,
+        dt2_base,
+        reduced_n + 1,
+        exact_deadline,
+        best_components,
+        best_comps,
+        memo,
+        stats_ptr
+    );
+    stats.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - exact_start
+    ).count();
+    stats.incumbent_after = best_components;
     if (!best_comps.empty() && best_components < heuristic_components) {
         res.solved = true;
         res.comps = std::move(best_comps);
+        stats.improved = true;
     }
+    emit_exact_profile(phase, stats);
     return res;
 }
 
@@ -2108,7 +2198,14 @@ std::vector<std::vector<int>> solve_direct_reduced(
     std::vector<std::vector<int>> best_reduced = reduced_singleton_components(reduced_n);
     int best_components = static_cast<int>(best_reduced.size());
 
-    auto exact = maybe_solve_exact_kernel(dt1_base, dt2_base, reduced_n, best_components, deadline);
+    auto exact = maybe_solve_exact_kernel(
+        dt1_base,
+        dt2_base,
+        reduced_n,
+        best_components,
+        deadline,
+        "initial"
+    );
     if (exact.solved && !exact.comps.empty()) {
         best_reduced = exact.comps;
         best_components = static_cast<int>(best_reduced.size());
@@ -2118,7 +2215,6 @@ std::vector<std::vector<int>> solve_direct_reduced(
     int elite_limit = elite_pool_limit_for_size(reduced_n);
     uint64_t iter = 0;
     auto intensify_start = Clock::now() + (deadline - Clock::now()) * 4 / 5;
-    int best_exact_attempt_bound = best_components;
 
     while (!g_terminate && Clock::now() < deadline) {
         uint64_t seed = mix64(seed_base ^ iter);
@@ -2146,21 +2242,6 @@ std::vector<std::vector<int>> solve_direct_reduced(
         if (static_cast<int>(res.comps.size()) < best_components) {
             best_reduced = res.comps;
             best_components = static_cast<int>(best_reduced.size());
-        }
-        if (static_cast<int>(res.comps.size()) < best_exact_attempt_bound) {
-            best_exact_attempt_bound = static_cast<int>(res.comps.size());
-            auto exact_retry = maybe_solve_exact_kernel(
-                dt1_base,
-                dt2_base,
-                reduced_n,
-                static_cast<int>(res.comps.size()),
-                deadline
-            );
-            if (exact_retry.solved && !exact_retry.comps.empty() &&
-                static_cast<int>(exact_retry.comps.size()) < best_components) {
-                best_reduced = exact_retry.comps;
-                best_components = static_cast<int>(best_reduced.size());
-            }
         }
         ++iter;
     }
@@ -2485,7 +2566,6 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     std::vector<EliteSolution> elite_pool;
     int elite_limit = elite_pool_limit_for_size(reduced_n);
     uint64_t iter = 0;
-    int best_exact_attempt_bound = std::numeric_limits<int>::max();
     auto intensify_start = start + (soft_deadline - start) * 4 / 5;
     while (!g_terminate && Clock::now() < soft_deadline) {
         uint64_t seed = mix64(base_seed ^ iter);
@@ -2516,26 +2596,6 @@ std::vector<std::string> solve(const PaceInstance& inst) {
             best_out = out;
             best_components = static_cast<int>(out.size());
             publish_best_solution(best_out);
-        }
-
-        if (static_cast<int>(res.comps.size()) < best_exact_attempt_bound) {
-            best_exact_attempt_bound = static_cast<int>(res.comps.size());
-            auto exact = maybe_solve_exact_kernel(
-                dt1_base,
-                dt2_base,
-                reduced_n,
-                static_cast<int>(res.comps.size()),
-                soft_deadline
-            );
-            if (exact.solved && !exact.comps.empty()) {
-                auto exact_expanded = expand_reduced_components(exact.comps, reduced.expansion);
-                auto exact_out = forest_from_partition(exact_expanded, n, original_t1);
-                if (!exact_out.empty() && static_cast<int>(exact_out.size()) < best_components) {
-                    best_out = exact_out;
-                    best_components = static_cast<int>(exact_out.size());
-                    publish_best_solution(best_out);
-                }
-            }
         }
         ++iter;
     }
