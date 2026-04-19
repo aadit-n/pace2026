@@ -609,6 +609,7 @@ bool reduce_common_rooted_chains_once(
     std::vector<std::vector<int>>& expansion,
     int& next_label
 ) {
+    constexpr int kMinReducibleChainLength = 3;
     std::vector<SimpleChainInfo> chain1(t1.children.size());
     std::vector<SimpleChainInfo> chain2(t2.children.size());
     compute_simple_chain_dfs(t1, t1.root, chain1);
@@ -626,12 +627,12 @@ bool reduce_common_rooted_chains_once(
     std::unordered_map<std::string, int> map2;
     for (int u = 0; u < static_cast<int>(t1.children.size()); ++u) {
         const auto& ci = chain1[static_cast<size_t>(u)];
-        if (!ci.is_chain || static_cast<int>(ci.ordered_leaves.size()) < 4) continue;
+        if (!ci.is_chain || static_cast<int>(ci.ordered_leaves.size()) < kMinReducibleChainLength) continue;
         map1.emplace(join_ints_key(ci.ordered_leaves), u);
     }
     for (int u = 0; u < static_cast<int>(t2.children.size()); ++u) {
         const auto& ci = chain2[static_cast<size_t>(u)];
-        if (!ci.is_chain || static_cast<int>(ci.ordered_leaves.size()) < 4) continue;
+        if (!ci.is_chain || static_cast<int>(ci.ordered_leaves.size()) < kMinReducibleChainLength) continue;
         map2.emplace(join_ints_key(ci.ordered_leaves), u);
     }
 
@@ -673,7 +674,7 @@ bool reduce_common_rooted_chains_once(
 
     auto rebuild = [&](const SimpleTree& src, const std::vector<SimpleChainInfo>& info, auto&& rebuild_ref, int u, SimpleTree& out) -> int {
         const auto& cur = info[static_cast<size_t>(u)];
-        if (cur.is_chain && static_cast<int>(cur.ordered_leaves.size()) >= 4) {
+        if (cur.is_chain && static_cast<int>(cur.ordered_leaves.size()) >= kMinReducibleChainLength) {
             auto it = selected.find(join_ints_key(cur.ordered_leaves));
             if (it != selected.end()) {
                 return add_simple_node(out, it->second);
@@ -1523,8 +1524,58 @@ bool is_medium_instance_size(int n) {
     return n >= 80 && n <= 350;
 }
 
+bool is_large_instance_size(int n) {
+    return n > 350;
+}
+
 int elite_pool_limit_for_size(int n) {
     return is_medium_instance_size(n) ? 8 : 4;
+}
+
+double search_phase_fraction(
+    Clock::time_point now,
+    Clock::time_point start,
+    Clock::time_point deadline
+) {
+    auto total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - start).count();
+    if (total_ns <= 0) return 1.0;
+    auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count();
+    if (elapsed_ns <= 0) return 0.0;
+    if (elapsed_ns >= total_ns) return 1.0;
+    return static_cast<double>(elapsed_ns) / static_cast<double>(total_ns);
+}
+
+bool configure_elite_guidance(
+    const std::vector<EliteSolution>& elite_pool,
+    uint64_t iter,
+    Clock::time_point start,
+    Clock::time_point deadline,
+    const std::vector<int>*& elite_comp_map,
+    double& elite_bonus
+) {
+    elite_comp_map = nullptr;
+    elite_bonus = 0.0;
+    if (elite_pool.empty()) return false;
+
+    double phase = search_phase_fraction(Clock::now(), start, deadline);
+    if (phase < 0.80) return false;
+
+    bool use = false;
+    if (phase >= 0.95) {
+        use = true;
+        elite_bonus = 6.0;
+    } else if (phase >= 0.90) {
+        use = ((iter & 3ULL) != 0ULL);
+        elite_bonus = 4.5;
+    } else {
+        use = ((iter & 1ULL) != 0ULL);
+        elite_bonus = 3.0;
+    }
+    if (!use) return false;
+
+    const auto& elite = elite_pool[static_cast<size_t>(iter % elite_pool.size())];
+    elite_comp_map = &elite.comp_of_leaf;
+    return true;
 }
 
 uint64_t elite_partition_hash(const std::vector<int>& comp_of_leaf) {
@@ -1662,6 +1713,17 @@ double score_cherry_candidate(const CherryCandidate& cand, int total_leaves) {
             0.004 * static_cast<double>(cand.component_size);
     }
 
+    if (is_large_instance_size(total_leaves)) {
+        return
+            (cand.common ? 11.0 : 0.0) +
+            (cand.same_component ? 0.0 : 4.75) -
+            1.15 * static_cast<double>(cand.distance) -
+            2.25 * static_cast<double>(cand.pendant_count) -
+            0.014 * static_cast<double>(cand.conflict_mass) +
+            3.6 * static_cast<double>(cand.immediate_gain) -
+            0.005 * static_cast<double>(cand.component_size);
+    }
+
     return
         (cand.common ? 12.0 : 0.0) +
         (cand.same_component ? 0.0 : 4.0) -
@@ -1740,7 +1802,7 @@ double evaluate_reduced_state(
     int sampled = 0;
     int sample_cap = (is_medium_instance_size(total_leaves) || total_leaves <= 64)
         ? std::numeric_limits<int>::max()
-        : 6;
+        : (is_large_instance_size(total_leaves) ? 10 : 6);
     for_each_cherry_label_pair(t1, [&](int a, int b) {
         ++cherry_count;
         if (sampled >= sample_cap) return true;
@@ -1773,6 +1835,14 @@ double evaluate_reduced_state(
              1.30 * static_cast<double>(sampled_pendants) -
              0.015 * static_cast<double>(sampled_conflict_mass) -
              0.04 * static_cast<double>(active_leaves);
+    }
+
+    if (is_large_instance_size(total_leaves)) {
+        return
+            -21.0 * static_cast<double>(comp_count) +
+             0.90 * static_cast<double>(cherry_count) -
+             1.55 * static_cast<double>(sampled_pendants) -
+             0.016 * static_cast<double>(sampled_conflict_mass);
     }
 
     return
@@ -2259,7 +2329,8 @@ ThreeApproxResult run_three_approx(
     int n,
     int incumbent_components,
     uint64_t seed,
-    const std::vector<int>* elite_comp_map = nullptr
+    const std::vector<int>* elite_comp_map = nullptr,
+    double elite_bonus = 0.0
 );
 
 std::vector<std::vector<int>> reduced_singleton_components(int reduced_n) {
@@ -2301,15 +2372,13 @@ std::vector<std::vector<int>> solve_direct_reduced(
     std::vector<EliteSolution> elite_pool;
     int elite_limit = elite_pool_limit_for_size(reduced_n);
     uint64_t iter = 0;
-    auto intensify_start = Clock::now() + (deadline - Clock::now()) * 4 / 5;
+    auto search_start = Clock::now();
 
     while (!g_terminate && Clock::now() < deadline) {
         uint64_t seed = mix64(seed_base ^ iter);
         const std::vector<int>* elite_comp_map = nullptr;
-        if (Clock::now() >= intensify_start && !elite_pool.empty() && (iter & 1ULL)) {
-            const auto& elite = elite_pool[static_cast<size_t>(iter % elite_pool.size())];
-            elite_comp_map = &elite.comp_of_leaf;
-        }
+        double elite_bonus = 0.0;
+        configure_elite_guidance(elite_pool, iter, search_start, deadline, elite_comp_map, elite_bonus);
         auto res = run_three_approx(
             dt1_base,
             dt2_base,
@@ -2317,7 +2386,8 @@ std::vector<std::vector<int>> solve_direct_reduced(
             reduced_n,
             best_components,
             seed,
-            elite_comp_map
+            elite_comp_map,
+            elite_bonus
         );
         if (!res.complete || res.comps.empty()) {
             ++iter;
@@ -2342,9 +2412,13 @@ std::vector<std::vector<int>> solve_decomposed_candidate(
     const std::vector<std::vector<int>>& base_expansion,
     Clock::time_point deadline,
     uint64_t seed_base,
+    int incumbent_components,
     int depth = 0
 ) {
     if (g_terminate || Clock::now() >= deadline) {
+        return singleton_partition_from_expansion(base_expansion);
+    }
+    if (incumbent_components <= 1) {
         return singleton_partition_from_expansion(base_expansion);
     }
 
@@ -2384,17 +2458,25 @@ std::vector<std::vector<int>> solve_decomposed_candidate(
                     filter_expansion(reduced.expansion, in_cluster),
                     inside_deadline,
                     mix64(seed_base ^ 0x91e10da5c79e7b1dULL),
+                    std::max(1, incumbent_components - 1),
                     depth + 1
                 );
+                if (static_cast<int>(inside.size()) >= incumbent_components) {
+                    return singleton_partition_from_expansion(reduced.expansion);
+                }
                 auto outside = solve_decomposed_candidate(
                     out_t1,
                     out_t2,
                     filter_expansion(reduced.expansion, out_cluster),
                     deadline,
                     mix64(seed_base ^ 0xbf58476d1ce4e5b9ULL),
+                    std::max(1, incumbent_components - static_cast<int>(inside.size())),
                     depth + 1
                 );
                 inside.insert(inside.end(), outside.begin(), outside.end());
+                if (static_cast<int>(inside.size()) >= incumbent_components) {
+                    return singleton_partition_from_expansion(reduced.expansion);
+                }
                 return inside;
             }
         }
@@ -2411,7 +2493,8 @@ ThreeApproxResult run_three_approx(
     int n,
     int incumbent_components,
     uint64_t seed,
-    const std::vector<int>* elite_comp_map
+    const std::vector<int>* elite_comp_map,
+    double elite_bonus
 ) {
     int next_label = n + 1;
     uint64_t rng = seed ^ 0x9e3779b97f4a7c15ULL;
@@ -2461,7 +2544,7 @@ ThreeApproxResult run_three_approx(
         if (did_common_contract) continue;
 
         size_t chosen_idx = 0;
-        if (medium_mode) {
+        if (medium_mode || elite_comp_map) {
             auto f_mass = compute_active_leaf_masses(f);
             struct RankedCherry {
                 double score = -std::numeric_limits<double>::infinity();
@@ -2476,7 +2559,7 @@ ThreeApproxResult run_three_approx(
                 if (elite_comp_map && elite_comp_map->size() > static_cast<size_t>(n)) {
                     int ida = (*elite_comp_map)[static_cast<size_t>(ca)];
                     int idb = (*elite_comp_map)[static_cast<size_t>(cb)];
-                    if (ida != 0 && ida == idb) score += 2.5;
+                    if (ida != 0 && ida == idb) score += elite_bonus;
                 }
                 ranked.push_back({score, i});
             }
@@ -2484,24 +2567,11 @@ ThreeApproxResult run_three_approx(
                 if (a.score != b.score) return a.score > b.score;
                 return a.idx < b.idx;
             });
-            size_t top_k = std::min<size_t>(4, ranked.size());
+            size_t top_k = medium_mode
+                ? std::min<size_t>(4, ranked.size())
+                : std::min<size_t>(elite_bonus >= 5.0 ? 2 : 3, ranked.size());
             rng = mix64(rng + 0x517cc1b727220a95ULL);
             chosen_idx = ranked[static_cast<size_t>(rng % top_k)].idx;
-        } else if (elite_comp_map && elite_comp_map->size() > static_cast<size_t>(n)) {
-            std::vector<size_t> guided;
-            guided.reserve(cherries.size());
-            for (size_t i = 0; i < cherries.size(); ++i) {
-                auto [ca, cb] = cherries[i];
-                int ida = (*elite_comp_map)[static_cast<size_t>(ca)];
-                int idb = (*elite_comp_map)[static_cast<size_t>(cb)];
-                if (ida != 0 && ida == idb) guided.push_back(i);
-            }
-            rng = mix64(rng + 0x517cc1b727220a95ULL);
-            if (!guided.empty()) {
-                chosen_idx = guided[static_cast<size_t>(rng % guided.size())];
-            } else {
-                chosen_idx = static_cast<size_t>(rng % cherries.size());
-            }
         } else {
             rng = mix64(rng + 0x517cc1b727220a95ULL);
             chosen_idx = static_cast<size_t>(rng % cherries.size());
@@ -2633,7 +2703,8 @@ std::vector<std::string> solve(const PaceInstance& inst) {
             parsed[1],
             identity_expansion,
             decomp_deadline,
-            mix64(base_seed ^ 0x243f6a8885a308d3ULL)
+            mix64(base_seed ^ 0x243f6a8885a308d3ULL),
+            best_components
         );
         auto decomp_out = forest_from_partition(decomp_comps, n, original_t1);
         if (!decomp_out.empty() && static_cast<int>(decomp_out.size()) < best_components) {
@@ -2653,14 +2724,11 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     std::vector<EliteSolution> elite_pool;
     int elite_limit = elite_pool_limit_for_size(reduced_n);
     uint64_t iter = 0;
-    auto intensify_start = start + (soft_deadline - start) * 4 / 5;
     while (!g_terminate && Clock::now() < soft_deadline) {
         uint64_t seed = mix64(base_seed ^ iter);
         const std::vector<int>* elite_comp_map = nullptr;
-        if (Clock::now() >= intensify_start && !elite_pool.empty() && (iter & 1ULL)) {
-            const auto& elite = elite_pool[static_cast<size_t>(iter % elite_pool.size())];
-            elite_comp_map = &elite.comp_of_leaf;
-        }
+        double elite_bonus = 0.0;
+        configure_elite_guidance(elite_pool, iter, start, soft_deadline, elite_comp_map, elite_bonus);
         auto res = run_three_approx(
             dt1_base,
             dt2_base,
@@ -2668,7 +2736,8 @@ std::vector<std::string> solve(const PaceInstance& inst) {
             reduced_n,
             best_components,
             seed,
-            elite_comp_map
+            elite_comp_map,
+            elite_bonus
         );
         if (!res.complete || res.comps.empty()) {
             ++iter;
