@@ -52,6 +52,22 @@ struct ReducedInstance {
     int reduced_leaf_count = 0;
 };
 
+struct ReductionRuleStats {
+    const char* name = "";
+    uint64_t calls = 0;
+    uint64_t applied = 0;
+    uint64_t leaves_removed = 0;
+    long long total_us = 0;
+};
+
+struct ReductionBuildStats {
+    int input_leaves = 0;
+    int output_leaves = 0;
+    int outer_cycles = 0;
+    ReductionRuleStats common_subtrees{"common_subtrees"};
+    ReductionRuleStats rooted_chains{"rooted_chains"};
+};
+
 struct PayloadNode {
     int left = -1;
     int right = -1;
@@ -425,6 +441,44 @@ std::vector<int> simple_tree_leaf_labels(const SimpleTree& st) {
     return out;
 }
 
+int simple_tree_leaf_count(const SimpleTree& st) {
+    int cnt = 0;
+    for (int x : st.leaf_label) {
+        if (x > 0) ++cnt;
+    }
+    return cnt;
+}
+
+bool reduction_profile_enabled() {
+    static int enabled = []() {
+        const char* env = std::getenv("STRIDE_REDUCTION_PROFILE");
+        return (env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
+    }();
+    return enabled != 0;
+}
+
+void emit_reduction_profile(const ReductionBuildStats& stats) {
+    if (!reduction_profile_enabled()) return;
+    auto emit_rule = [&](const ReductionRuleStats& rule) {
+        std::cerr
+            << "REDUCE_RULE"
+            << " name=" << rule.name
+            << " calls=" << rule.calls
+            << " applied=" << rule.applied
+            << " leaves_removed=" << rule.leaves_removed
+            << " us=" << rule.total_us
+            << '\n';
+    };
+    std::cerr
+        << "REDUCE"
+        << " input_leaves=" << stats.input_leaves
+        << " output_leaves=" << stats.output_leaves
+        << " outer_cycles=" << stats.outer_cycles
+        << '\n';
+    emit_rule(stats.common_subtrees);
+    emit_rule(stats.rooted_chains);
+}
+
 std::vector<int> gather_expanded_labels(
     const std::vector<int>& reduced_labels,
     const std::vector<std::vector<int>>& expansion
@@ -760,9 +814,11 @@ ReducedInstance build_reduced_instance(
     const SimpleTree& in2,
     const std::vector<std::vector<int>>& base_expansion
 ) {
+    ReductionBuildStats reduction_stats;
     ReducedInstance red;
     red.t1 = in1;
     red.t2 = in2;
+    reduction_stats.input_leaves = simple_tree_leaf_count(red.t1);
     int max_label = 0;
     for (int x : red.t1.leaf_label) max_label = std::max(max_label, x);
     for (int x : red.t2.leaf_label) max_label = std::max(max_label, x);
@@ -772,14 +828,43 @@ ReducedInstance build_reduced_instance(
     }
     int next_label = max_label + 1;
 
+    auto apply_rule = [&](ReductionRuleStats& stats, auto&& fn) -> bool {
+        ++stats.calls;
+        int before = simple_tree_leaf_count(red.t1);
+        auto started = Clock::now();
+        bool changed = fn(red.t1, red.t2, red.expansion, next_label);
+        stats.total_us += std::chrono::duration_cast<std::chrono::microseconds>(
+            Clock::now() - started
+        ).count();
+        if (changed) {
+            ++stats.applied;
+            int after = simple_tree_leaf_count(red.t1);
+            if (after < before) stats.leaves_removed += static_cast<uint64_t>(before - after);
+        }
+        return changed;
+    };
+
     while (true) {
         bool changed = false;
-        if (reduce_common_rooted_chains_once(red.t1, red.t2, red.expansion, next_label)) {
+        ++reduction_stats.outer_cycles;
+
+        while (apply_rule(
+            reduction_stats.common_subtrees,
+            [&](SimpleTree& t1, SimpleTree& t2, std::vector<std::vector<int>>& expansion, int& nl) {
+                return reduce_common_subtrees_once(t1, t2, expansion, nl);
+            })) {
             changed = true;
         }
-        if (reduce_common_subtrees_once(red.t1, red.t2, red.expansion, next_label)) {
+
+        if (apply_rule(
+            reduction_stats.rooted_chains,
+            [&](SimpleTree& t1, SimpleTree& t2, std::vector<std::vector<int>>& expansion, int& nl) {
+                return reduce_common_rooted_chains_once(t1, t2, expansion, nl);
+            })) {
             changed = true;
+            continue;
         }
+
         if (!changed) break;
     }
 
@@ -800,6 +885,8 @@ ReducedInstance build_reduced_instance(
     renumber_tree(red.t2);
     red.expansion = std::move(new_expansion);
     red.reduced_leaf_count = static_cast<int>(labels.size());
+    reduction_stats.output_leaves = red.reduced_leaf_count;
+    emit_reduction_profile(reduction_stats);
     return red;
 }
 
