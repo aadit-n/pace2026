@@ -1528,6 +1528,12 @@ bool is_large_instance_size(int n) {
     return n > 350;
 }
 
+bool should_use_swapped_orientation(uint64_t iter, int n) {
+    if (n < 24 || n >= 1000) return false;
+    uint64_t mod = is_large_instance_size(n) ? 6ULL : 8ULL;
+    return (mix64(iter ^ 0xa0761d6478bd642fULL) % mod) == 0ULL;
+}
+
 int elite_pool_limit_for_size(int n) {
     return is_medium_instance_size(n) ? 8 : 4;
 }
@@ -2379,9 +2385,10 @@ std::vector<std::vector<int>> solve_direct_reduced(
         const std::vector<int>* elite_comp_map = nullptr;
         double elite_bonus = 0.0;
         configure_elite_guidance(elite_pool, iter, search_start, deadline, elite_comp_map, elite_bonus);
+        bool swapped = should_use_swapped_orientation(iter, reduced_n);
         auto res = run_three_approx(
-            dt1_base,
-            dt2_base,
+            swapped ? dt2_base : dt1_base,
+            swapped ? dt1_base : dt2_base,
             deadline,
             reduced_n,
             best_components,
@@ -2729,9 +2736,10 @@ std::vector<std::string> solve(const PaceInstance& inst) {
         const std::vector<int>* elite_comp_map = nullptr;
         double elite_bonus = 0.0;
         configure_elite_guidance(elite_pool, iter, start, soft_deadline, elite_comp_map, elite_bonus);
+        bool swapped = should_use_swapped_orientation(iter, reduced_n);
         auto res = run_three_approx(
-            dt1_base,
-            dt2_base,
+            swapped ? dt2_base : dt1_base,
+            swapped ? dt1_base : dt2_base,
             soft_deadline,
             reduced_n,
             best_components,
