@@ -2649,6 +2649,15 @@ struct RepairCandidateGroup {
     std::vector<int> component_indices;
     int union_size = 0;
     int score = 0;
+    int elite_merge_votes = 0;
+    int elite_full_merge_votes = 0;
+    int elite_instability = 0;
+    bool from_elite = false;
+};
+
+struct LocalExactSearchPlan {
+    int threshold = 0;
+    std::chrono::milliseconds budget{0};
 };
 
 std::string repair_group_key(const std::vector<int>& group) {
@@ -2703,9 +2712,182 @@ void add_repair_candidates_from_order(
     }
 }
 
+int repair_group_union_size(
+    const std::vector<std::vector<int>>& comps,
+    const std::vector<int>& group
+) {
+    int union_size = 0;
+    for (int idx : group) {
+        if (idx >= 0 && idx < static_cast<int>(comps.size())) {
+            union_size += static_cast<int>(comps[static_cast<size_t>(idx)].size());
+        }
+    }
+    return union_size;
+}
+
+LocalExactSearchPlan plan_local_exact_search(
+    int reduced_n,
+    int incumbent_components,
+    bool final_phase,
+    long long ms_left
+) {
+    LocalExactSearchPlan plan;
+    int incumbent = std::max(1, incumbent_components);
+
+    if (incumbent <= 2) {
+        plan.threshold = final_phase ? 44 : 40;
+        plan.budget = std::chrono::milliseconds(final_phase ? 110 : 70);
+    } else if (incumbent == 3) {
+        plan.threshold = final_phase ? 42 : 38;
+        plan.budget = std::chrono::milliseconds(final_phase ? 90 : 55);
+    } else if (incumbent == 4) {
+        plan.threshold = final_phase ? 38 : 36;
+        plan.budget = std::chrono::milliseconds(final_phase ? 70 : 45);
+    } else {
+        plan.threshold = final_phase ? 34 : 32;
+        plan.budget = std::chrono::milliseconds(final_phase ? 55 : 35);
+    }
+
+    if (reduced_n <= 24) {
+        plan.budget += std::chrono::milliseconds(final_phase ? 40 : 20);
+    } else if (reduced_n >= 40) {
+        plan.budget -= std::chrono::milliseconds(10);
+    }
+
+    plan.threshold = std::min(plan.threshold, reduced_n);
+    long long budget_ms = plan.budget.count();
+    long long max_cap = final_phase ? 220 : 140;
+    long long share_cap = std::max<long long>(15, ms_left / (final_phase ? 3 : 5));
+    budget_ms = std::max<long long>(15, std::min<long long>(budget_ms, std::min(max_cap, share_cap)));
+    plan.budget = std::chrono::milliseconds(budget_ms);
+    return plan;
+}
+
+LocalExactSearchPlan plan_polish_exact_search(
+    int reduced_n,
+    int incumbent_components,
+    long long ms_left
+) {
+    LocalExactSearchPlan plan;
+    int incumbent = std::max(1, incumbent_components);
+
+    if (incumbent <= 6) {
+        plan.threshold = 40;
+        plan.budget = std::chrono::milliseconds(900);
+    } else if (incumbent <= 8) {
+        plan.threshold = 36;
+        plan.budget = std::chrono::milliseconds(650);
+    } else if (incumbent <= 10) {
+        plan.threshold = 32;
+        plan.budget = std::chrono::milliseconds(450);
+    } else if (incumbent <= 12) {
+        plan.threshold = 28;
+        plan.budget = std::chrono::milliseconds(300);
+    } else {
+        plan.threshold = 24;
+        plan.budget = std::chrono::milliseconds(180);
+    }
+
+    plan.threshold = std::min(plan.threshold, reduced_n);
+    long long budget_ms = plan.budget.count();
+    long long share_cap = std::max<long long>(40, ms_left / 4);
+    budget_ms = std::max<long long>(40, std::min<long long>(budget_ms, std::min<long long>(1400, share_cap)));
+    plan.budget = std::chrono::milliseconds(budget_ms);
+    return plan;
+}
+
+void annotate_repair_candidate_with_elite_signal(
+    RepairCandidateGroup& cand,
+    const std::vector<std::vector<int>>& comps,
+    const std::vector<EliteSolution>& elite_pool
+) {
+    if (elite_pool.empty() || cand.component_indices.empty()) return;
+
+    std::vector<int> union_labels;
+    union_labels.reserve(static_cast<size_t>(cand.union_size));
+    for (int idx : cand.component_indices) {
+        if (idx < 0 || idx >= static_cast<int>(comps.size())) continue;
+        union_labels.insert(
+            union_labels.end(),
+            comps[static_cast<size_t>(idx)].begin(),
+            comps[static_cast<size_t>(idx)].end()
+        );
+    }
+    std::sort(union_labels.begin(), union_labels.end());
+    union_labels.erase(std::unique(union_labels.begin(), union_labels.end()), union_labels.end());
+
+    int merge_votes = 0;
+    int full_merge_votes = 0;
+    for (const auto& elite : elite_pool) {
+        std::unordered_set<int> elite_ids;
+        for (int x : union_labels) {
+            if (x >= 1 && x < static_cast<int>(elite.comp_of_leaf.size())) {
+                int id = elite.comp_of_leaf[static_cast<size_t>(x)];
+                if (id != 0) elite_ids.insert(id);
+            }
+        }
+        int parts = static_cast<int>(elite_ids.size());
+        if (parts < static_cast<int>(cand.component_indices.size())) ++merge_votes;
+        if (parts == 1) ++full_merge_votes;
+    }
+
+    cand.elite_merge_votes = merge_votes;
+    cand.elite_full_merge_votes = full_merge_votes;
+    cand.elite_instability = merge_votes * static_cast<int>(elite_pool.size() - merge_votes);
+}
+
+void add_elite_repair_candidates(
+    const std::vector<std::vector<int>>& comps,
+    const std::vector<EliteSolution>& elite_pool,
+    int max_group_size,
+    int leaf_limit,
+    std::unordered_set<std::string>& seen,
+    std::vector<RepairCandidateGroup>& out
+) {
+    if (elite_pool.empty()) return;
+
+    for (const auto& elite : elite_pool) {
+        std::unordered_map<int, std::vector<int>> buckets;
+        buckets.reserve(comps.size());
+        for (int i = 0; i < static_cast<int>(comps.size()); ++i) {
+            std::unordered_set<int> elite_ids;
+            elite_ids.reserve(comps[static_cast<size_t>(i)].size());
+            for (int x : comps[static_cast<size_t>(i)]) {
+                if (x >= 1 && x < static_cast<int>(elite.comp_of_leaf.size())) {
+                    int id = elite.comp_of_leaf[static_cast<size_t>(x)];
+                    if (id != 0) elite_ids.insert(id);
+                }
+            }
+            for (int id : elite_ids) {
+                buckets[id].push_back(i);
+            }
+        }
+
+        for (auto& [elite_id, group] : buckets) {
+            (void)elite_id;
+            std::sort(group.begin(), group.end());
+            group.erase(std::unique(group.begin(), group.end()), group.end());
+            if (group.size() < 2 || static_cast<int>(group.size()) > max_group_size) continue;
+            int union_size = repair_group_union_size(comps, group);
+            if (union_size > leaf_limit) continue;
+
+            std::string key = repair_group_key(group);
+            if (!seen.insert(key).second) continue;
+
+            RepairCandidateGroup cand;
+            cand.component_indices = std::move(group);
+            cand.union_size = union_size;
+            cand.score = union_size + 2 * static_cast<int>(cand.component_indices.size() - 2);
+            cand.from_elite = true;
+            out.push_back(std::move(cand));
+        }
+    }
+}
+
 std::vector<RepairCandidateGroup> build_repair_candidates(
     const ReducedInstance& reduced,
     const std::vector<std::vector<int>>& comps,
+    const std::vector<EliteSolution>& elite_pool,
     int max_group_size,
     int leaf_limit,
     int max_candidates
@@ -2753,11 +2935,29 @@ std::vector<RepairCandidateGroup> build_repair_candidates(
 
     std::unordered_set<std::string> seen;
     std::vector<RepairCandidateGroup> candidates;
-    candidates.reserve(static_cast<size_t>(max_candidates * 2));
+    candidates.reserve(static_cast<size_t>(max_candidates * 3));
     add_repair_candidates_from_order(order_t1, summaries, max_group_size, leaf_limit, seen, candidates);
     add_repair_candidates_from_order(order_t2, summaries, max_group_size, leaf_limit, seen, candidates);
+    add_elite_repair_candidates(comps, elite_pool, max_group_size, leaf_limit, seen, candidates);
+
+    for (auto& cand : candidates) {
+        annotate_repair_candidate_with_elite_signal(cand, comps, elite_pool);
+        cand.score -= 2 * cand.elite_merge_votes + cand.elite_full_merge_votes;
+    }
 
     std::sort(candidates.begin(), candidates.end(), [](const RepairCandidateGroup& a, const RepairCandidateGroup& b) {
+        if (a.elite_instability != b.elite_instability) {
+            return a.elite_instability > b.elite_instability;
+        }
+        if (a.elite_merge_votes != b.elite_merge_votes) {
+            return a.elite_merge_votes > b.elite_merge_votes;
+        }
+        if (a.elite_full_merge_votes != b.elite_full_merge_votes) {
+            return a.elite_full_merge_votes > b.elite_full_merge_votes;
+        }
+        if (a.from_elite != b.from_elite) {
+            return a.from_elite > b.from_elite;
+        }
         if (a.score != b.score) return a.score < b.score;
         if (a.union_size != b.union_size) return a.union_size < b.union_size;
         return a.component_indices.size() < b.component_indices.size();
@@ -2773,8 +2973,8 @@ bool apply_exact_repair_group(
     const std::vector<std::vector<int>>& current_partition,
     const std::vector<int>& group_indices,
     int repair_leaf_limit,
-    std::chrono::milliseconds repair_cap,
     Clock::time_point deadline,
+    bool final_phase,
     std::vector<std::vector<int>>& next_partition
 ) {
     if (group_indices.size() < 2) return false;
@@ -2810,16 +3010,28 @@ bool apply_exact_repair_group(
         return false;
     }
 
+    auto now = Clock::now();
+    auto ms_left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+    LocalExactSearchPlan plan = plan_local_exact_search(
+        local_reduced.reduced_leaf_count,
+        static_cast<int>(group_indices.size()),
+        final_phase,
+        ms_left
+    );
+    if (local_reduced.reduced_leaf_count > plan.threshold) {
+        return false;
+    }
+
     DynamicTree dt1_base = build_dynamic_tree(local_reduced.t1);
     DynamicTree dt2_base = build_dynamic_tree(local_reduced.t2);
-    auto exact_deadline = std::min(deadline, Clock::now() + repair_cap);
+    auto exact_deadline = std::min(deadline, now + plan.budget);
     auto exact = solve_exact_kernel_bounded(
         dt1_base,
         dt2_base,
         local_reduced.reduced_leaf_count,
         static_cast<int>(group_indices.size()),
         exact_deadline,
-        repair_leaf_limit,
+        plan.threshold,
         "repair"
     );
     if (!exact.solved || exact.comps.empty()) return false;
@@ -2853,15 +3065,17 @@ bool run_exact_repair_pass(
     const ReducedInstance& reduced,
     std::vector<std::vector<int>>& best_reduced,
     int& best_components,
+    const std::vector<EliteSolution>& elite_pool,
     Clock::time_point deadline,
     int max_group_size,
     int repair_leaf_limit,
-    std::chrono::milliseconds per_repair_cap,
+    bool final_phase,
     int max_candidates
 ) {
     auto candidates = build_repair_candidates(
         reduced,
         best_reduced,
+        elite_pool,
         max_group_size,
         repair_leaf_limit,
         max_candidates
@@ -2874,8 +3088,8 @@ bool run_exact_repair_pass(
                 best_reduced,
                 cand.component_indices,
                 repair_leaf_limit,
-                per_repair_cap,
                 deadline,
+                final_phase,
                 improved_partition)) {
             continue;
         }
@@ -2893,6 +3107,7 @@ bool run_exact_repair_portfolio(
     const ReducedInstance& reduced,
     std::vector<std::vector<int>>& best_reduced,
     int& best_components,
+    const std::vector<EliteSolution>& elite_pool,
     Clock::time_point deadline,
     bool final_phase
 ) {
@@ -2912,10 +3127,11 @@ bool run_exact_repair_portfolio(
             reduced,
             best_reduced,
             best_components,
+            elite_pool,
             repair_deadline,
             2,
             40,
-            std::chrono::milliseconds(final_phase ? 40 : 30),
+            final_phase,
             final_phase ? 24 : 16
         );
         if (!improved) {
@@ -2923,10 +3139,11 @@ bool run_exact_repair_portfolio(
                 reduced,
                 best_reduced,
                 best_components,
+                elite_pool,
                 repair_deadline,
                 3,
                 44,
-                std::chrono::milliseconds(final_phase ? 55 : 40),
+                final_phase,
                 final_phase ? 20 : 12
             );
         }
@@ -2935,10 +3152,11 @@ bool run_exact_repair_portfolio(
                 reduced,
                 best_reduced,
                 best_components,
+                elite_pool,
                 repair_deadline,
                 4,
                 48,
-                std::chrono::milliseconds(70),
+                final_phase,
                 12
             );
         }
@@ -3029,16 +3247,23 @@ bool run_final_polishing_portfolio(
     uint64_t seed_base
 ) {
     bool improved = false;
-    if (reduced.reduced_leaf_count <= 32 && best_components <= 12 &&
-        Clock::now() + std::chrono::milliseconds(20) < deadline) {
-        auto exact_deadline = std::min(deadline, Clock::now() + std::chrono::milliseconds(400));
+    auto now = Clock::now();
+    auto ms_left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+    LocalExactSearchPlan polish_plan = plan_polish_exact_search(
+        reduced.reduced_leaf_count,
+        best_components,
+        ms_left
+    );
+    if (reduced.reduced_leaf_count <= polish_plan.threshold &&
+        now + std::chrono::milliseconds(20) < deadline) {
+        auto exact_deadline = std::min(deadline, now + polish_plan.budget);
         auto exact = solve_exact_kernel_bounded(
             dt1_base,
             dt2_base,
             reduced.reduced_leaf_count,
             best_components,
             exact_deadline,
-            32,
+            polish_plan.threshold,
             "polish"
         );
         if (exact.solved && !exact.comps.empty() &&
@@ -3059,7 +3284,7 @@ bool run_final_polishing_portfolio(
         }
     }
 
-    if (run_exact_repair_portfolio(reduced, best_reduced, best_components, deadline, true)) {
+    if (run_exact_repair_portfolio(reduced, best_reduced, best_components, elite_pool, deadline, true)) {
         improved = true;
     }
     if (run_discrepancy_polish(
@@ -3126,7 +3351,7 @@ std::vector<std::vector<int>> solve_direct_reduced(
         maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
     }
     if (best_components < reduced_n) {
-        if (run_exact_repair_portfolio(reduced, best_reduced, best_components, deadline, false)) {
+        if (run_exact_repair_portfolio(reduced, best_reduced, best_components, elite_pool, deadline, false)) {
             prune_limit = std::min(prune_limit, best_components);
             if (static_cast<int>(best_reduced.size()) <= prune_limit + 2) {
                 maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
@@ -3182,7 +3407,7 @@ std::vector<std::vector<int>> solve_direct_reduced(
             best_reduced = res.comps;
             best_components = static_cast<int>(best_reduced.size());
             prune_limit = std::min(prune_limit, best_components);
-            if (run_exact_repair_portfolio(reduced, best_reduced, best_components, deadline, false)) {
+            if (run_exact_repair_portfolio(reduced, best_reduced, best_components, elite_pool, deadline, false)) {
                 prune_limit = std::min(prune_limit, best_components);
             }
             if (static_cast<int>(best_reduced.size()) <= prune_limit + 2) {
@@ -3573,9 +3798,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     std::vector<EliteSolution> elite_pool;
     int elite_limit = elite_pool_limit_for_size(reduced_n);
     uint64_t iter = 0;
-    bool final_polish_done = false;
     while (!g_terminate && Clock::now() < soft_deadline) {
-        double phase = search_phase_fraction(Clock::now(), start, soft_deadline);
         // if (!final_polish_done &&
         //     phase >= 0.85 &&
         //     best_reduced_components <= best_components &&
@@ -3651,7 +3874,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
             best_reduced = std::move(candidate_reduced);
             best_reduced_components = static_cast<int>(best_reduced.size());
 
-            if (run_exact_repair_portfolio(reduced, best_reduced, best_reduced_components, soft_deadline, false) &&
+            if (run_exact_repair_portfolio(reduced, best_reduced, best_reduced_components, elite_pool, soft_deadline, false) &&
                 best_reduced_components < best_components &&
                 partition_is_valid_agreement_forest(
                     reduced.t1,
@@ -3707,6 +3930,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                 reduced,
                 polished,
                 polished_components,
+                elite_pool,
                 soft_deadline,
                 true) &&
             polished_components < best_components &&
