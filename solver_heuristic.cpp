@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -8,6 +9,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1514,6 +1516,51 @@ int count_root_components(const DynamicTree& t) {
     return c;
 }
 
+int exact_conflict_lower_bound(const DynamicTree& t1, const DynamicTree& f) {
+    std::vector<char> used(f.nodes.size(), 0);
+    int lb = 0;
+    for_each_cherry_label_pair(t1, [&](int a, int b) {
+        if (are_siblings_by_label(f, a, b)) return true;
+        int na = find_node_of_label(f, a);
+        int nb = find_node_of_label(f, b);
+        if (na == -1 || nb == -1) return true;
+        if (!is_active_leaf(f, na) || !is_active_leaf(f, nb)) return true;
+
+        int ra = root_of(f, na);
+        int rb = root_of(f, nb);
+        if (ra == -1 || rb == -1) return true;
+
+        if (ra != rb) {
+            if (used[static_cast<size_t>(ra)] || used[static_cast<size_t>(rb)]) return true;
+            used[static_cast<size_t>(ra)] = 1;
+            used[static_cast<size_t>(rb)] = 1;
+            ++lb;
+            return true;
+        }
+
+        auto path = path_nodes(f, na, nb);
+        std::vector<int> zone;
+        for (size_t i = 1; i + 1 < path.size(); ++i) zone.push_back(path[i]);
+        if (zone.empty()) {
+            int p = f.nodes[na].parent;
+            if (p == -1) return true;
+            zone.push_back(p);
+        }
+
+        for (int u : zone) {
+            if (u >= 0 && u < static_cast<int>(used.size()) && used[static_cast<size_t>(u)]) {
+                return true;
+            }
+        }
+        for (int u : zone) {
+            if (u >= 0 && u < static_cast<int>(used.size())) used[static_cast<size_t>(u)] = 1;
+        }
+        ++lb;
+        return true;
+    });
+    return lb;
+}
+
 struct EliteSolution {
     int components = 0;
     uint64_t hash = 0;
@@ -1878,21 +1925,36 @@ std::vector<int> choose_cut_plan(
         });
 
         size_t individual_limit = is_medium_instance_size(total_leaves)
-            ? std::min<size_t>(8, sorted.size())
+            ? std::min<size_t>(10, sorted.size())
             : std::min<size_t>(4, sorted.size());
         for (size_t i = 0; i < individual_limit; ++i) {
             plans.push_back({sorted[i]});
         }
+
         plans.push_back({cand.na});
         plans.push_back({cand.nb});
+
+        if (sorted.size() >= 2) {
+            plans.push_back({sorted[0], sorted[1]});
+        }
+        if (sorted.size() >= 3) {
+            plans.push_back({sorted[0], sorted[1], sorted[2]});
+        }
+
         if (cand.pendants.size() > 1) {
             std::vector<int> bundle;
-            for (size_t i = 0; i < (sorted.size() + 1) / 2; ++i) bundle.push_back(sorted[i]);
+            size_t bundle_limit = std::min<size_t>(5, sorted.size());
+            for (size_t i = 0; i < bundle_limit; ++i) {
+                bundle.push_back(sorted[i]);
+            }
             plans.push_back(std::move(bundle));
-            if (is_medium_instance_size(total_leaves)) {
+
+            if (sorted.size() <= 10) {
                 plans.push_back(sorted);
             }
-            if (cand.pendants.size() <= 6 || (is_medium_instance_size(total_leaves) && cand.pendants.size() <= 8)) {
+
+            if (cand.pendants.size() <= 6 ||
+                (is_medium_instance_size(total_leaves) && cand.pendants.size() <= 8)) {
                 std::vector<int> classic{cand.na, cand.nb};
                 classic.insert(classic.end(), cand.pendants.begin(), cand.pendants.end());
                 plans.push_back(std::move(classic));
@@ -1928,12 +1990,18 @@ bool use_expensive_same_component_plan(
     const std::vector<int>& path,
     const std::vector<int>& pendants
 ) {
-    // The rollout-style chooser pays off on small/medium instances,
-    // but on the largest instances it can prevent any completed run.
     if (total_leaves > 4000) return false;
-    if (path.size() > 64) return false;
-    if (pendants.size() > 10) return false;
-    return true;
+    if (path.size() > 96) return false;
+
+    if (is_medium_instance_size(total_leaves)) {
+        return pendants.size() <= 32;
+    }
+
+    if (is_large_instance_size(total_leaves)) {
+        return pendants.size() <= 14;
+    }
+
+    return pendants.size() <= 24;
 }
 
 struct ThreeApproxResult {
@@ -2132,6 +2200,7 @@ struct ExactSearchStats {
     uint64_t nodes = 0;
     uint64_t memo_hits = 0;
     uint64_t bound_prunes = 0;
+    uint64_t lb_prunes = 0;
     uint64_t deadline_prunes = 0;
     bool triggered = false;
     bool improved = false;
@@ -2160,6 +2229,7 @@ void emit_exact_profile(const char* phase, const ExactSearchStats& stats) {
         << " nodes=" << stats.nodes
         << " memo_hits=" << stats.memo_hits
         << " bound_prunes=" << stats.bound_prunes
+        << " lb_prunes=" << stats.lb_prunes
         << " deadline_prunes=" << stats.deadline_prunes
         << '\n';
 }
@@ -2196,6 +2266,11 @@ void exact_kernel_dfs(
     int current_components = count_root_components(f);
     if (current_components >= best_components) {
         if (stats) ++stats->bound_prunes;
+        return;
+    }
+    int lb = exact_conflict_lower_bound(t1, f);
+    if (current_components + lb >= best_components) {
+        if (stats) ++stats->lb_prunes;
         return;
     }
 
@@ -2268,40 +2343,37 @@ void exact_kernel_dfs(
     }
 }
 
-ExactKernelResult maybe_solve_exact_kernel(
+ExactKernelResult solve_exact_kernel_bounded(
     const DynamicTree& dt1_base,
     const DynamicTree& dt2_base,
     int reduced_n,
-    int heuristic_components,
-    Clock::time_point soft_deadline,
-    const char* phase = "initial"
+    int incumbent_components,
+    Clock::time_point exact_deadline,
+    int threshold,
+    const char* phase
 ) {
     ExactKernelResult res;
     ExactSearchStats stats;
     stats.reduced_n = reduced_n;
-    stats.incumbent_before = heuristic_components;
-    stats.incumbent_after = heuristic_components;
-    if (reduced_n > stats.threshold) {
+    stats.threshold = threshold;
+    stats.incumbent_before = incumbent_components;
+    stats.incumbent_after = incumbent_components;
+    if (reduced_n > threshold) {
         emit_exact_profile(phase, stats);
         return res;
     }
-    if (heuristic_components <= 1) {
+    if (incumbent_components <= 1) {
         emit_exact_profile(phase, stats);
         return res;
     }
-    if (heuristic_components - 1 > 18) {
-        emit_exact_profile(phase, stats);
-        return res;
-    }
-    if (Clock::now() + std::chrono::milliseconds(50) >= soft_deadline) {
+    if (Clock::now() + std::chrono::milliseconds(5) >= exact_deadline) {
         emit_exact_profile(phase, stats);
         return res;
     }
 
-    int best_components = heuristic_components;
+    int best_components = incumbent_components;
     std::vector<std::vector<int>> best_comps;
     std::unordered_map<ExactStateKey, int, ExactStateKeyHash> memo;
-    auto exact_deadline = std::min(soft_deadline, Clock::now() + std::chrono::milliseconds(1200));
     stats.triggered = true;
     auto exact_start = Clock::now();
     ExactSearchStats* stats_ptr = exact_profile_enabled() ? &stats : nullptr;
@@ -2319,13 +2391,561 @@ ExactKernelResult maybe_solve_exact_kernel(
         Clock::now() - exact_start
     ).count();
     stats.incumbent_after = best_components;
-    if (!best_comps.empty() && best_components < heuristic_components) {
+    if (!best_comps.empty() && best_components < incumbent_components) {
         res.solved = true;
         res.comps = std::move(best_comps);
         stats.improved = true;
     }
     emit_exact_profile(phase, stats);
     return res;
+}
+
+ExactKernelResult maybe_solve_exact_kernel(
+    const DynamicTree& dt1_base,
+    const DynamicTree& dt2_base,
+    int reduced_n,
+    int heuristic_components,
+    Clock::time_point soft_deadline,
+    const char* phase = "initial"
+) {
+    ExactSearchStats stats;
+    stats.reduced_n = reduced_n;
+    stats.incumbent_before = heuristic_components;
+    stats.incumbent_after = heuristic_components;
+    if (reduced_n > stats.threshold) {
+        emit_exact_profile(phase, stats);
+        return {};
+    }
+    if (heuristic_components <= 1) {
+        emit_exact_profile(phase, stats);
+        return {};
+    }
+    if (heuristic_components - 1 > 18) {
+        emit_exact_profile(phase, stats);
+        return {};
+    }
+    if (Clock::now() + std::chrono::milliseconds(50) >= soft_deadline) {
+        emit_exact_profile(phase, stats);
+        return {};
+    }
+    auto exact_deadline = std::min(soft_deadline, Clock::now() + std::chrono::milliseconds(1200));
+    return solve_exact_kernel_bounded(
+        dt1_base,
+        dt2_base,
+        reduced_n,
+        heuristic_components,
+        exact_deadline,
+        stats.threshold,
+        phase
+    );
+}
+
+std::vector<std::vector<int>> reduced_identity_expansion(int n) {
+    std::vector<std::vector<int>> expansion(static_cast<size_t>(n + 1));
+    for (int i = 1; i <= n; ++i) expansion[static_cast<size_t>(i)] = {i};
+    return expansion;
+}
+
+void normalize_partition(std::vector<std::vector<int>>& comps) {
+    for (auto& comp : comps) {
+        std::sort(comp.begin(), comp.end());
+        comp.erase(std::unique(comp.begin(), comp.end()), comp.end());
+    }
+    comps.erase(
+        std::remove_if(comps.begin(), comps.end(), [](const std::vector<int>& comp) {
+            return comp.empty();
+        }),
+        comps.end()
+    );
+    std::sort(comps.begin(), comps.end(), [](const std::vector<int>& a, const std::vector<int>& b) {
+        if (a.empty() || b.empty()) return a.size() < b.size();
+        if (a.front() != b.front()) return a.front() < b.front();
+        return a.size() < b.size();
+    });
+}
+
+std::string restricted_key_simple_dfs(
+    const SimpleTree& st,
+    int u,
+    const std::vector<char>& in_comp
+) {
+    if (st.children[static_cast<size_t>(u)].empty()) {
+        int lbl = st.leaf_label[static_cast<size_t>(u)];
+        return (lbl > 0 && lbl < static_cast<int>(in_comp.size()) && in_comp[static_cast<size_t>(lbl)])
+            ? ("L" + std::to_string(lbl))
+            : std::string();
+    }
+
+    std::string a = restricted_key_simple_dfs(st, st.children[static_cast<size_t>(u)][0], in_comp);
+    std::string b = restricted_key_simple_dfs(st, st.children[static_cast<size_t>(u)][1], in_comp);
+
+    if (a.empty()) return b;
+    if (b.empty()) return a;
+    if (a > b) std::swap(a, b);
+    return "(" + a + "," + b + ")";
+}
+
+int mark_component_edges_dfs(
+    const SimpleTree& st,
+    int u,
+    const std::vector<char>& in_comp,
+    int comp_size,
+    int comp_id,
+    std::vector<int>& edge_owner,
+    bool& ok
+) {
+    if (!ok) return 0;
+
+    if (st.children[static_cast<size_t>(u)].empty()) {
+        int lbl = st.leaf_label[static_cast<size_t>(u)];
+        return (lbl > 0 && lbl < static_cast<int>(in_comp.size()) && in_comp[static_cast<size_t>(lbl)]) ? 1 : 0;
+    }
+
+    int total = 0;
+    for (int v : st.children[static_cast<size_t>(u)]) {
+        int child_count = mark_component_edges_dfs(
+            st,
+            v,
+            in_comp,
+            comp_size,
+            comp_id,
+            edge_owner,
+            ok
+        );
+
+        if (child_count > 0 && child_count < comp_size) {
+            if (edge_owner[static_cast<size_t>(v)] != -1 &&
+                edge_owner[static_cast<size_t>(v)] != comp_id) {
+                ok = false;
+                return 0;
+            }
+            edge_owner[static_cast<size_t>(v)] = comp_id;
+        }
+
+        total += child_count;
+    }
+
+    return total;
+}
+
+bool partition_is_valid_agreement_forest(
+    const SimpleTree& t1,
+    const SimpleTree& t2,
+    const std::vector<std::vector<int>>& input_comps,
+    int n
+) {
+    std::vector<std::vector<int>> comps = input_comps;
+    normalize_partition(comps);
+
+    std::vector<int> seen(static_cast<size_t>(n + 1), 0);
+    int total_seen = 0;
+
+    for (const auto& comp : comps) {
+        if (comp.empty()) return false;
+        for (int x : comp) {
+            if (x < 1 || x > n) return false;
+            if (++seen[static_cast<size_t>(x)] != 1) return false;
+            ++total_seen;
+        }
+    }
+
+    if (total_seen != n) return false;
+
+    std::vector<int> edge_owner_t1(t1.children.size(), -1);
+    std::vector<int> edge_owner_t2(t2.children.size(), -1);
+
+    for (int cid = 0; cid < static_cast<int>(comps.size()); ++cid) {
+        const auto& comp = comps[static_cast<size_t>(cid)];
+        std::vector<char> in_comp(static_cast<size_t>(n + 1), 0);
+
+        for (int x : comp) {
+            in_comp[static_cast<size_t>(x)] = 1;
+        }
+
+        std::string k1 = restricted_key_simple_dfs(t1, t1.root, in_comp);
+        std::string k2 = restricted_key_simple_dfs(t2, t2.root, in_comp);
+
+        if (k1.empty() || k2.empty() || k1 != k2) {
+            return false;
+        }
+
+        bool ok1 = true;
+        bool ok2 = true;
+
+        int c1 = mark_component_edges_dfs(
+            t1,
+            t1.root,
+            in_comp,
+            static_cast<int>(comp.size()),
+            cid,
+            edge_owner_t1,
+            ok1
+        );
+
+        int c2 = mark_component_edges_dfs(
+            t2,
+            t2.root,
+            in_comp,
+            static_cast<int>(comp.size()),
+            cid,
+            edge_owner_t2,
+            ok2
+        );
+
+        if (!ok1 || !ok2) return false;
+        if (c1 != static_cast<int>(comp.size())) return false;
+        if (c2 != static_cast<int>(comp.size())) return false;
+    }
+
+    return true;
+}
+
+bool partition_matches_union(
+    const std::vector<std::vector<int>>& comps,
+    const std::vector<int>& union_labels
+) {
+    std::vector<int> seen;
+    for (const auto& comp : comps) {
+        seen.insert(seen.end(), comp.begin(), comp.end());
+    }
+    std::sort(seen.begin(), seen.end());
+    seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+    return seen == union_labels;
+}
+
+void collect_simple_leaf_order_dfs(const SimpleTree& st, int u, std::vector<int>& order) {
+    if (u < 0) return;
+    if (st.children[static_cast<size_t>(u)].empty()) {
+        int lbl = st.leaf_label[static_cast<size_t>(u)];
+        if (lbl > 0) order.push_back(lbl);
+        return;
+    }
+    collect_simple_leaf_order_dfs(st, st.children[static_cast<size_t>(u)][0], order);
+    collect_simple_leaf_order_dfs(st, st.children[static_cast<size_t>(u)][1], order);
+}
+
+std::vector<int> compute_simple_leaf_positions(const SimpleTree& st, int max_label) {
+    std::vector<int> pos(static_cast<size_t>(max_label + 1), -1);
+    std::vector<int> order;
+    order.reserve(static_cast<size_t>(max_label));
+    collect_simple_leaf_order_dfs(st, st.root, order);
+    for (int i = 0; i < static_cast<int>(order.size()); ++i) {
+        int lbl = order[static_cast<size_t>(i)];
+        if (lbl >= 0 && lbl < static_cast<int>(pos.size())) pos[static_cast<size_t>(lbl)] = i;
+    }
+    return pos;
+}
+
+struct RepairComponentSummary {
+    int comp_index = -1;
+    int size = 0;
+    int min_t1 = std::numeric_limits<int>::max();
+    int max_t1 = std::numeric_limits<int>::min();
+    int min_t2 = std::numeric_limits<int>::max();
+    int max_t2 = std::numeric_limits<int>::min();
+};
+
+struct RepairCandidateGroup {
+    std::vector<int> component_indices;
+    int union_size = 0;
+    int score = 0;
+};
+
+std::string repair_group_key(const std::vector<int>& group) {
+    std::string key;
+    key.reserve(group.size() * 4);
+    for (int x : group) {
+        key += std::to_string(x);
+        key.push_back(',');
+    }
+    return key;
+}
+
+void add_repair_candidates_from_order(
+    const std::vector<int>& order,
+    const std::vector<RepairComponentSummary>& summaries,
+    int max_group_size,
+    int leaf_limit,
+    std::unordered_set<std::string>& seen,
+    std::vector<RepairCandidateGroup>& out
+) {
+    for (size_t i = 0; i < order.size(); ++i) {
+        std::vector<int> group;
+        int union_size = 0;
+        int min_t1 = std::numeric_limits<int>::max();
+        int max_t1 = std::numeric_limits<int>::min();
+        int min_t2 = std::numeric_limits<int>::max();
+        int max_t2 = std::numeric_limits<int>::min();
+        for (size_t len = 0; len < static_cast<size_t>(max_group_size) && i + len < order.size(); ++len) {
+            const auto& summary = summaries[static_cast<size_t>(order[i + len])];
+            group.push_back(summary.comp_index);
+            union_size += summary.size;
+            min_t1 = std::min(min_t1, summary.min_t1);
+            max_t1 = std::max(max_t1, summary.max_t1);
+            min_t2 = std::min(min_t2, summary.min_t2);
+            max_t2 = std::max(max_t2, summary.max_t2);
+            if (union_size > leaf_limit) break;
+            if (group.size() < 2) continue;
+
+            std::vector<int> key_group = group;
+            std::sort(key_group.begin(), key_group.end());
+            std::string key = repair_group_key(key_group);
+            if (!seen.insert(key).second) continue;
+
+            int gap_t1 = std::max(0, (max_t1 - min_t1 + 1) - union_size);
+            int gap_t2 = std::max(0, (max_t2 - min_t2 + 1) - union_size);
+            RepairCandidateGroup cand;
+            cand.component_indices = std::move(key_group);
+            cand.union_size = union_size;
+            cand.score = union_size + 2 * (gap_t1 + gap_t2) + 3 * static_cast<int>(group.size() - 2);
+            out.push_back(std::move(cand));
+        }
+    }
+}
+
+std::vector<RepairCandidateGroup> build_repair_candidates(
+    const ReducedInstance& reduced,
+    const std::vector<std::vector<int>>& comps,
+    int max_group_size,
+    int leaf_limit,
+    int max_candidates
+) {
+    if (comps.size() < 2 || max_group_size < 2) return {};
+
+    auto pos_t1 = compute_simple_leaf_positions(reduced.t1, reduced.reduced_leaf_count);
+    auto pos_t2 = compute_simple_leaf_positions(reduced.t2, reduced.reduced_leaf_count);
+
+    std::vector<RepairComponentSummary> summaries(comps.size());
+    for (int i = 0; i < static_cast<int>(comps.size()); ++i) {
+        auto& summary = summaries[static_cast<size_t>(i)];
+        summary.comp_index = i;
+        summary.size = static_cast<int>(comps[static_cast<size_t>(i)].size());
+        for (int x : comps[static_cast<size_t>(i)]) {
+            if (x >= 0 && x < static_cast<int>(pos_t1.size()) && pos_t1[static_cast<size_t>(x)] != -1) {
+                summary.min_t1 = std::min(summary.min_t1, pos_t1[static_cast<size_t>(x)]);
+                summary.max_t1 = std::max(summary.max_t1, pos_t1[static_cast<size_t>(x)]);
+            }
+            if (x >= 0 && x < static_cast<int>(pos_t2.size()) && pos_t2[static_cast<size_t>(x)] != -1) {
+                summary.min_t2 = std::min(summary.min_t2, pos_t2[static_cast<size_t>(x)]);
+                summary.max_t2 = std::max(summary.max_t2, pos_t2[static_cast<size_t>(x)]);
+            }
+        }
+        if (summary.min_t1 == std::numeric_limits<int>::max()) summary.min_t1 = summary.max_t1 = 0;
+        if (summary.min_t2 == std::numeric_limits<int>::max()) summary.min_t2 = summary.max_t2 = 0;
+    }
+
+    std::vector<int> order_t1(comps.size());
+    std::vector<int> order_t2(comps.size());
+    std::iota(order_t1.begin(), order_t1.end(), 0);
+    std::iota(order_t2.begin(), order_t2.end(), 0);
+    std::sort(order_t1.begin(), order_t1.end(), [&](int a, int b) {
+        if (summaries[static_cast<size_t>(a)].min_t1 != summaries[static_cast<size_t>(b)].min_t1) {
+            return summaries[static_cast<size_t>(a)].min_t1 < summaries[static_cast<size_t>(b)].min_t1;
+        }
+        return summaries[static_cast<size_t>(a)].size < summaries[static_cast<size_t>(b)].size;
+    });
+    std::sort(order_t2.begin(), order_t2.end(), [&](int a, int b) {
+        if (summaries[static_cast<size_t>(a)].min_t2 != summaries[static_cast<size_t>(b)].min_t2) {
+            return summaries[static_cast<size_t>(a)].min_t2 < summaries[static_cast<size_t>(b)].min_t2;
+        }
+        return summaries[static_cast<size_t>(a)].size < summaries[static_cast<size_t>(b)].size;
+    });
+
+    std::unordered_set<std::string> seen;
+    std::vector<RepairCandidateGroup> candidates;
+    candidates.reserve(static_cast<size_t>(max_candidates * 2));
+    add_repair_candidates_from_order(order_t1, summaries, max_group_size, leaf_limit, seen, candidates);
+    add_repair_candidates_from_order(order_t2, summaries, max_group_size, leaf_limit, seen, candidates);
+
+    std::sort(candidates.begin(), candidates.end(), [](const RepairCandidateGroup& a, const RepairCandidateGroup& b) {
+        if (a.score != b.score) return a.score < b.score;
+        if (a.union_size != b.union_size) return a.union_size < b.union_size;
+        return a.component_indices.size() < b.component_indices.size();
+    });
+    if (static_cast<int>(candidates.size()) > max_candidates) {
+        candidates.resize(static_cast<size_t>(max_candidates));
+    }
+    return candidates;
+}
+
+bool apply_exact_repair_group(
+    const ReducedInstance& reduced,
+    const std::vector<std::vector<int>>& current_partition,
+    const std::vector<int>& group_indices,
+    int repair_leaf_limit,
+    std::chrono::milliseconds repair_cap,
+    Clock::time_point deadline,
+    std::vector<std::vector<int>>& next_partition
+) {
+    if (group_indices.size() < 2) return false;
+    if (Clock::now() + std::chrono::milliseconds(5) >= deadline) return false;
+
+    std::vector<int> union_labels;
+    for (int idx : group_indices) {
+        if (idx < 0 || idx >= static_cast<int>(current_partition.size())) return false;
+        union_labels.insert(
+            union_labels.end(),
+            current_partition[static_cast<size_t>(idx)].begin(),
+            current_partition[static_cast<size_t>(idx)].end()
+        );
+    }
+    std::sort(union_labels.begin(), union_labels.end());
+    union_labels.erase(std::unique(union_labels.begin(), union_labels.end()), union_labels.end());
+    if (static_cast<int>(union_labels.size()) > repair_leaf_limit) return false;
+
+    std::vector<char> keep(reduced.expansion.size(), 0);
+    for (int x : union_labels) {
+        if (x > 0 && x < static_cast<int>(keep.size())) keep[static_cast<size_t>(x)] = 1;
+    }
+
+    SimpleTree local_t1, local_t2;
+    if (!restrict_simple_tree(reduced.t1, keep, local_t1) ||
+        !restrict_simple_tree(reduced.t2, keep, local_t2)) {
+        return false;
+    }
+
+    auto identity_expansion = filter_expansion(reduced_identity_expansion(reduced.reduced_leaf_count), keep);
+    ReducedInstance local_reduced = build_reduced_instance(local_t1, local_t2, identity_expansion);
+    if (local_reduced.reduced_leaf_count <= 0 || local_reduced.reduced_leaf_count > repair_leaf_limit) {
+        return false;
+    }
+
+    DynamicTree dt1_base = build_dynamic_tree(local_reduced.t1);
+    DynamicTree dt2_base = build_dynamic_tree(local_reduced.t2);
+    auto exact_deadline = std::min(deadline, Clock::now() + repair_cap);
+    auto exact = solve_exact_kernel_bounded(
+        dt1_base,
+        dt2_base,
+        local_reduced.reduced_leaf_count,
+        static_cast<int>(group_indices.size()),
+        exact_deadline,
+        repair_leaf_limit,
+        "repair"
+    );
+    if (!exact.solved || exact.comps.empty()) return false;
+
+    auto local_expanded = expand_reduced_components(exact.comps, local_reduced.expansion);
+    normalize_partition(local_expanded);
+    if (static_cast<int>(local_expanded.size()) >= static_cast<int>(group_indices.size())) return false;
+    if (!partition_matches_union(local_expanded, union_labels)) return false;
+
+    next_partition = current_partition;
+    std::vector<int> erase_indices = group_indices;
+    std::sort(erase_indices.begin(), erase_indices.end(), std::greater<int>());
+    for (int idx : erase_indices) {
+        next_partition.erase(next_partition.begin() + idx);
+    }
+    next_partition.insert(next_partition.end(), local_expanded.begin(), local_expanded.end());
+    normalize_partition(next_partition);
+
+    if (!partition_is_valid_agreement_forest(
+            reduced.t1,
+            reduced.t2,
+            next_partition,
+            reduced.reduced_leaf_count)) {
+        return false;
+    }
+
+    return true;
+}
+
+bool run_exact_repair_pass(
+    const ReducedInstance& reduced,
+    std::vector<std::vector<int>>& best_reduced,
+    int& best_components,
+    Clock::time_point deadline,
+    int max_group_size,
+    int repair_leaf_limit,
+    std::chrono::milliseconds per_repair_cap,
+    int max_candidates
+) {
+    auto candidates = build_repair_candidates(
+        reduced,
+        best_reduced,
+        max_group_size,
+        repair_leaf_limit,
+        max_candidates
+    );
+    for (const auto& cand : candidates) {
+        if (g_terminate || Clock::now() + std::chrono::milliseconds(5) >= deadline) break;
+        std::vector<std::vector<int>> improved_partition;
+        if (!apply_exact_repair_group(
+                reduced,
+                best_reduced,
+                cand.component_indices,
+                repair_leaf_limit,
+                per_repair_cap,
+                deadline,
+                improved_partition)) {
+            continue;
+        }
+        int improved_components = static_cast<int>(improved_partition.size());
+        if (improved_components < best_components) {
+            best_reduced = std::move(improved_partition);
+            best_components = improved_components;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool run_exact_repair_portfolio(
+    const ReducedInstance& reduced,
+    std::vector<std::vector<int>>& best_reduced,
+    int& best_components,
+    Clock::time_point deadline,
+    bool final_phase
+) {
+    auto now = Clock::now();
+    auto ms_left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+    if (ms_left < 20) return false;
+
+    long long budget_ms = final_phase
+        ? std::min<long long>(300, std::max<long long>(50, ms_left / 6))
+        : std::min<long long>(120, std::max<long long>(20, ms_left / 10));
+    auto repair_deadline = std::min(deadline, now + std::chrono::milliseconds(budget_ms));
+
+    bool improved_any = false;
+    while (!g_terminate && Clock::now() + std::chrono::milliseconds(5) < repair_deadline) {
+        bool improved = false;
+        improved = run_exact_repair_pass(
+            reduced,
+            best_reduced,
+            best_components,
+            repair_deadline,
+            2,
+            40,
+            std::chrono::milliseconds(final_phase ? 40 : 30),
+            final_phase ? 24 : 16
+        );
+        if (!improved) {
+            improved = run_exact_repair_pass(
+                reduced,
+                best_reduced,
+                best_components,
+                repair_deadline,
+                3,
+                44,
+                std::chrono::milliseconds(final_phase ? 55 : 40),
+                final_phase ? 20 : 12
+            );
+        }
+        if (!improved && final_phase) {
+            improved = run_exact_repair_pass(
+                reduced,
+                best_reduced,
+                best_components,
+                repair_deadline,
+                4,
+                48,
+                std::chrono::milliseconds(70),
+                12
+            );
+        }
+        if (!improved) break;
+        improved_any = true;
+    }
+    return improved_any;
 }
 
 ThreeApproxResult run_three_approx(
@@ -2336,8 +2956,130 @@ ThreeApproxResult run_three_approx(
     int incumbent_components,
     uint64_t seed,
     const std::vector<int>* elite_comp_map = nullptr,
-    double elite_bonus = 0.0
+    double elite_bonus = 0.0,
+    const std::vector<int>* discrepancy_choices = nullptr
 );
+
+bool run_discrepancy_polish(
+    const ReducedInstance& reduced,
+    const DynamicTree& dt1_base,
+    const DynamicTree& dt2_base,
+    int reduced_n,
+    std::vector<std::vector<int>>& best_reduced,
+    int& best_components,
+    Clock::time_point deadline,
+    uint64_t seed_base,
+    const std::vector<EliteSolution>& elite_pool
+) {
+    auto now = Clock::now();
+    auto ms_left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+    if (ms_left < 30) return false;
+
+    const std::vector<int>* elite_comp_map = nullptr;
+    double elite_bonus = 0.0;
+    if (!elite_pool.empty()) {
+        elite_comp_map = &elite_pool.front().comp_of_leaf;
+        elite_bonus = 5.0;
+    }
+
+    std::array<std::vector<int>, 2> discrepancy_runs{{{1}, {2}}};
+    bool improved = false;
+    for (size_t i = 0; i < discrepancy_runs.size(); ++i) {
+        if (g_terminate || Clock::now() + std::chrono::milliseconds(10) >= deadline) break;
+        auto local_deadline = std::min(deadline, Clock::now() + std::chrono::milliseconds(20));
+        auto res = run_three_approx(
+            dt1_base,
+            dt2_base,
+            local_deadline,
+            reduced_n,
+            best_components,
+            mix64(seed_base ^ (0xd1b54a32d192ed03ULL + static_cast<uint64_t>(i))),
+            elite_comp_map,
+            elite_bonus,
+            &discrepancy_runs[i]
+        );
+        if (!res.complete || res.comps.empty()) continue;
+        if (static_cast<int>(res.comps.size()) < best_components) {
+            auto candidate = res.comps;
+            normalize_partition(candidate);
+
+            if (partition_is_valid_agreement_forest(
+                    reduced.t1,
+                    reduced.t2,
+                    candidate,
+                    reduced.reduced_leaf_count)) {
+                best_reduced = std::move(candidate);
+                best_components = static_cast<int>(best_reduced.size());
+                improved = true;
+            }
+        }
+    }
+    return improved;
+}
+
+bool run_final_polishing_portfolio(
+    const ReducedInstance& reduced,
+    const DynamicTree& dt1_base,
+    const DynamicTree& dt2_base,
+    std::vector<std::vector<int>>& best_reduced,
+    int& best_components,
+    std::vector<EliteSolution>& elite_pool,
+    int elite_limit,
+    Clock::time_point deadline,
+    uint64_t seed_base
+) {
+    bool improved = false;
+    if (reduced.reduced_leaf_count <= 32 && best_components <= 12 &&
+        Clock::now() + std::chrono::milliseconds(20) < deadline) {
+        auto exact_deadline = std::min(deadline, Clock::now() + std::chrono::milliseconds(400));
+        auto exact = solve_exact_kernel_bounded(
+            dt1_base,
+            dt2_base,
+            reduced.reduced_leaf_count,
+            best_components,
+            exact_deadline,
+            32,
+            "polish"
+        );
+        if (exact.solved && !exact.comps.empty() &&
+            static_cast<int>(exact.comps.size()) < best_components) {
+
+            auto candidate = exact.comps;
+            normalize_partition(candidate);
+
+            if (partition_is_valid_agreement_forest(
+                    reduced.t1,
+                    reduced.t2,
+                    candidate,
+                    reduced.reduced_leaf_count)) {
+                best_reduced = std::move(candidate);
+                best_components = static_cast<int>(best_reduced.size());
+                improved = true;
+            }
+        }
+    }
+
+    if (run_exact_repair_portfolio(reduced, best_reduced, best_components, deadline, true)) {
+        improved = true;
+    }
+    if (run_discrepancy_polish(
+            reduced,
+            dt1_base,
+            dt2_base,
+            reduced.reduced_leaf_count,
+            best_reduced,
+            best_components,
+            deadline,
+            seed_base,
+            elite_pool)) {
+        improved = true;
+    }
+
+    if (improved && static_cast<int>(best_reduced.size()) <= best_components + 2) {
+        maybe_add_elite_solution(elite_pool, best_reduced, reduced.reduced_leaf_count, elite_limit);
+    }
+    return improved;
+}
 
 std::vector<std::vector<int>> reduced_singleton_components(int reduced_n) {
     std::vector<std::vector<int>> comps;
@@ -2349,7 +3091,8 @@ std::vector<std::vector<int>> reduced_singleton_components(int reduced_n) {
 std::vector<std::vector<int>> solve_direct_reduced(
     const ReducedInstance& reduced,
     Clock::time_point deadline,
-    uint64_t seed_base
+    uint64_t seed_base,
+    int incumbent_limit = std::numeric_limits<int>::max()
 ) {
     int reduced_n = reduced.reduced_leaf_count;
     if (reduced_n <= 0) return {};
@@ -2361,26 +3104,58 @@ std::vector<std::vector<int>> solve_direct_reduced(
 
     std::vector<std::vector<int>> best_reduced = reduced_singleton_components(reduced_n);
     int best_components = static_cast<int>(best_reduced.size());
+    int prune_limit = std::min(best_components, incumbent_limit);
 
     auto exact = maybe_solve_exact_kernel(
         dt1_base,
         dt2_base,
         reduced_n,
-        best_components,
+        prune_limit,
         deadline,
         "initial"
     );
     if (exact.solved && !exact.comps.empty()) {
         best_reduced = exact.comps;
         best_components = static_cast<int>(best_reduced.size());
+        prune_limit = std::min(prune_limit, best_components);
     }
 
     std::vector<EliteSolution> elite_pool;
     int elite_limit = elite_pool_limit_for_size(reduced_n);
+    if (static_cast<int>(best_reduced.size()) <= prune_limit + 2) {
+        maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
+    }
+    if (best_components < reduced_n) {
+        if (run_exact_repair_portfolio(reduced, best_reduced, best_components, deadline, false)) {
+            prune_limit = std::min(prune_limit, best_components);
+            if (static_cast<int>(best_reduced.size()) <= prune_limit + 2) {
+                maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
+            }
+        }
+    }
+
     uint64_t iter = 0;
     auto search_start = Clock::now();
+    bool final_polish_done = false;
 
     while (!g_terminate && Clock::now() < deadline) {
+        double phase = search_phase_fraction(Clock::now(), search_start, deadline);
+        if (!final_polish_done && phase >= 0.85) {
+            run_final_polishing_portfolio(
+                reduced,
+                dt1_base,
+                dt2_base,
+                best_reduced,
+                best_components,
+                elite_pool,
+                elite_limit,
+                deadline,
+                mix64(seed_base ^ 0x6eed0e9da4d94a4fULL)
+            );
+            prune_limit = std::min(prune_limit, best_components);
+            final_polish_done = true;
+            continue;
+        }
         uint64_t seed = mix64(seed_base ^ iter);
         const std::vector<int>* elite_comp_map = nullptr;
         double elite_bonus = 0.0;
@@ -2391,7 +3166,7 @@ std::vector<std::vector<int>> solve_direct_reduced(
             swapped ? dt1_base : dt2_base,
             deadline,
             reduced_n,
-            best_components,
+            prune_limit,
             seed,
             elite_comp_map,
             elite_bonus
@@ -2406,8 +3181,29 @@ std::vector<std::vector<int>> solve_direct_reduced(
         if (static_cast<int>(res.comps.size()) < best_components) {
             best_reduced = res.comps;
             best_components = static_cast<int>(best_reduced.size());
+            prune_limit = std::min(prune_limit, best_components);
+            if (run_exact_repair_portfolio(reduced, best_reduced, best_components, deadline, false)) {
+                prune_limit = std::min(prune_limit, best_components);
+            }
+            if (static_cast<int>(best_reduced.size()) <= prune_limit + 2) {
+                maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
+            }
         }
         ++iter;
+    }
+
+    if (!final_polish_done && !g_terminate && Clock::now() + std::chrono::milliseconds(10) < deadline) {
+        run_final_polishing_portfolio(
+            reduced,
+            dt1_base,
+            dt2_base,
+            best_reduced,
+            best_components,
+            elite_pool,
+            elite_limit,
+            deadline,
+            mix64(seed_base ^ 0x8f4d7c1259b3abf1ULL)
+        );
     }
 
     return best_reduced;
@@ -2489,7 +3285,7 @@ std::vector<std::vector<int>> solve_decomposed_candidate(
         }
     }
 
-    auto reduced_comps = solve_direct_reduced(reduced, deadline, seed_base);
+    auto reduced_comps = solve_direct_reduced(reduced, deadline, seed_base, incumbent_components);
     return expand_reduced_components(reduced_comps, reduced.expansion);
 }
 
@@ -2501,12 +3297,14 @@ ThreeApproxResult run_three_approx(
     int incumbent_components,
     uint64_t seed,
     const std::vector<int>* elite_comp_map,
-    double elite_bonus
+    double elite_bonus,
+    const std::vector<int>* discrepancy_choices
 ) {
     int next_label = n + 1;
     uint64_t rng = seed ^ 0x9e3779b97f4a7c15ULL;
     bool timed_out_or_terminated = false;
     bool medium_mode = is_medium_instance_size(n);
+    size_t discrepancy_step = 0;
 
     // Exhaust common cherries before branching.
     contract_all_common_cherries(t1, f, next_label);
@@ -2551,7 +3349,7 @@ ThreeApproxResult run_three_approx(
         if (did_common_contract) continue;
 
         size_t chosen_idx = 0;
-        if (medium_mode || elite_comp_map) {
+        if (medium_mode || elite_comp_map || discrepancy_choices) {
             auto f_mass = compute_active_leaf_masses(f);
             struct RankedCherry {
                 double score = -std::numeric_limits<double>::infinity();
@@ -2574,11 +3372,19 @@ ThreeApproxResult run_three_approx(
                 if (a.score != b.score) return a.score > b.score;
                 return a.idx < b.idx;
             });
-            size_t top_k = medium_mode
-                ? std::min<size_t>(4, ranked.size())
-                : std::min<size_t>(elite_bonus >= 5.0 ? 2 : 3, ranked.size());
-            rng = mix64(rng + 0x517cc1b727220a95ULL);
-            chosen_idx = ranked[static_cast<size_t>(rng % top_k)].idx;
+            size_t top_k = discrepancy_choices
+                ? std::min<size_t>(3, ranked.size())
+                : (medium_mode
+                    ? std::min<size_t>(4, ranked.size())
+                    : std::min<size_t>(elite_bonus >= 5.0 ? 2 : 3, ranked.size()));
+            if (discrepancy_choices && discrepancy_step < discrepancy_choices->size()) {
+                int want = (*discrepancy_choices)[discrepancy_step++];
+                if (want < 0) want = 0;
+                chosen_idx = ranked[static_cast<size_t>(std::min<int>(want, static_cast<int>(top_k) - 1))].idx;
+            } else {
+                rng = mix64(rng + 0x517cc1b727220a95ULL);
+                chosen_idx = ranked[static_cast<size_t>(rng % top_k)].idx;
+            }
         } else {
             rng = mix64(rng + 0x517cc1b727220a95ULL);
             chosen_idx = static_cast<size_t>(rng % cherries.size());
@@ -2626,15 +3432,44 @@ ThreeApproxResult run_three_approx(
                 auto f_mass = compute_active_leaf_masses(f);
                 auto cand = build_cherry_candidate(t1, f, f_mass, a, b, n);
                 auto plan = choose_cut_plan(t1, f, cand, next_label, rng, n);
-                if (!plan.empty()) {
+
+                int max_plan_cuts = is_medium_instance_size(n) ? 5 : 4;
+
+                if (!plan.empty() && static_cast<int>(plan.size()) <= max_plan_cuts) {
                     apply_cut_plan(f, plan);
                     continue;
                 }
             }
             {
-                cut_edge_above(f, na);
-                cut_edge_above(f, nb);
-                for (int c : pendants) cut_edge_above(f, c);
+                auto f_mass = compute_active_leaf_masses(f);
+
+                int best_cut = -1;
+                int best_mass = std::numeric_limits<int>::max();
+
+                for (int c : pendants) {
+                    if (c >= 0 && c < static_cast<int>(f_mass.size()) && f_mass[c] < best_mass) {
+                        best_mass = f_mass[c];
+                        best_cut = c;
+                    }
+                }
+
+                int mass_a = (na >= 0 && na < static_cast<int>(f_mass.size())) ? f_mass[na] : 1;
+                int mass_b = (nb >= 0 && nb < static_cast<int>(f_mass.size())) ? f_mass[nb] : 1;
+
+                if (mass_a < best_mass) {
+                    best_mass = mass_a;
+                    best_cut = na;
+                }
+                if (mass_b < best_mass) {
+                    best_mass = mass_b;
+                    best_cut = nb;
+                }
+
+                if (best_cut != -1) {
+                    cut_edge_above(f, best_cut);
+                } else {
+                    cut_edge_above(f, na);
+                }
             }
         }
     }
@@ -2713,11 +3548,16 @@ std::vector<std::string> solve(const PaceInstance& inst) {
             mix64(base_seed ^ 0x243f6a8885a308d3ULL),
             best_components
         );
-        auto decomp_out = forest_from_partition(decomp_comps, n, original_t1);
-        if (!decomp_out.empty() && static_cast<int>(decomp_out.size()) < best_components) {
-            best_out = decomp_out;
-            best_components = static_cast<int>(best_out.size());
-            publish_best_solution(best_out);
+
+        normalize_partition(decomp_comps);
+
+        if (partition_is_valid_agreement_forest(parsed[0], parsed[1], decomp_comps, n)) {
+            auto decomp_out = forest_from_partition(decomp_comps, n, original_t1);
+            if (!decomp_out.empty() && static_cast<int>(decomp_out.size()) < best_components) {
+                best_out = decomp_out;
+                best_components = static_cast<int>(best_out.size());
+                publish_best_solution(best_out);
+            }
         }
     }
 
@@ -2728,10 +3568,40 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     DynamicTree dt2_base = build_dynamic_tree(reduced.t2);
     int reduced_n = reduced.reduced_leaf_count;
 
+    std::vector<std::vector<int>> best_reduced = reduced_singleton_components(reduced_n);
+    int best_reduced_components = static_cast<int>(best_reduced.size());
     std::vector<EliteSolution> elite_pool;
     int elite_limit = elite_pool_limit_for_size(reduced_n);
     uint64_t iter = 0;
+    bool final_polish_done = false;
     while (!g_terminate && Clock::now() < soft_deadline) {
+        double phase = search_phase_fraction(Clock::now(), start, soft_deadline);
+        // if (!final_polish_done &&
+        //     phase >= 0.85 &&
+        //     best_reduced_components <= best_components &&
+        //     Clock::now() + std::chrono::milliseconds(15) < soft_deadline) {
+        //     if (run_final_polishing_portfolio(
+        //             reduced,
+        //             dt1_base,
+        //             dt2_base,
+        //             best_reduced,
+        //             best_reduced_components,
+        //             elite_pool,
+        //             elite_limit,
+        //             soft_deadline,
+        //             mix64(base_seed ^ 0x1234fedcba987654ULL)) &&
+        //         best_reduced_components < best_components) {
+        //         auto polished_expanded = expand_reduced_components(best_reduced, reduced.expansion);
+        //         auto polished_out = forest_from_partition(polished_expanded, n, original_t1);
+        //         if (!polished_out.empty() && static_cast<int>(polished_out.size()) < best_components) {
+        //             best_out = polished_out;
+        //             best_components = static_cast<int>(best_out.size());
+        //             publish_best_solution(best_out);
+        //         }
+        //     }
+        //     final_polish_done = true;
+        //     continue;
+        // }
         uint64_t seed = mix64(base_seed ^ iter);
         const std::vector<int>* elite_comp_map = nullptr;
         double elite_bonus = 0.0;
@@ -2751,17 +3621,113 @@ std::vector<std::string> solve(const PaceInstance& inst) {
             ++iter;
             continue;
         }
-        if (static_cast<int>(res.comps.size()) <= best_components + 2) {
-            maybe_add_elite_solution(elite_pool, res.comps, reduced_n, elite_limit);
+        std::vector<std::vector<int>> candidate_reduced = res.comps;
+        normalize_partition(candidate_reduced);
+
+        if (!partition_is_valid_agreement_forest(
+                reduced.t1,
+                reduced.t2,
+                candidate_reduced,
+                reduced.reduced_leaf_count)) {
+            ++iter;
+            continue;
         }
-        auto expanded = expand_reduced_components(res.comps, reduced.expansion);
+
+        if (static_cast<int>(candidate_reduced.size()) <= best_components + 2) {
+            maybe_add_elite_solution(elite_pool, candidate_reduced, reduced_n, elite_limit);
+        }
+
+        if (static_cast<int>(candidate_reduced.size()) < best_reduced_components) {
+            best_reduced = candidate_reduced;
+            best_reduced_components = static_cast<int>(best_reduced.size());
+        }
+
+        auto expanded = expand_reduced_components(candidate_reduced, reduced.expansion);
         auto out = forest_from_partition(expanded, n, original_t1);
+
         if (!out.empty() && static_cast<int>(out.size()) < best_components) {
             best_out = out;
             best_components = static_cast<int>(out.size());
+            best_reduced = std::move(candidate_reduced);
+            best_reduced_components = static_cast<int>(best_reduced.size());
+
+            if (run_exact_repair_portfolio(reduced, best_reduced, best_reduced_components, soft_deadline, false) &&
+                best_reduced_components < best_components &&
+                partition_is_valid_agreement_forest(
+                    reduced.t1,
+                    reduced.t2,
+                    best_reduced,
+                    reduced.reduced_leaf_count)) {
+
+                auto repaired_expanded = expand_reduced_components(best_reduced, reduced.expansion);
+                auto repaired_out = forest_from_partition(repaired_expanded, n, original_t1);
+
+                if (!repaired_out.empty() && static_cast<int>(repaired_out.size()) < best_components) {
+                    best_out = repaired_out;
+                    best_components = static_cast<int>(best_out.size());
+                }
+            }
+
             publish_best_solution(best_out);
         }
         ++iter;
+    }
+    // if (!final_polish_done &&
+    //     !g_terminate &&
+    //     best_reduced_components <= best_components &&
+    //     Clock::now() + std::chrono::milliseconds(15) < soft_deadline) {
+    //     if (run_final_polishing_portfolio(
+    //             reduced,
+    //             dt1_base,
+    //             dt2_base,
+    //             best_reduced,
+    //             best_reduced_components,
+    //             elite_pool,
+    //             elite_limit,
+    //             soft_deadline,
+    //             mix64(base_seed ^ 0xfedc987654321234ULL)) &&
+    //         best_reduced_components < best_components) {
+    //         auto polished_expanded = expand_reduced_components(best_reduced, reduced.expansion);
+    //         auto polished_out = forest_from_partition(polished_expanded, n, original_t1);
+    //         if (!polished_out.empty() && static_cast<int>(polished_out.size()) < best_components) {
+    //             best_out = polished_out;
+    //             best_components = static_cast<int>(best_out.size());
+    //             publish_best_solution(best_out);
+    //         }
+    //     }
+    // }
+    if (!g_terminate &&
+        best_reduced_components < reduced_n &&
+        Clock::now() + std::chrono::milliseconds(50) < soft_deadline) {
+
+        std::vector<std::vector<int>> polished = best_reduced;
+        int polished_components = best_reduced_components;
+
+        if (run_exact_repair_portfolio(
+                reduced,
+                polished,
+                polished_components,
+                soft_deadline,
+                true) &&
+            polished_components < best_components &&
+            partition_is_valid_agreement_forest(
+                reduced.t1,
+                reduced.t2,
+                polished,
+                reduced.reduced_leaf_count)) {
+
+            auto polished_expanded = expand_reduced_components(polished, reduced.expansion);
+            auto polished_out = forest_from_partition(polished_expanded, n, original_t1);
+
+            if (!polished_out.empty() &&
+                static_cast<int>(polished_out.size()) < best_components) {
+                best_reduced = std::move(polished);
+                best_reduced_components = polished_components;
+                best_out = std::move(polished_out);
+                best_components = static_cast<int>(best_out.size());
+                publish_best_solution(best_out);
+            }
+        }
     }
     return best_out;
 }
