@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 #include <unistd.h>
+#include <functional>
 
 namespace {
 
@@ -1426,22 +1427,63 @@ void for_each_cherry_label_pair(const DynamicTree& t, Fn&& fn) {
     }
 }
 
-bool contract_all_common_cherries(DynamicTree& t1, DynamicTree& t2, int& next_label, UndoLog* log = nullptr) {
-    bool any = false;
-    while (true) {
-        auto cherries = cherries_by_label(t1);
-        bool contracted = false;
-        for (auto [a, b] : cherries) {
-            if (!are_siblings_by_label(t1, a, b) || !are_siblings_by_label(t2, a, b)) continue;
-            int nl = next_label++;
-            if (contract_cherry(t1, a, b, nl, log) && contract_cherry(t2, a, b, nl, log)) {
-                contracted = true;
-                any = true;
-                break; // restart scan; cherry set changed
-            }
+bool contract_one_common_cherry(
+    DynamicTree& t1,
+    DynamicTree& t2,
+    int& next_label,
+    UndoLog* log = nullptr
+) {
+    for (int u : t1.cherry_nodes) {
+        if (u < 0 || u >= static_cast<int>(t1.nodes.size())) continue;
+        if (!t1.nodes[static_cast<size_t>(u)].active) continue;
+
+        int l = t1.nodes[static_cast<size_t>(u)].left;
+        int r = t1.nodes[static_cast<size_t>(u)].right;
+
+        if (!is_active_leaf(t1, l) || !is_active_leaf(t1, r)) continue;
+
+        int a = t1.nodes[static_cast<size_t>(l)].label;
+        int b = t1.nodes[static_cast<size_t>(r)].label;
+
+        if (a > b) std::swap(a, b);
+
+        if (!are_siblings_by_label(t2, a, b)) continue;
+
+        int nl = next_label;
+
+        if (!are_siblings_by_label(t1, a, b) ||
+            !are_siblings_by_label(t2, a, b)) {
+            continue;
         }
-        if (!contracted) break;
+
+        ++next_label;
+
+        bool ok1 = contract_cherry(t1, a, b, nl, log);
+        bool ok2 = contract_cherry(t2, a, b, nl, log);
+
+        if (ok1 && ok2) {
+            return true;
+        }
+
+        // Defensive fallback. This should almost never happen.
+        return false;
     }
+
+    return false;
+}
+
+bool contract_all_common_cherries(
+    DynamicTree& t1,
+    DynamicTree& t2,
+    int& next_label,
+    UndoLog* log = nullptr
+) {
+    bool any = false;
+
+    while (contract_one_common_cherry(t1, t2, next_label, log)) {
+        any = true;
+    }
+
     return any;
 }
 
@@ -1451,33 +1493,73 @@ int root_of(const DynamicTree& t, int u) {
     return x;
 }
 
-std::vector<int> path_nodes(const DynamicTree& t, int a, int b) {
-    std::unordered_map<int, int> pos;
+struct PathScratch {
+    std::vector<int> mark;
+    std::vector<int> pos;
     std::vector<int> upa;
+    std::vector<int> upb;
+    std::vector<int> result;
+    int stamp = 1;
+
+    void ensure_size(size_t n) {
+        if (mark.size() < n) {
+            mark.assign(n, 0);
+            pos.assign(n, -1);
+        }
+    }
+};
+
+const std::vector<int>& path_nodes_fast(
+    const DynamicTree& t,
+    int a,
+    int b,
+    PathScratch& scratch
+) {
+    scratch.ensure_size(t.nodes.size());
+
+    ++scratch.stamp;
+    if (scratch.stamp == std::numeric_limits<int>::max()) {
+        std::fill(scratch.mark.begin(), scratch.mark.end(), 0);
+        scratch.stamp = 1;
+    }
+
+    scratch.upa.clear();
+    scratch.upb.clear();
+    scratch.result.clear();
+
     int x = a;
     while (x != -1) {
-        pos[x] = static_cast<int>(upa.size());
-        upa.push_back(x);
-        x = t.nodes[x].parent;
+        scratch.mark[static_cast<size_t>(x)] = scratch.stamp;
+        scratch.pos[static_cast<size_t>(x)] = static_cast<int>(scratch.upa.size());
+        scratch.upa.push_back(x);
+        x = t.nodes[static_cast<size_t>(x)].parent;
     }
-    std::vector<int> upb;
+
     x = b;
     int lca = -1;
     while (x != -1) {
-        if (pos.find(x) != pos.end()) {
+        if (scratch.mark[static_cast<size_t>(x)] == scratch.stamp) {
             lca = x;
             break;
         }
-        upb.push_back(x);
-        x = t.nodes[x].parent;
+        scratch.upb.push_back(x);
+        x = t.nodes[static_cast<size_t>(x)].parent;
     }
-    if (lca == -1) return {};
 
-    std::vector<int> res;
-    int ia = pos[lca];
-    for (int i = 0; i <= ia; ++i) res.push_back(upa[i]);
-    for (int i = static_cast<int>(upb.size()) - 1; i >= 0; --i) res.push_back(upb[i]);
-    return res;
+    if (lca == -1) {
+        return scratch.result;
+    }
+
+    int ia = scratch.pos[static_cast<size_t>(lca)];
+    for (int i = 0; i <= ia; ++i) {
+        scratch.result.push_back(scratch.upa[static_cast<size_t>(i)]);
+    }
+
+    for (int i = static_cast<int>(scratch.upb.size()) - 1; i >= 0; --i) {
+        scratch.result.push_back(scratch.upb[static_cast<size_t>(i)]);
+    }
+
+    return scratch.result;
 }
 
 std::vector<int> pendant_children_on_path(const DynamicTree& t, const std::vector<int>& path) {
@@ -1518,6 +1600,7 @@ int count_root_components(const DynamicTree& t) {
 
 int exact_conflict_lower_bound(const DynamicTree& t1, const DynamicTree& f) {
     std::vector<char> used(f.nodes.size(), 0);
+    PathScratch path_scratch;
     int lb = 0;
     for_each_cherry_label_pair(t1, [&](int a, int b) {
         if (are_siblings_by_label(f, a, b)) return true;
@@ -1538,7 +1621,7 @@ int exact_conflict_lower_bound(const DynamicTree& t1, const DynamicTree& f) {
             return true;
         }
 
-        auto path = path_nodes(f, na, nb);
+        const auto& path = path_nodes_fast(f, na, nb, path_scratch);
         std::vector<int> zone;
         for (size_t i = 1; i + 1 < path.size(); ++i) zone.push_back(path[i]);
         if (zone.empty()) {
@@ -1793,7 +1876,8 @@ CherryCandidate build_cherry_candidate(
     const std::vector<int>& f_mass,
     int a,
     int b,
-    int total_leaves
+    int total_leaves,
+    PathScratch* scratch = nullptr
 ) {
     CherryCandidate cand;
     cand.a = a;
@@ -1813,7 +1897,12 @@ CherryCandidate build_cherry_candidate(
 
     cand.same_component = (cand.ra == cand.rb);
     if (cand.same_component) {
-        cand.path = path_nodes(f, cand.na, cand.nb);
+        PathScratch local_scratch;
+        PathScratch& ps = scratch ? *scratch : local_scratch;
+
+        const auto& path_ref = path_nodes_fast(f, cand.na, cand.nb, ps);
+        cand.path.assign(path_ref.begin(), path_ref.end());
+
         cand.distance = cand.path.empty() ? 0 : static_cast<int>(cand.path.size()) - 1;
         cand.pendants = pendant_children_on_path(f, cand.path);
         cand.pendant_count = static_cast<int>(cand.pendants.size());
@@ -1846,6 +1935,7 @@ double evaluate_reduced_state(
     int total_leaves
 ) {
     auto f_mass = compute_active_leaf_masses(f);
+    PathScratch path_scratch;
     int comp_count = count_root_components(f);
     int sampled_pendants = 0;
     int sampled_conflict_mass = 0;
@@ -1874,7 +1964,7 @@ double evaluate_reduced_state(
             return true;
         }
 
-        auto path = path_nodes(f, na, nb);
+        const auto& path = path_nodes_fast(f, na, nb, path_scratch);
         auto pendants = pendant_children_on_path(f, path);
         sampled_pendants += static_cast<int>(pendants.size());
         for (int u : pendants) sampled_conflict_mass += f_mass[u];
@@ -1911,14 +2001,14 @@ std::vector<int> choose_cut_plan(
     const CherryCandidate& cand,
     int next_label,
     uint64_t& rng,
-    int total_leaves
+    int total_leaves,
+    const std::vector<int>& f_mass
 ) {
     std::vector<std::vector<int>> plans;
     if (!cand.same_component) {
         plans.push_back({cand.na});
         plans.push_back({cand.nb});
     } else {
-        auto f_mass = compute_active_leaf_masses(f);
         std::vector<int> sorted = cand.pendants;
         std::sort(sorted.begin(), sorted.end(), [&](int x, int y) {
             return f_mass[x] < f_mass[y];
@@ -2256,6 +2346,7 @@ void exact_kernel_dfs(
     std::unordered_map<ExactStateKey, int, ExactStateKeyHash>& memo,
     ExactSearchStats* stats = nullptr
 ) {
+    PathScratch path_scratch;
     if (stats) ++stats->nodes;
     if (g_terminate || Clock::now() >= deadline) {
         if (stats) ++stats->deadline_prunes;
@@ -2296,7 +2387,7 @@ void exact_kernel_dfs(
     CherryCandidate best_cand;
     bool have = false;
     for (auto [a, b] : cherries) {
-        auto cand = build_cherry_candidate(t1, f, f_mass, a, b, active_leaf_count(t1));
+        auto cand = build_cherry_candidate(t1, f, f_mass, a, b, active_leaf_count(t1), &path_scratch);
         if (!have || cand.score > best_cand.score) {
             best_cand = std::move(cand);
             have = true;
@@ -2725,6 +2816,21 @@ int repair_group_union_size(
     return union_size;
 }
 
+std::vector<int> build_component_of_leaf(
+    const std::vector<std::vector<int>>& comps,
+    int n
+) {
+    std::vector<int> comp_of_leaf(static_cast<size_t>(n + 1), -1);
+    for (int i = 0; i < static_cast<int>(comps.size()); ++i) {
+        for (int x : comps[static_cast<size_t>(i)]) {
+            if (x >= 1 && x <= n) {
+                comp_of_leaf[static_cast<size_t>(x)] = i;
+            }
+        }
+    }
+    return comp_of_leaf;
+}
+
 LocalExactSearchPlan plan_local_exact_search(
     int reduced_n,
     int incumbent_components,
@@ -2884,6 +2990,63 @@ void add_elite_repair_candidates(
     }
 }
 
+void add_cherry_conflict_repair_candidates(
+    const SimpleTree& t1,
+    const std::vector<std::vector<int>>& comps,
+    int n,
+    int max_group_size,
+    int leaf_limit,
+    std::unordered_set<std::string>& seen,
+    std::vector<RepairCandidateGroup>& out
+) {
+    if (max_group_size < 2) return;
+
+    auto comp_of_leaf = build_component_of_leaf(comps, n);
+
+    std::function<void(int)> dfs = [&](int u) {
+        if (u < 0 || u >= static_cast<int>(t1.children.size())) return;
+        if (t1.children[static_cast<size_t>(u)].empty()) return;
+
+        int a = t1.children[static_cast<size_t>(u)][0];
+        int b = t1.children[static_cast<size_t>(u)][1];
+
+        bool a_leaf = t1.children[static_cast<size_t>(a)].empty();
+        bool b_leaf = t1.children[static_cast<size_t>(b)].empty();
+
+        if (a_leaf && b_leaf) {
+            int la = t1.leaf_label[static_cast<size_t>(a)];
+            int lb = t1.leaf_label[static_cast<size_t>(b)];
+
+            if (la >= 1 && la <= n && lb >= 1 && lb <= n) {
+                int ca = comp_of_leaf[static_cast<size_t>(la)];
+                int cb = comp_of_leaf[static_cast<size_t>(lb)];
+
+                if (ca != -1 && cb != -1 && ca != cb) {
+                    std::vector<int> group{ca, cb};
+                    std::sort(group.begin(), group.end());
+
+                    int union_size = repair_group_union_size(comps, group);
+                    if (union_size <= leaf_limit) {
+                        std::string key = repair_group_key(group);
+                        if (seen.insert(key).second) {
+                            RepairCandidateGroup cand;
+                            cand.component_indices = std::move(group);
+                            cand.union_size = union_size;
+                            cand.score = union_size - 8; // bonus: directly repairs split cherry
+                            out.push_back(std::move(cand));
+                        }
+                    }
+                }
+            }
+        }
+
+        dfs(a);
+        dfs(b);
+    };
+
+    dfs(t1.root);
+}
+
 std::vector<RepairCandidateGroup> build_repair_candidates(
     const ReducedInstance& reduced,
     const std::vector<std::vector<int>>& comps,
@@ -2938,6 +3101,27 @@ std::vector<RepairCandidateGroup> build_repair_candidates(
     candidates.reserve(static_cast<size_t>(max_candidates * 3));
     add_repair_candidates_from_order(order_t1, summaries, max_group_size, leaf_limit, seen, candidates);
     add_repair_candidates_from_order(order_t2, summaries, max_group_size, leaf_limit, seen, candidates);
+
+    add_cherry_conflict_repair_candidates(
+        reduced.t1,
+        comps,
+        reduced.reduced_leaf_count,
+        max_group_size,
+        leaf_limit,
+        seen,
+        candidates
+    );
+
+    add_cherry_conflict_repair_candidates(
+        reduced.t2,
+        comps,
+        reduced.reduced_leaf_count,
+        max_group_size,
+        leaf_limit,
+        seen,
+        candidates
+    );
+
     add_elite_repair_candidates(comps, elite_pool, max_group_size, leaf_limit, seen, candidates);
 
     for (auto& cand : candidates) {
@@ -3347,6 +3531,10 @@ std::vector<std::vector<int>> solve_direct_reduced(
 
     std::vector<EliteSolution> elite_pool;
     int elite_limit = elite_pool_limit_for_size(reduced_n);
+    if (!best_reduced.empty() &&
+        static_cast<int>(best_reduced.size()) < reduced_n) {
+        maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
+    }
     if (static_cast<int>(best_reduced.size()) <= prune_limit + 2) {
         maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
     }
@@ -3400,20 +3588,57 @@ std::vector<std::vector<int>> solve_direct_reduced(
             ++iter;
             continue;
         }
-        if (static_cast<int>(res.comps.size()) <= best_components + 2) {
-            maybe_add_elite_solution(elite_pool, res.comps, reduced_n, elite_limit);
+        std::vector<std::vector<int>> candidate = res.comps;
+        normalize_partition(candidate);
+
+        int cand_components = static_cast<int>(candidate.size());
+
+        bool checked_valid = false;
+        bool candidate_valid = false;
+
+        auto ensure_candidate_valid = [&]() -> bool {
+            if (!checked_valid) {
+                candidate_valid = partition_is_valid_agreement_forest(
+                    reduced.t1,
+                    reduced.t2,
+                    candidate,
+                    reduced.reduced_leaf_count
+                );
+                checked_valid = true;
+            }
+            return candidate_valid;
+        };
+
+        if (cand_components <= best_components + 2) {
+            if (ensure_candidate_valid()) {
+                maybe_add_elite_solution(elite_pool, candidate, reduced_n, elite_limit);
+            }
         }
-        if (static_cast<int>(res.comps.size()) < best_components) {
-            best_reduced = res.comps;
+
+        if (cand_components < best_components) {
+            if (!ensure_candidate_valid()) {
+                ++iter;
+                continue;
+            }
+
+            best_reduced = std::move(candidate);
             best_components = static_cast<int>(best_reduced.size());
             prune_limit = std::min(prune_limit, best_components);
-            if (run_exact_repair_portfolio(reduced, best_reduced, best_components, elite_pool, deadline, false)) {
+
+            if (run_exact_repair_portfolio(
+                    reduced,
+                    best_reduced,
+                    best_components,
+                    elite_pool,
+                    deadline,
+                    false)) {
                 prune_limit = std::min(prune_limit, best_components);
             }
+
             if (static_cast<int>(best_reduced.size()) <= prune_limit + 2) {
                 maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
             }
-        }
+}
         ++iter;
     }
 
@@ -3530,6 +3755,7 @@ ThreeApproxResult run_three_approx(
     bool timed_out_or_terminated = false;
     bool medium_mode = is_medium_instance_size(n);
     size_t discrepancy_step = 0;
+    PathScratch path_scratch;
 
     // Exhaust common cherries before branching.
     contract_all_common_cherries(t1, f, next_label);
@@ -3584,7 +3810,7 @@ ThreeApproxResult run_three_approx(
             ranked.reserve(cherries.size());
             for (size_t i = 0; i < cherries.size(); ++i) {
                 auto [ca, cb] = cherries[i];
-                auto cand = build_cherry_candidate(t1, f, f_mass, ca, cb, n);
+                auto cand = build_cherry_candidate(t1, f, f_mass, ca, cb, n, &path_scratch);
                 double score = cand.score;
                 if (elite_comp_map && elite_comp_map->size() > static_cast<size_t>(n)) {
                     int ida = (*elite_comp_map)[static_cast<size_t>(ca)];
@@ -3648,15 +3874,16 @@ ThreeApproxResult run_three_approx(
             continue;
         }
 
-        auto path = path_nodes(f, na, nb);
+        const auto& path = path_nodes_fast(f, na, nb, path_scratch);
         auto pendants = pendant_children_on_path(f, path);
         if (pendants.size() == 1) {
             cut_edge_above(f, pendants[0]);
         } else {
+            auto f_mass = compute_active_leaf_masses(f);
+
             if (use_expensive_same_component_plan(n, path, pendants)) {
-                auto f_mass = compute_active_leaf_masses(f);
-                auto cand = build_cherry_candidate(t1, f, f_mass, a, b, n);
-                auto plan = choose_cut_plan(t1, f, cand, next_label, rng, n);
+                auto cand = build_cherry_candidate(t1, f, f_mass, a, b, n, &path_scratch);
+                auto plan = choose_cut_plan(t1, f, cand, next_label, rng, n, f_mass);
 
                 int max_plan_cuts = is_medium_instance_size(n) ? 5 : 4;
 
@@ -3665,9 +3892,8 @@ ThreeApproxResult run_three_approx(
                     continue;
                 }
             }
-            {
-                auto f_mass = compute_active_leaf_masses(f);
 
+            {
                 int best_cut = -1;
                 int best_mass = std::numeric_limits<int>::max();
 
@@ -3792,12 +4018,57 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     DynamicTree dt1_base = build_dynamic_tree(reduced.t1);
     DynamicTree dt2_base = build_dynamic_tree(reduced.t2);
     int reduced_n = reduced.reduced_leaf_count;
-
     std::vector<std::vector<int>> best_reduced = reduced_singleton_components(reduced_n);
     int best_reduced_components = static_cast<int>(best_reduced.size());
+    int exact0_incumbent = std::min(best_components, best_reduced_components);
+
+    auto exact0 = maybe_solve_exact_kernel(
+        dt1_base,
+        dt2_base,
+        reduced_n,
+        exact0_incumbent,
+        soft_deadline,
+        "main_initial"
+    );
+
+    if (exact0.solved && !exact0.comps.empty()) {
+        auto candidate = exact0.comps;
+        normalize_partition(candidate);
+
+        if (partition_is_valid_agreement_forest(
+                reduced.t1,
+                reduced.t2,
+                candidate,
+                reduced.reduced_leaf_count)) {
+
+            best_reduced = candidate;
+            best_reduced_components = static_cast<int>(candidate.size());
+
+            auto expanded = expand_reduced_components(candidate, reduced.expansion);
+            auto out = forest_from_partition(expanded, n, original_t1);
+
+            if (!out.empty() && static_cast<int>(out.size()) < best_components) {
+                best_out = std::move(out);
+                best_components = static_cast<int>(best_out.size());
+                publish_best_solution(best_out);
+            }
+        }
+    }
     std::vector<EliteSolution> elite_pool;
     int elite_limit = elite_pool_limit_for_size(reduced_n);
     uint64_t iter = 0;
+    if (!best_reduced.empty() &&
+        static_cast<int>(best_reduced.size()) < reduced_n) {
+        maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
+    }
+    static const std::array<std::vector<int>, 6> discrepancy_scripts = {{
+        {1},
+        {2},
+        {1, 1},
+        {1, 2},
+        {2, 1},
+        {3}
+    }};
     while (!g_terminate && Clock::now() < soft_deadline) {
         // if (!final_polish_done &&
         //     phase >= 0.85 &&
@@ -3830,6 +4101,14 @@ std::vector<std::string> solve(const PaceInstance& inst) {
         double elite_bonus = 0.0;
         configure_elite_guidance(elite_pool, iter, start, soft_deadline, elite_comp_map, elite_bonus);
         bool swapped = should_use_swapped_orientation(iter, reduced_n);
+
+        const std::vector<int>* discrepancy = nullptr;
+        if (reduced_n <= 600 && (iter % 16ULL == 7ULL)) {
+            discrepancy = &discrepancy_scripts[
+                static_cast<size_t>((iter / 16ULL) % discrepancy_scripts.size())
+            ];
+        }
+
         auto res = run_three_approx(
             swapped ? dt2_base : dt1_base,
             swapped ? dt1_base : dt2_base,
@@ -3838,116 +4117,128 @@ std::vector<std::string> solve(const PaceInstance& inst) {
             best_components,
             seed,
             elite_comp_map,
-            elite_bonus
+            elite_bonus,
+            discrepancy
         );
         if (!res.complete || res.comps.empty()) {
             ++iter;
             continue;
         }
+
         std::vector<std::vector<int>> candidate_reduced = res.comps;
         normalize_partition(candidate_reduced);
 
-        if (!partition_is_valid_agreement_forest(
-                reduced.t1,
-                reduced.t2,
-                candidate_reduced,
-                reduced.reduced_leaf_count)) {
-            ++iter;
-            continue;
-        }
+        int cand_components = static_cast<int>(candidate_reduced.size());
 
-        if (static_cast<int>(candidate_reduced.size()) <= best_components + 2) {
-            maybe_add_elite_solution(elite_pool, candidate_reduced, reduced_n, elite_limit);
-        }
+        bool checked_valid = false;
+        bool candidate_valid = false;
 
-        if (static_cast<int>(candidate_reduced.size()) < best_reduced_components) {
-            best_reduced = candidate_reduced;
-            best_reduced_components = static_cast<int>(best_reduced.size());
-        }
-
-        auto expanded = expand_reduced_components(candidate_reduced, reduced.expansion);
-        auto out = forest_from_partition(expanded, n, original_t1);
-
-        if (!out.empty() && static_cast<int>(out.size()) < best_components) {
-            best_out = out;
-            best_components = static_cast<int>(out.size());
-            best_reduced = std::move(candidate_reduced);
-            best_reduced_components = static_cast<int>(best_reduced.size());
-
-            if (run_exact_repair_portfolio(reduced, best_reduced, best_reduced_components, elite_pool, soft_deadline, false) &&
-                best_reduced_components < best_components &&
-                partition_is_valid_agreement_forest(
+        auto ensure_candidate_valid = [&]() -> bool {
+            if (!checked_valid) {
+                candidate_valid = partition_is_valid_agreement_forest(
                     reduced.t1,
                     reduced.t2,
-                    best_reduced,
-                    reduced.reduced_leaf_count)) {
+                    candidate_reduced,
+                    reduced.reduced_leaf_count
+                );
+                checked_valid = true;
+            }
+            return candidate_valid;
+        };
 
-                auto repaired_expanded = expand_reduced_components(best_reduced, reduced.expansion);
-                auto repaired_out = forest_from_partition(repaired_expanded, n, original_t1);
+        int elite_reference = std::min(best_components, best_reduced_components);
 
-                if (!repaired_out.empty() && static_cast<int>(repaired_out.size()) < best_components) {
-                    best_out = repaired_out;
-                    best_components = static_cast<int>(best_out.size());
-                }
+        // Only store as best_reduced if valid.
+        if (cand_components < best_reduced_components) {
+            if (ensure_candidate_valid()) {
+                best_reduced = candidate_reduced;
+                best_reduced_components = cand_components;
+            } else {
+                ++iter;
+                continue;
+            }
+        }
+
+        // Only validate near-elite candidates before adding them to elite pool.
+        if (cand_components <= elite_reference + 2) {
+            if (ensure_candidate_valid()) {
+                maybe_add_elite_solution(elite_pool, candidate_reduced, reduced_n, elite_limit);
+            }
+        }
+
+        // Full output construction only if it can improve the published incumbent.
+        if (cand_components < best_components) {
+            if (!ensure_candidate_valid()) {
+                ++iter;
+                continue;
             }
 
-            publish_best_solution(best_out);
+            auto expanded = expand_reduced_components(candidate_reduced, reduced.expansion);
+            auto out = forest_from_partition(expanded, n, original_t1);
+
+            if (!out.empty() && static_cast<int>(out.size()) < best_components) {
+                best_out = out;
+                best_components = static_cast<int>(out.size());
+                best_reduced = std::move(candidate_reduced);
+                best_reduced_components = static_cast<int>(best_reduced.size());
+
+                if (run_exact_repair_portfolio(
+                        reduced,
+                        best_reduced,
+                        best_reduced_components,
+                        elite_pool,
+                        soft_deadline,
+                        false) &&
+                    best_reduced_components < best_components &&
+                    partition_is_valid_agreement_forest(
+                        reduced.t1,
+                        reduced.t2,
+                        best_reduced,
+                        reduced.reduced_leaf_count)) {
+
+                    auto repaired_expanded = expand_reduced_components(best_reduced, reduced.expansion);
+                    auto repaired_out = forest_from_partition(repaired_expanded, n, original_t1);
+
+                    if (!repaired_out.empty() &&
+                        static_cast<int>(repaired_out.size()) < best_components) {
+                        best_out = std::move(repaired_out);
+                        best_components = static_cast<int>(best_out.size());
+                    }
+                }
+
+                publish_best_solution(best_out);
+            }
         }
         ++iter;
     }
-    // if (!final_polish_done &&
-    //     !g_terminate &&
-    //     best_reduced_components <= best_components &&
-    //     Clock::now() + std::chrono::milliseconds(15) < soft_deadline) {
-    //     if (run_final_polishing_portfolio(
-    //             reduced,
-    //             dt1_base,
-    //             dt2_base,
-    //             best_reduced,
-    //             best_reduced_components,
-    //             elite_pool,
-    //             elite_limit,
-    //             soft_deadline,
-    //             mix64(base_seed ^ 0xfedc987654321234ULL)) &&
-    //         best_reduced_components < best_components) {
-    //         auto polished_expanded = expand_reduced_components(best_reduced, reduced.expansion);
-    //         auto polished_out = forest_from_partition(polished_expanded, n, original_t1);
-    //         if (!polished_out.empty() && static_cast<int>(polished_out.size()) < best_components) {
-    //             best_out = polished_out;
-    //             best_components = static_cast<int>(best_out.size());
-    //             publish_best_solution(best_out);
-    //         }
-    //     }
-    // }
     if (!g_terminate &&
         best_reduced_components < reduced_n &&
-        Clock::now() + std::chrono::milliseconds(50) < soft_deadline) {
+        Clock::now() + std::chrono::milliseconds(200) < soft_deadline) {
 
-        std::vector<std::vector<int>> polished = best_reduced;
-        int polished_components = best_reduced_components;
+        run_final_polishing_portfolio(
+            reduced,
+            dt1_base,
+            dt2_base,
+            best_reduced,
+            best_reduced_components,
+            elite_pool,
+            elite_limit,
+            soft_deadline,
+            mix64(base_seed ^ 0xfedc987654321234ULL)
+        );
 
-        if (run_exact_repair_portfolio(
-                reduced,
-                polished,
-                polished_components,
-                elite_pool,
-                soft_deadline,
-                true) &&
-            polished_components < best_components &&
+        if (best_reduced_components < best_components &&
             partition_is_valid_agreement_forest(
                 reduced.t1,
                 reduced.t2,
-                polished,
+                best_reduced,
                 reduced.reduced_leaf_count)) {
 
-            auto polished_expanded = expand_reduced_components(polished, reduced.expansion);
-            auto polished_out = forest_from_partition(polished_expanded, n, original_t1);
+            auto expanded = expand_reduced_components(best_reduced, reduced.expansion);
+            auto out = forest_from_partition(expanded, n, original_t1);
 
-            if (!polished_out.empty() &&
-                static_cast<int>(polished_out.size()) < best_components) {
-                best_reduced = std::move(polished);
-                best_reduced_components = polished_components;
-                best_out = std::move(polished_out);
+            if (!out.empty() && static_cast<int>(out.size()) < best_components) {
+                best_out = std::move(out);
                 best_components = static_cast<int>(best_out.size());
                 publish_best_solution(best_out);
             }
