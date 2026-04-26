@@ -1658,60 +1658,8 @@ bool is_large_instance_size(int n) {
     return n > 350;
 }
 
-bool should_use_swapped_orientation(uint64_t iter, int n) {
-    if (n < 24 || n >= 1000) return false;
-    uint64_t mod = is_large_instance_size(n) ? 6ULL : 8ULL;
-    return (mix64(iter ^ 0xa0761d6478bd642fULL) % mod) == 0ULL;
-}
-
 int elite_pool_limit_for_size(int n) {
     return is_medium_instance_size(n) ? 8 : 4;
-}
-
-double search_phase_fraction(
-    Clock::time_point now,
-    Clock::time_point start,
-    Clock::time_point deadline
-) {
-    auto total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - start).count();
-    if (total_ns <= 0) return 1.0;
-    auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count();
-    if (elapsed_ns <= 0) return 0.0;
-    if (elapsed_ns >= total_ns) return 1.0;
-    return static_cast<double>(elapsed_ns) / static_cast<double>(total_ns);
-}
-
-bool configure_elite_guidance(
-    const std::vector<EliteSolution>& elite_pool,
-    uint64_t iter,
-    Clock::time_point start,
-    Clock::time_point deadline,
-    const std::vector<int>*& elite_comp_map,
-    double& elite_bonus
-) {
-    elite_comp_map = nullptr;
-    elite_bonus = 0.0;
-    if (elite_pool.empty()) return false;
-
-    double phase = search_phase_fraction(Clock::now(), start, deadline);
-    if (phase < 0.80) return false;
-
-    bool use = false;
-    if (phase >= 0.95) {
-        use = true;
-        elite_bonus = 6.0;
-    } else if (phase >= 0.90) {
-        use = ((iter & 3ULL) != 0ULL);
-        elite_bonus = 4.5;
-    } else {
-        use = ((iter & 1ULL) != 0ULL);
-        elite_bonus = 3.0;
-    }
-    if (!use) return false;
-
-    const auto& elite = elite_pool[static_cast<size_t>(iter % elite_pool.size())];
-    elite_comp_map = &elite.comp_of_leaf;
-    return true;
 }
 
 uint64_t elite_partition_hash(const std::vector<int>& comp_of_leaf) {
@@ -1818,6 +1766,122 @@ std::vector<int> compute_active_leaf_masses(const DynamicTree& t) {
     return mass;
 }
 
+enum class GreedyPolicy {
+    Balanced,
+    PreferDifferentComponent,
+    PreferLowConflictMass,
+    PreferFewPendants,
+    PreferImmediateGain,
+    ConservativeSingleCut,
+    AggressiveMultiCut
+};
+
+struct DeterministicRunConfig {
+    bool swapped = false;
+    GreedyPolicy policy = GreedyPolicy::Balanced;
+    std::vector<int> discrepancy;
+    bool elite_guided = false;
+    int cherry_sample_cap = 0;
+    long long budget_ms = 0;
+    uint64_t tie_salt = 0;
+    int id = 0;
+};
+
+const char* greedy_policy_name(GreedyPolicy policy) {
+    switch (policy) {
+        case GreedyPolicy::Balanced: return "balanced";
+        case GreedyPolicy::PreferDifferentComponent: return "diff_component";
+        case GreedyPolicy::PreferLowConflictMass: return "low_conflict";
+        case GreedyPolicy::PreferFewPendants: return "few_pendants";
+        case GreedyPolicy::PreferImmediateGain: return "immediate_gain";
+        case GreedyPolicy::ConservativeSingleCut: return "single_cut";
+        case GreedyPolicy::AggressiveMultiCut: return "multi_cut";
+    }
+    return "unknown";
+}
+
+uint64_t discrepancy_hash(const std::vector<int>& script) {
+    uint64_t h = 0x9e3779b97f4a7c15ULL ^ static_cast<uint64_t>(script.size());
+    for (int x : script) {
+        h = mix64(h ^ (static_cast<uint64_t>(static_cast<unsigned>(x + 17)) + 0x9e3779b97f4a7c15ULL));
+    }
+    return h;
+}
+
+std::string discrepancy_string(const std::vector<int>& script) {
+    if (script.empty()) return "-";
+    std::string out;
+    for (size_t i = 0; i < script.size(); ++i) {
+        if (i) out.push_back('.');
+        out += std::to_string(script[i]);
+    }
+    return out;
+}
+
+uint64_t deterministic_pair_key(
+    uint64_t salt,
+    uint64_t step,
+    int a,
+    int b,
+    uint64_t tag = 0
+) {
+    uint64_t lo = static_cast<uint64_t>(std::min(a, b));
+    uint64_t hi = static_cast<uint64_t>(std::max(a, b));
+    return mix64(
+        salt ^
+        (step * 0x9e3779b97f4a7c15ULL) ^
+        (lo << 32) ^
+        hi ^
+        (tag * 0xbf58476d1ce4e5b9ULL)
+    );
+}
+
+uint64_t deterministic_plan_key(uint64_t salt, const std::vector<int>& plan) {
+    uint64_t h = salt ^ (static_cast<uint64_t>(plan.size()) * 0x94d049bb133111ebULL);
+    for (int x : plan) {
+        h = mix64(h ^ static_cast<uint64_t>(static_cast<unsigned>(x + 31)));
+    }
+    return h;
+}
+
+bool deterministic_profile_enabled() {
+    static int enabled = []() {
+        const char* env = std::getenv("STRIDE_DET_PROFILE");
+        return (env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
+    }();
+    return enabled != 0;
+}
+
+void emit_deterministic_profile(
+    const char* phase,
+    const DeterministicRunConfig& cfg,
+    int reduced_n,
+    bool complete,
+    int components,
+    bool accepted,
+    bool improved,
+    long long elapsed_ms
+) {
+    if (!deterministic_profile_enabled()) return;
+    std::cerr
+        << "DET"
+        << " phase=" << phase
+        << " id=" << cfg.id
+        << " n=" << reduced_n
+        << " policy=" << greedy_policy_name(cfg.policy)
+        << " swapped=" << (cfg.swapped ? 1 : 0)
+        << " elite=" << (cfg.elite_guided ? 1 : 0)
+        << " script=" << discrepancy_string(cfg.discrepancy)
+        << " sample=" << cfg.cherry_sample_cap
+        << " budget_ms=" << cfg.budget_ms
+        << " complete=" << (complete ? 1 : 0)
+        << " components=" << components
+        << " accepted=" << (accepted ? 1 : 0)
+        << " improved=" << (improved ? 1 : 0)
+        << " ms=" << elapsed_ms
+        << '\n';
+}
+
 struct CherryCandidate {
     int a = -1;
     int b = -1;
@@ -1868,6 +1932,47 @@ double score_cherry_candidate(const CherryCandidate& cand, int total_leaves) {
         0.02 * static_cast<double>(cand.conflict_mass) +
         3.0 * static_cast<double>(cand.immediate_gain) -
         0.01 * static_cast<double>(cand.component_size);
+}
+
+double score_cherry_candidate_policy(
+    const CherryCandidate& cand,
+    int total_leaves,
+    GreedyPolicy policy
+) {
+    double s = score_cherry_candidate(cand, total_leaves);
+
+    switch (policy) {
+        case GreedyPolicy::Balanced:
+            return s;
+
+        case GreedyPolicy::PreferDifferentComponent:
+            if (!cand.same_component) s += 5.0;
+            return s;
+
+        case GreedyPolicy::PreferLowConflictMass:
+            s -= 0.035 * static_cast<double>(cand.conflict_mass);
+            return s;
+
+        case GreedyPolicy::PreferFewPendants:
+            s -= 2.75 * static_cast<double>(cand.pendant_count);
+            return s;
+
+        case GreedyPolicy::PreferImmediateGain:
+            s += 4.50 * static_cast<double>(cand.immediate_gain);
+            return s;
+
+        case GreedyPolicy::ConservativeSingleCut:
+            s -= 2.00 * static_cast<double>(cand.pendant_count);
+            s -= 0.020 * static_cast<double>(cand.conflict_mass);
+            return s;
+
+        case GreedyPolicy::AggressiveMultiCut:
+            s += 2.00 * static_cast<double>(cand.immediate_gain);
+            s -= 0.005 * static_cast<double>(cand.conflict_mass);
+            return s;
+    }
+
+    return s;
 }
 
 CherryCandidate build_cherry_candidate(
@@ -2000,9 +2105,10 @@ std::vector<int> choose_cut_plan(
     DynamicTree& f,
     const CherryCandidate& cand,
     int next_label,
-    uint64_t& rng,
     int total_leaves,
-    const std::vector<int>& f_mass
+    const std::vector<int>& f_mass,
+    GreedyPolicy policy,
+    uint64_t tie_salt
 ) {
     std::vector<std::vector<int>> plans;
     if (!cand.same_component) {
@@ -2011,7 +2117,8 @@ std::vector<int> choose_cut_plan(
     } else {
         std::vector<int> sorted = cand.pendants;
         std::sort(sorted.begin(), sorted.end(), [&](int x, int y) {
-            return f_mass[x] < f_mass[y];
+            if (f_mass[x] != f_mass[y]) return f_mass[x] < f_mass[y];
+            return x < y;
         });
 
         size_t individual_limit = is_medium_instance_size(total_leaves)
@@ -2024,14 +2131,16 @@ std::vector<int> choose_cut_plan(
         plans.push_back({cand.na});
         plans.push_back({cand.nb});
 
-        if (sorted.size() >= 2) {
-            plans.push_back({sorted[0], sorted[1]});
-        }
-        if (sorted.size() >= 3) {
-            plans.push_back({sorted[0], sorted[1], sorted[2]});
+        if (policy != GreedyPolicy::ConservativeSingleCut) {
+            if (sorted.size() >= 2) {
+                plans.push_back({sorted[0], sorted[1]});
+            }
+            if (sorted.size() >= 3) {
+                plans.push_back({sorted[0], sorted[1], sorted[2]});
+            }
         }
 
-        if (cand.pendants.size() > 1) {
+        if (policy != GreedyPolicy::ConservativeSingleCut && cand.pendants.size() > 1) {
             std::vector<int> bundle;
             size_t bundle_limit = std::min<size_t>(5, sorted.size());
             for (size_t i = 0; i < bundle_limit; ++i) {
@@ -2071,8 +2180,35 @@ std::vector<int> choose_cut_plan(
         }
     }
 
-    rng = mix64(rng + 0x94d049bb133111ebULL);
-    return plans[best_indices[static_cast<size_t>(rng % best_indices.size())]];
+    int chosen = best_indices.front();
+
+    for (int idx : best_indices) {
+        const auto& p = plans[static_cast<size_t>(idx)];
+        const auto& q = plans[static_cast<size_t>(chosen)];
+
+        // Prefer fewer cuts unless aggressive policy explicitly allows larger plans.
+        if (policy != GreedyPolicy::AggressiveMultiCut && p.size() != q.size()) {
+            if (p.size() < q.size()) chosen = idx;
+            continue;
+        }
+
+        // In aggressive mode, allow larger plans if they were tied by evaluation,
+        // but still make the choice stable.
+        if (policy == GreedyPolicy::AggressiveMultiCut && p.size() != q.size()) {
+            if (p.size() > q.size()) chosen = idx;
+            continue;
+        }
+
+        uint64_t hp = deterministic_plan_key(tie_salt, p);
+        uint64_t hq = deterministic_plan_key(tie_salt, q);
+        if (hp != hq) {
+            if (hp < hq) chosen = idx;
+            continue;
+        }
+        if (p < q) chosen = idx;
+    }
+
+    return plans[static_cast<size_t>(chosen)];
 }
 
 bool use_expensive_same_component_plan(
@@ -2503,6 +2639,21 @@ ExactKernelResult maybe_solve_exact_kernel(
     stats.reduced_n = reduced_n;
     stats.incumbent_before = heuristic_components;
     stats.incumbent_after = heuristic_components;
+
+    int threshold = 24;
+    if (reduced_n <= 20) {
+        threshold = reduced_n;
+    } else if (reduced_n <= 28) {
+        threshold = std::min(reduced_n, 28);
+    } else if (reduced_n <= 32 && heuristic_components <= 16) {
+        threshold = std::min(reduced_n, 32);
+    } else if (reduced_n <= 36 && heuristic_components <= 12) {
+        threshold = std::min(reduced_n, 32);
+    } else if (reduced_n <= 40 && heuristic_components <= 10) {
+        threshold = 32;
+    }
+    stats.threshold = std::min(threshold, reduced_n);
+
     if (reduced_n > stats.threshold) {
         emit_exact_profile(phase, stats);
         return {};
@@ -2511,7 +2662,7 @@ ExactKernelResult maybe_solve_exact_kernel(
         emit_exact_profile(phase, stats);
         return {};
     }
-    if (heuristic_components - 1 > 18) {
+    if (heuristic_components - 1 > stats.threshold + 4) {
         emit_exact_profile(phase, stats);
         return {};
     }
@@ -2855,7 +3006,11 @@ LocalExactSearchPlan plan_local_exact_search(
     }
 
     if (reduced_n <= 24) {
-        plan.budget += std::chrono::milliseconds(final_phase ? 40 : 20);
+        plan.threshold = reduced_n;
+        plan.budget += std::chrono::milliseconds(final_phase ? 50 : 30);
+    } else if (reduced_n <= 32 && incumbent <= 5) {
+        plan.threshold = std::min(plan.threshold + 2, reduced_n);
+        plan.budget += std::chrono::milliseconds(final_phase ? 20 : 10);
     } else if (reduced_n >= 40) {
         plan.budget -= std::chrono::milliseconds(10);
     }
@@ -2877,7 +3032,10 @@ LocalExactSearchPlan plan_polish_exact_search(
     LocalExactSearchPlan plan;
     int incumbent = std::max(1, incumbent_components);
 
-    if (incumbent <= 6) {
+    if (reduced_n <= 24) {
+        plan.threshold = reduced_n;
+        plan.budget = std::chrono::milliseconds(1200);
+    } else if (incumbent <= 6) {
         plan.threshold = 40;
         plan.budget = std::chrono::milliseconds(900);
     } else if (incumbent <= 8) {
@@ -2892,6 +3050,11 @@ LocalExactSearchPlan plan_polish_exact_search(
     } else {
         plan.threshold = 24;
         plan.budget = std::chrono::milliseconds(180);
+    }
+
+    if (reduced_n <= 32 && incumbent <= 5) {
+        plan.threshold = std::min(plan.threshold, reduced_n);
+        plan.budget = std::chrono::milliseconds(std::max<long long>(plan.budget.count(), 850));
     }
 
     plan.threshold = std::min(plan.threshold, reduced_n);
@@ -3144,7 +3307,10 @@ std::vector<RepairCandidateGroup> build_repair_candidates(
         }
         if (a.score != b.score) return a.score < b.score;
         if (a.union_size != b.union_size) return a.union_size < b.union_size;
-        return a.component_indices.size() < b.component_indices.size();
+        if (a.component_indices.size() != b.component_indices.size()) {
+            return a.component_indices.size() < b.component_indices.size();
+        }
+        return a.component_indices < b.component_indices;
     });
     if (static_cast<int>(candidates.size()) > max_candidates) {
         candidates.resize(static_cast<size_t>(max_candidates));
@@ -3356,10 +3522,12 @@ ThreeApproxResult run_three_approx(
     Clock::time_point deadline,
     int n,
     int incumbent_components,
-    uint64_t seed,
+    GreedyPolicy policy,
     const std::vector<int>* elite_comp_map = nullptr,
     double elite_bonus = 0.0,
-    const std::vector<int>* discrepancy_choices = nullptr
+    const std::vector<int>* discrepancy_choices = nullptr,
+    uint64_t tie_salt = 0,
+    int cherry_sample_cap = 0
 );
 
 bool run_discrepancy_polish(
@@ -3373,6 +3541,7 @@ bool run_discrepancy_polish(
     uint64_t seed_base,
     const std::vector<EliteSolution>& elite_pool
 ) {
+    (void)seed_base;
     auto now = Clock::now();
     auto ms_left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
     if (ms_left < 30) return false;
@@ -3395,7 +3564,7 @@ bool run_discrepancy_polish(
             local_deadline,
             reduced_n,
             best_components,
-            mix64(seed_base ^ (0xd1b54a32d192ed03ULL + static_cast<uint64_t>(i))),
+            GreedyPolicy::Balanced,
             elite_comp_map,
             elite_bonus,
             &discrepancy_runs[i]
@@ -3497,6 +3666,177 @@ std::vector<std::vector<int>> reduced_singleton_components(int reduced_n) {
     return comps;
 }
 
+void generate_lds_scripts_rec(
+    int max_rank,
+    int max_depth,
+    int remaining_cost,
+    std::vector<int>& cur,
+    std::vector<std::vector<int>>& out,
+    size_t cap
+) {
+    if (out.size() >= cap) return;
+    if (remaining_cost == 0) {
+        if (!cur.empty()) out.push_back(cur);
+        return;
+    }
+    if (static_cast<int>(cur.size()) >= max_depth) return;
+    for (int rank = 1; rank <= max_rank && rank <= remaining_cost; ++rank) {
+        cur.push_back(rank);
+        generate_lds_scripts_rec(max_rank, max_depth, remaining_cost - rank, cur, out, cap);
+        cur.pop_back();
+        if (out.size() >= cap) return;
+    }
+}
+
+std::vector<std::vector<int>> deterministic_lds_scripts(int n) {
+    std::vector<std::vector<int>> scripts;
+    scripts.push_back({});
+
+    int max_rank = n <= 600 ? 3 : 2;
+    int max_depth = n <= 300 ? 6 : (n <= 600 ? 5 : 4);
+    int max_cost = n <= 300 ? 9 : (n <= 600 ? 7 : 5);
+    size_t cap = n <= 300 ? 96 : (n <= 600 ? 64 : 32);
+
+    std::vector<int> cur;
+    for (int cost = 1; cost <= max_cost && scripts.size() < cap; ++cost) {
+        generate_lds_scripts_rec(max_rank, max_depth, cost, cur, scripts, cap);
+    }
+    return scripts;
+}
+
+void add_deterministic_config(
+    std::vector<DeterministicRunConfig>& configs,
+    std::unordered_set<std::string>& seen,
+    bool swapped,
+    GreedyPolicy policy,
+    std::vector<int> discrepancy,
+    bool elite_guided,
+    int cherry_sample_cap = 0,
+    long long budget_ms = 0
+) {
+    std::string key;
+    key.reserve(64 + discrepancy.size() * 3);
+    key += swapped ? "1:" : "0:";
+    key += std::to_string(static_cast<int>(policy));
+    key += elite_guided ? ":1:" : ":0:";
+    key += std::to_string(cherry_sample_cap);
+    key += ':';
+    for (int x : discrepancy) {
+        key += std::to_string(x);
+        key.push_back(',');
+    }
+    if (!seen.insert(key).second) return;
+
+    DeterministicRunConfig cfg;
+    cfg.swapped = swapped;
+    cfg.policy = policy;
+    cfg.discrepancy = std::move(discrepancy);
+    cfg.elite_guided = elite_guided;
+    cfg.cherry_sample_cap = cherry_sample_cap;
+    cfg.budget_ms = budget_ms;
+    configs.push_back(std::move(cfg));
+}
+
+void finalize_deterministic_configs(std::vector<DeterministicRunConfig>& configs, int n) {
+    int default_sample = 0;
+    long long default_budget = 0;
+    if (n > 4000) {
+        default_sample = 96;
+        default_budget = 7000;
+    } else if (n > 1000) {
+        default_sample = 160;
+        default_budget = 4500;
+    }
+
+    for (size_t i = 0; i < configs.size(); ++i) {
+        auto& cfg = configs[i];
+        cfg.id = static_cast<int>(i);
+        if (cfg.cherry_sample_cap == 0 && default_sample > 0) {
+            cfg.cherry_sample_cap = default_sample;
+        }
+        if (cfg.budget_ms == 0 && default_budget > 0) {
+            cfg.budget_ms = (i == 0 && n > 4000) ? 12000 : default_budget;
+        }
+        uint64_t h = 0x6a09e667f3bcc909ULL;
+        h ^= static_cast<uint64_t>(n) * 0x9e3779b97f4a7c15ULL;
+        h ^= static_cast<uint64_t>(i + 1) * 0xbf58476d1ce4e5b9ULL;
+        h ^= static_cast<uint64_t>(static_cast<int>(cfg.policy) + 1) * 0x94d049bb133111ebULL;
+        h ^= cfg.swapped ? 0x243f6a8885a308d3ULL : 0x13198a2e03707344ULL;
+        h ^= cfg.elite_guided ? 0xd1b54a32d192ed03ULL : 0x853c49e6748fea9bULL;
+        h ^= discrepancy_hash(cfg.discrepancy);
+        cfg.tie_salt = mix64(h);
+    }
+}
+
+Clock::time_point deterministic_config_deadline(
+    const DeterministicRunConfig& cfg,
+    Clock::time_point global_deadline
+) {
+    if (cfg.budget_ms <= 0) return global_deadline;
+    return std::min(
+        global_deadline,
+        Clock::now() + std::chrono::milliseconds(cfg.budget_ms)
+    );
+}
+
+std::vector<DeterministicRunConfig> deterministic_configs_for_size(int n) {
+    std::vector<DeterministicRunConfig> configs;
+    std::unordered_set<std::string> seen;
+
+    if (n > 1000) {
+        int fast_sample = n > 4000 ? 64 : 128;
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, false, fast_sample, n > 4000 ? 9000 : 3500);
+        add_deterministic_config(configs, seen, true,  GreedyPolicy::Balanced, {}, false);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, {}, false);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, {}, false);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {}, false);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::AggressiveMultiCut, {}, false);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {1}, false);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {2}, false);
+        add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, {1}, false);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true);
+        finalize_deterministic_configs(configs, n);
+        return configs;
+    }
+
+    if (n > 600) {
+        for (const auto& script : deterministic_lds_scripts(n)) {
+            add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, script, false);
+            if (script.size() <= 2) {
+                add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, script, false);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, script, false);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, script, false);
+            }
+        }
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferFewPendants, {}, false);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::ConservativeSingleCut, {}, false);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true);
+        finalize_deterministic_configs(configs, n);
+        return configs;
+    }
+
+    for (const auto& script : deterministic_lds_scripts(n)) {
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, script, false);
+        add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, script, false);
+        if (script.size() <= 3) {
+            add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, script, false);
+            add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, script, false);
+            add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, script, false);
+        }
+        if (script.empty()) {
+            add_deterministic_config(configs, seen, true, GreedyPolicy::PreferDifferentComponent, script, false);
+            add_deterministic_config(configs, seen, false, GreedyPolicy::PreferFewPendants, script, false);
+            add_deterministic_config(configs, seen, false, GreedyPolicy::ConservativeSingleCut, script, false);
+            add_deterministic_config(configs, seen, false, GreedyPolicy::AggressiveMultiCut, script, false);
+        }
+    }
+    add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true);
+    add_deterministic_config(configs, seen, true,  GreedyPolicy::Balanced, {}, true);
+    add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {1}, true);
+    finalize_deterministic_configs(configs, n);
+    return configs;
+}
+
 std::vector<std::vector<int>> solve_direct_reduced(
     const ReducedInstance& reduced,
     Clock::time_point deadline,
@@ -3546,52 +3886,70 @@ std::vector<std::vector<int>> solve_direct_reduced(
             }
         }
     }
-
-    uint64_t iter = 0;
-    auto search_start = Clock::now();
+    auto configs = deterministic_configs_for_size(reduced_n);   
     bool final_polish_done = false;
 
-    while (!g_terminate && Clock::now() < deadline) {
-        double phase = search_phase_fraction(Clock::now(), search_start, deadline);
-        if (!final_polish_done && phase >= 0.85) {
-            run_final_polishing_portfolio(
+    for (const auto& cfg : configs) {
+        if (g_terminate || Clock::now() + std::chrono::milliseconds(10) >= deadline) {
+            break;
+        }
+
+        if (!final_polish_done &&
+            Clock::now() + std::chrono::milliseconds(80) < deadline &&
+            best_components < reduced_n) {
+            run_exact_repair_portfolio(
                 reduced,
-                dt1_base,
-                dt2_base,
                 best_reduced,
                 best_components,
                 elite_pool,
-                elite_limit,
                 deadline,
-                mix64(seed_base ^ 0x6eed0e9da4d94a4fULL)
+                false
             );
             prune_limit = std::min(prune_limit, best_components);
             final_polish_done = true;
-            continue;
         }
-        uint64_t seed = mix64(seed_base ^ iter);
+
         const std::vector<int>* elite_comp_map = nullptr;
         double elite_bonus = 0.0;
-        configure_elite_guidance(elite_pool, iter, search_start, deadline, elite_comp_map, elite_bonus);
-        bool swapped = should_use_swapped_orientation(iter, reduced_n);
+
+        if (cfg.elite_guided && !elite_pool.empty()) {
+            elite_comp_map = &elite_pool.front().comp_of_leaf;
+            elite_bonus = 5.0;
+        }
+
+        const std::vector<int>* discrepancy_ptr =
+            cfg.discrepancy.empty() ? nullptr : &cfg.discrepancy;
+
+        auto cfg_start = Clock::now();
+        auto cfg_deadline = deterministic_config_deadline(cfg, deadline);
         auto res = run_three_approx(
-            swapped ? dt2_base : dt1_base,
-            swapped ? dt1_base : dt2_base,
-            deadline,
+            cfg.swapped ? dt2_base : dt1_base,
+            cfg.swapped ? dt1_base : dt2_base,
+            cfg_deadline,
             reduced_n,
             prune_limit,
-            seed,
+            cfg.policy,
             elite_comp_map,
-            elite_bonus
+            elite_bonus,
+            discrepancy_ptr,
+            cfg.tie_salt,
+            cfg.cherry_sample_cap
         );
-        if (!res.complete || res.comps.empty()) {
-            ++iter;
+        long long cfg_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - cfg_start
+        ).count();
+
+        if (res.comps.empty()) {
+            emit_deterministic_profile("direct", cfg, reduced_n, res.complete, -1, false, false, cfg_ms);
             continue;
         }
+
         std::vector<std::vector<int>> candidate = res.comps;
         normalize_partition(candidate);
 
         int cand_components = static_cast<int>(candidate.size());
+        bool accepted = false;
+        bool improved = false;
 
         bool checked_valid = false;
         bool candidate_valid = false;
@@ -3612,18 +3970,21 @@ std::vector<std::vector<int>> solve_direct_reduced(
         if (cand_components <= best_components + 2) {
             if (ensure_candidate_valid()) {
                 maybe_add_elite_solution(elite_pool, candidate, reduced_n, elite_limit);
+                accepted = true;
             }
         }
 
         if (cand_components < best_components) {
             if (!ensure_candidate_valid()) {
-                ++iter;
+                emit_deterministic_profile("direct", cfg, reduced_n, res.complete, cand_components, false, false, cfg_ms);
                 continue;
             }
 
             best_reduced = std::move(candidate);
             best_components = static_cast<int>(best_reduced.size());
             prune_limit = std::min(prune_limit, best_components);
+            accepted = true;
+            improved = true;
 
             if (run_exact_repair_portfolio(
                     reduced,
@@ -3638,11 +3999,11 @@ std::vector<std::vector<int>> solve_direct_reduced(
             if (static_cast<int>(best_reduced.size()) <= prune_limit + 2) {
                 maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
             }
-}
-        ++iter;
+        }
+        emit_deterministic_profile("direct", cfg, reduced_n, res.complete, cand_components, accepted, improved, cfg_ms);
     }
 
-    if (!final_polish_done && !g_terminate && Clock::now() + std::chrono::milliseconds(10) < deadline) {
+    if (!g_terminate && Clock::now() + std::chrono::milliseconds(10) < deadline) {
         run_final_polishing_portfolio(
             reduced,
             dt1_base,
@@ -3745,16 +4106,18 @@ ThreeApproxResult run_three_approx(
     Clock::time_point deadline,
     int n,
     int incumbent_components,
-    uint64_t seed,
+    GreedyPolicy policy,
     const std::vector<int>* elite_comp_map,
     double elite_bonus,
-    const std::vector<int>* discrepancy_choices
+    const std::vector<int>* discrepancy_choices,
+    uint64_t tie_salt,
+    int cherry_sample_cap
 ) {
     int next_label = n + 1;
-    uint64_t rng = seed ^ 0x9e3779b97f4a7c15ULL;
     bool timed_out_or_terminated = false;
     bool medium_mode = is_medium_instance_size(n);
     size_t discrepancy_step = 0;
+    uint64_t decision_step = 0;
     PathScratch path_scratch;
 
     // Exhaust common cherries before branching.
@@ -3784,61 +4147,144 @@ ThreeApproxResult run_three_approx(
         auto cherries = cherries_by_label(t1);
         if (cherries.empty()) break;
 
-        bool did_common_contract = false;
-        rng = mix64(rng + 0x9e3779b97f4a7c15ULL);
-        size_t start_idx = cherries.empty() ? 0 : static_cast<size_t>(rng % cherries.size());
-        for (size_t step = 0; step < cherries.size(); ++step) {
-            auto [a, b] = cherries[(start_idx + step) % cherries.size()];
+        int common_idx = -1;
+        bool deadline_near = false;
+        size_t common_start = static_cast<size_t>(
+            deterministic_pair_key(
+                tie_salt,
+                decision_step,
+                static_cast<int>(cherries.size()),
+                n,
+                1
+            ) % cherries.size()
+        );
+        for (size_t offset = 0; offset < cherries.size(); ++offset) {
+            if ((offset & 511ULL) == 0ULL &&
+                (g_terminate || Clock::now() + std::chrono::milliseconds(2) >= deadline)) {
+                deadline_near = true;
+                break;
+            }
+            size_t i = (common_start + offset) % cherries.size();
+            auto [a, b] = cherries[i];
             if (are_siblings_by_label(f, a, b)) {
-                int nl = next_label++;
-                if (contract_cherry(t1, a, b, nl) && contract_cherry(f, a, b, nl)) {
-                    did_common_contract = true;
-                    break;
-                }
+                common_idx = static_cast<int>(i);
+                break;
             }
         }
-        if (did_common_contract) continue;
+        if (deadline_near) break;
+
+        if (common_idx != -1) {
+            auto [a, b] = cherries[static_cast<size_t>(common_idx)];
+            int nl = next_label++;
+            if (contract_cherry(t1, a, b, nl) && contract_cherry(f, a, b, nl)) {
+                continue;
+            }
+        }
 
         size_t chosen_idx = 0;
-        if (medium_mode || elite_comp_map || discrepancy_choices) {
+        uint64_t step_key = decision_step++;
+
+        {
             auto f_mass = compute_active_leaf_masses(f);
+
             struct RankedCherry {
                 double score = -std::numeric_limits<double>::infinity();
                 size_t idx = 0;
+                int a = -1;
+                int b = -1;
+                uint64_t tie = 0;
             };
+
             std::vector<RankedCherry> ranked;
-            ranked.reserve(cherries.size());
-            for (size_t i = 0; i < cherries.size(); ++i) {
+            std::vector<size_t> candidate_indices;
+            if (cherry_sample_cap > 0 &&
+                cherries.size() > static_cast<size_t>(cherry_sample_cap)) {
+                candidate_indices.reserve(static_cast<size_t>(cherry_sample_cap));
+                uint64_t start_seed = deterministic_pair_key(
+                    tie_salt,
+                    step_key,
+                    static_cast<int>(cherries.size()),
+                    n,
+                    2
+                );
+                size_t start = static_cast<size_t>(start_seed % cherries.size());
+                size_t stride = static_cast<size_t>((mix64(start_seed ^ 0xd1b54a32d192ed03ULL) % cherries.size()) | 1ULL);
+                for (size_t attempts = 0;
+                     candidate_indices.size() < static_cast<size_t>(cherry_sample_cap) &&
+                     attempts < cherries.size() + static_cast<size_t>(cherry_sample_cap) * 4ULL;
+                     ++attempts) {
+                    size_t idx = (start + attempts * stride) % cherries.size();
+                    if (std::find(candidate_indices.begin(), candidate_indices.end(), idx) == candidate_indices.end()) {
+                        candidate_indices.push_back(idx);
+                    }
+                }
+                for (size_t idx = start;
+                     candidate_indices.size() < static_cast<size_t>(cherry_sample_cap) &&
+                     candidate_indices.size() < cherries.size();
+                     idx = (idx + 1) % cherries.size()) {
+                    if (std::find(candidate_indices.begin(), candidate_indices.end(), idx) == candidate_indices.end()) {
+                        candidate_indices.push_back(idx);
+                    }
+                }
+            } else {
+                candidate_indices.resize(cherries.size());
+                std::iota(candidate_indices.begin(), candidate_indices.end(), 0);
+            }
+
+            ranked.reserve(candidate_indices.size());
+
+            for (size_t k = 0; k < candidate_indices.size(); ++k) {
+                if ((k & 63ULL) == 0ULL &&
+                    (g_terminate || Clock::now() + std::chrono::milliseconds(2) >= deadline)) {
+                    deadline_near = true;
+                    break;
+                }
+                size_t i = candidate_indices[k];
                 auto [ca, cb] = cherries[i];
+
                 auto cand = build_cherry_candidate(t1, f, f_mass, ca, cb, n, &path_scratch);
-                double score = cand.score;
+                double score = score_cherry_candidate_policy(cand, n, policy);
+
                 if (elite_comp_map && elite_comp_map->size() > static_cast<size_t>(n)) {
                     int ida = (*elite_comp_map)[static_cast<size_t>(ca)];
                     int idb = (*elite_comp_map)[static_cast<size_t>(cb)];
                     if (ida != 0 && ida == idb) score += elite_bonus;
                 }
-                ranked.push_back({score, i});
+
+                uint64_t tie = deterministic_pair_key(tie_salt, step_key, ca, cb, 3);
+                ranked.push_back({score, i, ca, cb, tie});
             }
-            std::sort(ranked.begin(), ranked.end(), [](const RankedCherry& a, const RankedCherry& b) {
-                if (a.score != b.score) return a.score > b.score;
-                return a.idx < b.idx;
+            if (deadline_near || ranked.empty()) break;
+
+            std::sort(ranked.begin(), ranked.end(), [](const RankedCherry& x, const RankedCherry& y) {
+                if (x.score != y.score) return x.score > y.score;
+                if (x.tie != y.tie) return x.tie < y.tie;
+                if (x.a != y.a) return x.a < y.a;
+                if (x.b != y.b) return x.b < y.b;
+                return x.idx < y.idx;
             });
-            size_t top_k = discrepancy_choices
-                ? std::min<size_t>(3, ranked.size())
-                : (medium_mode
-                    ? std::min<size_t>(4, ranked.size())
-                    : std::min<size_t>(elite_bonus >= 5.0 ? 2 : 3, ranked.size()));
+
+            size_t top_k = std::min<size_t>(4, ranked.size());
+
+            if (is_large_instance_size(n)) {
+                top_k = std::min<size_t>(3, ranked.size());
+            }
+
+            if (n > 1000) {
+                top_k = std::min<size_t>(2, ranked.size());
+            }
+
+            size_t rank_choice = 0;
+
             if (discrepancy_choices && discrepancy_step < discrepancy_choices->size()) {
                 int want = (*discrepancy_choices)[discrepancy_step++];
                 if (want < 0) want = 0;
-                chosen_idx = ranked[static_cast<size_t>(std::min<int>(want, static_cast<int>(top_k) - 1))].idx;
-            } else {
-                rng = mix64(rng + 0x517cc1b727220a95ULL);
-                chosen_idx = ranked[static_cast<size_t>(rng % top_k)].idx;
+                rank_choice = static_cast<size_t>(
+                    std::min<int>(want, static_cast<int>(top_k) - 1)
+                );
             }
-        } else {
-            rng = mix64(rng + 0x517cc1b727220a95ULL);
-            chosen_idx = static_cast<size_t>(rng % cherries.size());
+
+            chosen_idx = ranked[rank_choice].idx;
         }
         auto [a, b] = cherries[chosen_idx];
         int na = find_node_of_label(f, a);
@@ -3867,10 +4313,21 @@ ThreeApproxResult run_three_approx(
             } else if (mb > ma) {
                 cut_edge_above(f, nb);
             } else {
-                rng = mix64(rng + 0x94d049bb133111ebULL);
-                if ((rng & 1ULL) == 0ULL) cut_edge_above(f, na);
-                else cut_edge_above(f, nb);
+                auto f_mass = compute_active_leaf_masses(f);
+
+                int mass_a = (ra >= 0 && ra < static_cast<int>(f_mass.size())) ? f_mass[ra] : 1;
+                int mass_b = (rb >= 0 && rb < static_cast<int>(f_mass.size())) ? f_mass[rb] : 1;
+
+                if (mass_a != mass_b) {
+                    if (mass_a <= mass_b) cut_edge_above(f, na);
+                    else cut_edge_above(f, nb);
+                } else {
+                    uint64_t ha = deterministic_pair_key(tie_salt, step_key, a, b, 4);
+                    if ((ha & 1ULL) == 0ULL) cut_edge_above(f, na);
+                    else cut_edge_above(f, nb);
+                }
             }
+
             continue;
         }
 
@@ -3883,7 +4340,7 @@ ThreeApproxResult run_three_approx(
 
             if (use_expensive_same_component_plan(n, path, pendants)) {
                 auto cand = build_cherry_candidate(t1, f, f_mass, a, b, n, &path_scratch);
-                auto plan = choose_cut_plan(t1, f, cand, next_label, rng, n, f_mass);
+                auto plan = choose_cut_plan(t1, f, cand, next_label, n, f_mass, policy, tie_salt ^ step_key);
 
                 int max_plan_cuts = is_medium_instance_size(n) ? 5 : 4;
 
@@ -4056,72 +4513,50 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     }
     std::vector<EliteSolution> elite_pool;
     int elite_limit = elite_pool_limit_for_size(reduced_n);
-    uint64_t iter = 0;
+    auto configs = deterministic_configs_for_size(reduced_n);
+
     if (!best_reduced.empty() &&
         static_cast<int>(best_reduced.size()) < reduced_n) {
         maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
     }
-    static const std::array<std::vector<int>, 6> discrepancy_scripts = {{
-        {1},
-        {2},
-        {1, 1},
-        {1, 2},
-        {2, 1},
-        {3}
-    }};
-    while (!g_terminate && Clock::now() < soft_deadline) {
-        // if (!final_polish_done &&
-        //     phase >= 0.85 &&
-        //     best_reduced_components <= best_components &&
-        //     Clock::now() + std::chrono::milliseconds(15) < soft_deadline) {
-        //     if (run_final_polishing_portfolio(
-        //             reduced,
-        //             dt1_base,
-        //             dt2_base,
-        //             best_reduced,
-        //             best_reduced_components,
-        //             elite_pool,
-        //             elite_limit,
-        //             soft_deadline,
-        //             mix64(base_seed ^ 0x1234fedcba987654ULL)) &&
-        //         best_reduced_components < best_components) {
-        //         auto polished_expanded = expand_reduced_components(best_reduced, reduced.expansion);
-        //         auto polished_out = forest_from_partition(polished_expanded, n, original_t1);
-        //         if (!polished_out.empty() && static_cast<int>(polished_out.size()) < best_components) {
-        //             best_out = polished_out;
-        //             best_components = static_cast<int>(best_out.size());
-        //             publish_best_solution(best_out);
-        //         }
-        //     }
-        //     final_polish_done = true;
-        //     continue;
-        // }
-        uint64_t seed = mix64(base_seed ^ iter);
-        const std::vector<int>* elite_comp_map = nullptr;
-        double elite_bonus = 0.0;
-        configure_elite_guidance(elite_pool, iter, start, soft_deadline, elite_comp_map, elite_bonus);
-        bool swapped = should_use_swapped_orientation(iter, reduced_n);
 
-        const std::vector<int>* discrepancy = nullptr;
-        if (reduced_n <= 600 && (iter % 16ULL == 7ULL)) {
-            discrepancy = &discrepancy_scripts[
-                static_cast<size_t>((iter / 16ULL) % discrepancy_scripts.size())
-            ];
+    for (const auto& cfg : configs) {
+        if (g_terminate || Clock::now() + std::chrono::milliseconds(10) >= soft_deadline) {
+            break;
         }
 
+        const std::vector<int>* elite_comp_map = nullptr;
+        double elite_bonus = 0.0;
+
+        if (cfg.elite_guided && !elite_pool.empty()) {
+            elite_comp_map = &elite_pool.front().comp_of_leaf;
+            elite_bonus = 5.0;
+        }
+
+        const std::vector<int>* discrepancy =
+            cfg.discrepancy.empty() ? nullptr : &cfg.discrepancy;
+
+        auto cfg_start = Clock::now();
+        auto cfg_deadline = deterministic_config_deadline(cfg, soft_deadline);
         auto res = run_three_approx(
-            swapped ? dt2_base : dt1_base,
-            swapped ? dt1_base : dt2_base,
-            soft_deadline,
+            cfg.swapped ? dt2_base : dt1_base,
+            cfg.swapped ? dt1_base : dt2_base,
+            cfg_deadline,
             reduced_n,
             best_components,
-            seed,
+            cfg.policy,
             elite_comp_map,
             elite_bonus,
-            discrepancy
+            discrepancy,
+            cfg.tie_salt,
+            cfg.cherry_sample_cap
         );
-        if (!res.complete || res.comps.empty()) {
-            ++iter;
+        long long cfg_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - cfg_start
+        ).count();
+
+        if (res.comps.empty()) {
+            emit_deterministic_profile("main", cfg, reduced_n, res.complete, -1, false, false, cfg_ms);
             continue;
         }
 
@@ -4129,6 +4564,8 @@ std::vector<std::string> solve(const PaceInstance& inst) {
         normalize_partition(candidate_reduced);
 
         int cand_components = static_cast<int>(candidate_reduced.size());
+        bool accepted = false;
+        bool improved = false;
 
         bool checked_valid = false;
         bool candidate_valid = false;
@@ -4148,28 +4585,27 @@ std::vector<std::string> solve(const PaceInstance& inst) {
 
         int elite_reference = std::min(best_components, best_reduced_components);
 
-        // Only store as best_reduced if valid.
         if (cand_components < best_reduced_components) {
             if (ensure_candidate_valid()) {
                 best_reduced = candidate_reduced;
                 best_reduced_components = cand_components;
+                accepted = true;
             } else {
-                ++iter;
+                emit_deterministic_profile("main", cfg, reduced_n, res.complete, cand_components, false, false, cfg_ms);
                 continue;
             }
         }
 
-        // Only validate near-elite candidates before adding them to elite pool.
         if (cand_components <= elite_reference + 2) {
             if (ensure_candidate_valid()) {
                 maybe_add_elite_solution(elite_pool, candidate_reduced, reduced_n, elite_limit);
+                accepted = true;
             }
         }
 
-        // Full output construction only if it can improve the published incumbent.
         if (cand_components < best_components) {
             if (!ensure_candidate_valid()) {
-                ++iter;
+                emit_deterministic_profile("main", cfg, reduced_n, res.complete, cand_components, false, false, cfg_ms);
                 continue;
             }
 
@@ -4181,6 +4617,8 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                 best_components = static_cast<int>(out.size());
                 best_reduced = std::move(candidate_reduced);
                 best_reduced_components = static_cast<int>(best_reduced.size());
+                accepted = true;
+                improved = true;
 
                 if (run_exact_repair_portfolio(
                         reduced,
@@ -4209,7 +4647,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                 publish_best_solution(best_out);
             }
         }
-        ++iter;
+        emit_deterministic_profile("main", cfg, reduced_n, res.complete, cand_components, accepted, improved, cfg_ms);
     }
     if (!g_terminate &&
         best_reduced_components < reduced_n &&
