@@ -2639,6 +2639,21 @@ ExactKernelResult maybe_solve_exact_kernel(
     stats.reduced_n = reduced_n;
     stats.incumbent_before = heuristic_components;
     stats.incumbent_after = heuristic_components;
+
+    int threshold = 24;
+    if (reduced_n <= 20) {
+        threshold = reduced_n;
+    } else if (reduced_n <= 28) {
+        threshold = std::min(reduced_n, 28);
+    } else if (reduced_n <= 32 && heuristic_components <= 16) {
+        threshold = std::min(reduced_n, 32);
+    } else if (reduced_n <= 36 && heuristic_components <= 12) {
+        threshold = std::min(reduced_n, 32);
+    } else if (reduced_n <= 40 && heuristic_components <= 10) {
+        threshold = 32;
+    }
+    stats.threshold = std::min(threshold, reduced_n);
+
     if (reduced_n > stats.threshold) {
         emit_exact_profile(phase, stats);
         return {};
@@ -2647,7 +2662,7 @@ ExactKernelResult maybe_solve_exact_kernel(
         emit_exact_profile(phase, stats);
         return {};
     }
-    if (heuristic_components - 1 > 18) {
+    if (heuristic_components - 1 > stats.threshold + 4) {
         emit_exact_profile(phase, stats);
         return {};
     }
@@ -2991,7 +3006,11 @@ LocalExactSearchPlan plan_local_exact_search(
     }
 
     if (reduced_n <= 24) {
-        plan.budget += std::chrono::milliseconds(final_phase ? 40 : 20);
+        plan.threshold = reduced_n;
+        plan.budget += std::chrono::milliseconds(final_phase ? 50 : 30);
+    } else if (reduced_n <= 32 && incumbent <= 5) {
+        plan.threshold = std::min(plan.threshold + 2, reduced_n);
+        plan.budget += std::chrono::milliseconds(final_phase ? 20 : 10);
     } else if (reduced_n >= 40) {
         plan.budget -= std::chrono::milliseconds(10);
     }
@@ -3013,7 +3032,10 @@ LocalExactSearchPlan plan_polish_exact_search(
     LocalExactSearchPlan plan;
     int incumbent = std::max(1, incumbent_components);
 
-    if (incumbent <= 6) {
+    if (reduced_n <= 24) {
+        plan.threshold = reduced_n;
+        plan.budget = std::chrono::milliseconds(1200);
+    } else if (incumbent <= 6) {
         plan.threshold = 40;
         plan.budget = std::chrono::milliseconds(900);
     } else if (incumbent <= 8) {
@@ -3028,6 +3050,11 @@ LocalExactSearchPlan plan_polish_exact_search(
     } else {
         plan.threshold = 24;
         plan.budget = std::chrono::milliseconds(180);
+    }
+
+    if (reduced_n <= 32 && incumbent <= 5) {
+        plan.threshold = std::min(plan.threshold, reduced_n);
+        plan.budget = std::chrono::milliseconds(std::max<long long>(plan.budget.count(), 850));
     }
 
     plan.threshold = std::min(plan.threshold, reduced_n);
@@ -3762,6 +3789,8 @@ std::vector<DeterministicRunConfig> deterministic_configs_for_size(int n) {
         add_deterministic_config(configs, seen, true,  GreedyPolicy::Balanced, {}, false);
         add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, {}, false);
         add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, {}, false);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {}, false);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::AggressiveMultiCut, {}, false);
         add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {1}, false);
         add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {2}, false);
         add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, {1}, false);
