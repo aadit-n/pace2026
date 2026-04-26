@@ -91,6 +91,8 @@ struct DynNode {
 
 struct DynamicTree {
     int root = -1;
+    int active_leaf_count = 0;
+    int root_component_count = 1;
     std::vector<DynNode> nodes;
     std::vector<PayloadNode> payloads;
     std::vector<int> label_to_node; // active pseudo-label -> node, -1 if inactive
@@ -102,6 +104,8 @@ struct DynamicTree {
 struct UndoLog {
     enum class Kind {
         Root,
+        ActiveLeafCount,
+        RootComponentCount,
         NodeParent,
         NodeLeft,
         NodeRight,
@@ -140,6 +144,12 @@ struct UndoLog {
                     break;
                 case Kind::NodeParent:
                     e.tree->nodes[e.index].parent = e.old_value;
+                    break;
+                case Kind::ActiveLeafCount:
+                    e.tree->active_leaf_count = e.old_value;
+                    break;
+                case Kind::RootComponentCount:
+                    e.tree->root_component_count = e.old_value;
                     break;
                 case Kind::NodeLeft:
                     e.tree->nodes[e.index].left = e.old_value;
@@ -527,6 +537,15 @@ std::string join_ints_key(const std::vector<int>& vals) {
     return s;
 }
 
+uint64_t hash_int_vector(const std::vector<int>& vals) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (int x : vals) {
+        h ^= mix64(static_cast<uint64_t>(static_cast<uint32_t>(x + 1)));
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
 SimpleNodeInfo compute_simple_info_dfs(
     const SimpleTree& st,
     int u,
@@ -620,8 +639,6 @@ bool reduce_common_rooted_chains_once(
 
     struct Candidate {
         std::string key;
-        int u1 = -1;
-        int u2 = -1;
         int size = 0;
         std::vector<int> ordered_leaves;
     };
@@ -645,7 +662,7 @@ bool reduce_common_rooted_chains_once(
         auto it = map2.find(kv.first);
         if (it == map2.end()) continue;
         const auto& leaves = chain1[static_cast<size_t>(kv.second)].ordered_leaves;
-        candidates.push_back({kv.first, kv.second, it->second, static_cast<int>(leaves.size()), leaves});
+        candidates.push_back({kv.first, static_cast<int>(leaves.size()), leaves});
     }
     if (candidates.empty()) return false;
 
@@ -731,18 +748,19 @@ bool reduce_common_subtrees_once(
 
     struct Candidate {
         std::string key;
-        int u1 = -1;
-        int u2 = -1;
         int size = 0;
         std::vector<int> leaves;
     };
+
     std::vector<Candidate> candidates;
     candidates.reserve(std::min(map1.size(), map2.size()));
+
     for (const auto& kv : map1) {
         auto it = map2.find(kv.first);
         if (it == map2.end()) continue;
+
         const auto& inf = info1[static_cast<size_t>(kv.second)];
-        candidates.push_back({kv.first, kv.second, it->second, static_cast<int>(inf.leaves.size()), inf.leaves});
+        candidates.push_back({kv.first, static_cast<int>(inf.leaves.size()), inf.leaves});
     }
     if (candidates.empty()) return false;
 
@@ -935,7 +953,8 @@ bool find_common_cluster(
     cluster_labels.clear();
     if (t1.children.empty() || t2.children.empty()) return false;
     int n = static_cast<int>(simple_tree_leaf_labels(t1).size());
-    if (n < 6) return false;
+    if (n < 4) return false;
+    int min_cluster = (n > 1000 ? 2 : 3);
 
     std::vector<SimpleNodeInfo> info1(t1.children.size());
     std::vector<SimpleNodeInfo> info2(t2.children.size());
@@ -945,22 +964,25 @@ bool find_common_cluster(
     std::unordered_set<std::string> clusters2;
     for (int u = 0; u < static_cast<int>(t2.children.size()); ++u) {
         const auto& leaves = info2[static_cast<size_t>(u)].leaves;
-        if (static_cast<int>(leaves.size()) >= 3 && static_cast<int>(leaves.size()) <= n - 3) {
+        if (static_cast<int>(leaves.size()) >= min_cluster &&
+            static_cast<int>(leaves.size()) <= n - min_cluster) {
             clusters2.insert(join_ints_key(leaves));
         }
     }
 
-    int best_balance = std::numeric_limits<int>::max();
+    double best_score = -1e100;
     int best_size = -1;
     for (int u = 0; u < static_cast<int>(t1.children.size()); ++u) {
         const auto& leaves = info1[static_cast<size_t>(u)].leaves;
         int sz = static_cast<int>(leaves.size());
-        if (sz < 3 || sz > n - 3) continue;
+        if (sz < min_cluster || sz > n - min_cluster) continue;
         std::string key = join_ints_key(leaves);
         if (!clusters2.count(key)) continue;
-        int balance = std::abs(n - 2 * sz);
-        if (balance < best_balance || (balance == best_balance && sz > best_size)) {
-            best_balance = balance;
+        double score = static_cast<double>(std::min(sz, n - sz))
+                    - 0.15 * static_cast<double>(std::abs(n - 2 * sz));
+
+        if (score > best_score || (score == best_score && sz > best_size)) {
+            best_score = score;
             best_size = sz;
             cluster_labels = leaves;
         }
@@ -1094,6 +1116,7 @@ DynamicTree build_dynamic_tree(const SimpleTree& st) {
 
         if (st.children[u].empty()) {
             dn.label = st.leaf_label[u];
+            ++dt.active_leaf_count;
             dn.payload_id = push_payload(dt, PayloadNode{-1, -1, st.leaf_label[u]});
             dn.payload_size = 1;
             dt.label_to_node[static_cast<size_t>(dn.label)] = static_cast<int>(u);
@@ -1115,6 +1138,7 @@ DynamicTree build_dynamic_tree(const SimpleTree& st) {
             dt.cherry_nodes.push_back(u);
         }
     }
+    dt.root_component_count = 1;
     return dt;
 }
 
@@ -1204,12 +1228,6 @@ void set_cherry_node_slot(DynamicTree& t, int idx, int value, UndoLog* log = nul
 void push_node(DynamicTree& t, DynNode node, UndoLog* log = nullptr) {
     push_undo(log, UndoLog::Kind::NodesSize, &t, -1, static_cast<int>(t.nodes.size()));
     t.nodes.push_back(std::move(node));
-}
-
-void resize_nodes(DynamicTree& t, size_t new_size, UndoLog* log = nullptr) {
-    if (t.nodes.size() == new_size) return;
-    push_undo(log, UndoLog::Kind::NodesSize, &t, -1, static_cast<int>(t.nodes.size()));
-    t.nodes.resize(new_size);
 }
 
 void push_cherry_node(DynamicTree& t, int value, UndoLog* log = nullptr) {
@@ -1322,8 +1340,14 @@ void suppress_up(DynamicTree& t, int u, UndoLog* log = nullptr) {
 void cut_edge_above(DynamicTree& t, int child, UndoLog* log = nullptr) {
     if (child < 0 || child >= static_cast<int>(t.nodes.size())) return;
     if (!t.nodes[child].active) return;
+
     int p = t.nodes[child].parent;
     if (p == -1) return;
+
+    // Cutting one edge creates one additional forest component.
+    push_undo(log, UndoLog::Kind::RootComponentCount, &t, -1, t.root_component_count);
+    ++t.root_component_count;
+
     remove_cherry_node(t, p, log);
     replace_child(t, p, child, -1, log);
     set_node_parent(t, child, -1, log);
@@ -1385,6 +1409,11 @@ bool contract_cherry(DynamicTree& t, int la, int lb, int new_label, UndoLog* log
     remove_cherry_node(t, p, log);
     remove_cherry_node(t, a, log);
     remove_cherry_node(t, b, log);
+
+    // Two active leaves become one active leaf.
+    push_undo(log, UndoLog::Kind::ActiveLeafCount, &t, -1, t.active_leaf_count);
+    --t.active_leaf_count;
+
     set_node_active(t, a, false, log);
     set_node_active(t, b, false, log);
     set_node_parent(t, a, -1, log);
@@ -1410,6 +1439,27 @@ std::vector<std::pair<int, int>> cherries_by_label(const DynamicTree& t) {
         out.push_back({a, b});
     }
     return out;
+}
+
+void fill_cherries_by_label(const DynamicTree& t, std::vector<std::pair<int, int>>& out) {
+    out.clear();
+    out.reserve(t.cherry_nodes.size());
+
+    for (int u : t.cherry_nodes) {
+        if (u < 0 || u >= static_cast<int>(t.nodes.size())) continue;
+        if (!t.nodes[u].active) continue;
+
+        int l = t.nodes[u].left;
+        int r = t.nodes[u].right;
+
+        if (!is_active_leaf(t, l) || !is_active_leaf(t, r)) continue;
+
+        int a = t.nodes[l].label;
+        int b = t.nodes[r].label;
+
+        if (a > b) std::swap(a, b);
+        out.push_back({a, b});
+    }
 }
 
 template <typename Fn>
@@ -1449,24 +1499,11 @@ bool contract_one_common_cherry(
 
         if (!are_siblings_by_label(t2, a, b)) continue;
 
-        int nl = next_label;
-
-        if (!are_siblings_by_label(t1, a, b) ||
-            !are_siblings_by_label(t2, a, b)) {
-            continue;
-        }
-
-        ++next_label;
-
+        int nl = next_label++;
         bool ok1 = contract_cherry(t1, a, b, nl, log);
         bool ok2 = contract_cherry(t2, a, b, nl, log);
 
-        if (ok1 && ok2) {
-            return true;
-        }
-
-        // Defensive fallback. This should almost never happen.
-        return false;
+        return ok1 && ok2;
     }
 
     return false;
@@ -1575,6 +1612,28 @@ std::vector<int> pendant_children_on_path(const DynamicTree& t, const std::vecto
         if (r != -1 && t.nodes[r].active && r != prev && r != next) out.push_back(r);
     }
     return out;
+}
+
+void fill_pendant_children_on_path(
+    const DynamicTree& t,
+    const std::vector<int>& path,
+    std::vector<int>& out
+) {
+    out.clear();
+
+    if (path.size() < 3) return;
+
+    for (size_t i = 1; i + 1 < path.size(); ++i) {
+        int u = path[i];
+        int prev = path[i - 1];
+        int next = path[i + 1];
+
+        int l = t.nodes[u].left;
+        int r = t.nodes[u].right;
+
+        if (l != -1 && t.nodes[l].active && l != prev && l != next) out.push_back(l);
+        if (r != -1 && t.nodes[r].active && r != prev && r != next) out.push_back(r);
+    }
 }
 
 int count_common_cherries(const DynamicTree& t1, const DynamicTree& f) {
@@ -1836,6 +1895,12 @@ uint64_t deterministic_pair_key(
     );
 }
 
+uint64_t cherry_pair_key(int a, int b) {
+    if (a > b) std::swap(a, b);
+    return (static_cast<uint64_t>(static_cast<uint32_t>(a)) << 32)
+         | static_cast<uint32_t>(b);
+}   
+
 uint64_t deterministic_plan_key(uint64_t salt, const std::vector<int>& plan) {
     uint64_t h = salt ^ (static_cast<uint64_t>(plan.size()) * 0x94d049bb133111ebULL);
     for (int x : plan) {
@@ -1901,6 +1966,23 @@ struct CherryCandidate {
     std::vector<int> pendants;
 };
 
+struct LightCherryCandidate {
+    int a = -1;
+    int b = -1;
+    int na = -1;
+    int nb = -1;
+    int ra = -1;
+    int rb = -1;
+    bool common = false;
+    bool same_component = false;
+    int distance = 0;
+    int pendant_count = 0;
+    int conflict_mass = 0;
+    int component_size = 0;
+    int immediate_gain = 0;
+    double score = -std::numeric_limits<double>::infinity();
+};
+
 double score_cherry_candidate_normalized(const CherryCandidate& cand, int total_leaves) {
     if (total_leaves <= 0) total_leaves = 1;
     double inv = 1.0 / static_cast<double>(total_leaves);
@@ -1934,25 +2016,33 @@ double score_cherry_candidate_policy(
 
     switch (policy) {
         case GreedyPolicy::PreferDifferentComponent:
-            if (!cand.same_component) s += 5.0;   // keep original bonus
+            if (!cand.same_component) s += 5.0;
             break;
+
         case GreedyPolicy::PreferLowConflictMass:
-            s -= 0.3;   // since mass is now normalised, adjust bonus
+            s -= 8.0 * (cand.conflict_mass / static_cast<double>(total_leaves > 0 ? total_leaves : 1));
             break;
+
         case GreedyPolicy::PreferFewPendants:
-            s -= 2.0 * (cand.pendant_count / static_cast<double>(total_leaves > 0 ? total_leaves : 1));
+            s -= 4.0 * (cand.pendant_count / static_cast<double>(total_leaves > 0 ? total_leaves : 1));
             break;
+
         case GreedyPolicy::PreferImmediateGain:
             s += 4.0 * static_cast<double>(cand.immediate_gain);
             break;
+
         case GreedyPolicy::ConservativeSingleCut:
-            s -= 1.5 * (cand.pendant_count / static_cast<double>(total_leaves > 0 ? total_leaves : 1));
-            s -= 0.015;   // conflict mass penalty
+            s -= 4.0 * (cand.pendant_count / static_cast<double>(total_leaves > 0 ? total_leaves : 1));
+            s -= 6.0 * (cand.conflict_mass / static_cast<double>(total_leaves > 0 ? total_leaves : 1));
+            if (cand.pendant_count <= 1) s += 2.0;
             break;
+
         case GreedyPolicy::AggressiveMultiCut:
             s += 3.0 * static_cast<double>(cand.immediate_gain);
+            if (cand.pendant_count >= 2) s += 1.5;
             break;
-        default: // Balanced – no extra bonus
+
+        default:
             break;
     }
     return s;
@@ -1992,7 +2082,7 @@ CherryCandidate build_cherry_candidate(
         cand.path.assign(path_ref.begin(), path_ref.end());
 
         cand.distance = cand.path.empty() ? 0 : static_cast<int>(cand.path.size()) - 1;
-        cand.pendants = pendant_children_on_path(f, cand.path);
+        fill_pendant_children_on_path(f, cand.path, cand.pendants);
         cand.pendant_count = static_cast<int>(cand.pendants.size());
         for (int u : cand.pendants) {
             if (u >= 0 && u < static_cast<int>(f_mass.size())) cand.conflict_mass += f_mass[u];
@@ -2024,10 +2114,10 @@ double evaluate_reduced_state(
 ) {
     auto f_mass = compute_active_leaf_masses(f);
     PathScratch path_scratch;
-    int comp_count = count_root_components(f);
+    int comp_count = f.root_component_count;
     int sampled_pendants = 0;
     int sampled_conflict_mass = 0;
-    int active_leaves = active_leaf_count(t1);
+    int active_leaves = t1.active_leaf_count;
 
     int cherry_count = 0;
     int sampled = 0;
@@ -2218,59 +2308,6 @@ struct ThreeApproxResult {
     bool complete = false;
 };
 
-std::string serialize_payload_canon(
-    const DynamicTree& t,
-    int payload_id,
-    std::vector<std::string>& cache
-) {
-    if (payload_id < 0 || payload_id >= static_cast<int>(t.payloads.size())) return {};
-    if (!cache[static_cast<size_t>(payload_id)].empty()) return cache[static_cast<size_t>(payload_id)];
-    const auto& p = t.payloads[static_cast<size_t>(payload_id)];
-    if (p.leaf_label != -1) {
-        cache[static_cast<size_t>(payload_id)] = "L" + std::to_string(p.leaf_label);
-        return cache[static_cast<size_t>(payload_id)];
-    }
-    std::string a = serialize_payload_canon(t, p.left, cache);
-    std::string b = serialize_payload_canon(t, p.right, cache);
-    if (a > b) std::swap(a, b);
-    cache[static_cast<size_t>(payload_id)] = "(" + a + "," + b + ")";
-    return cache[static_cast<size_t>(payload_id)];
-}
-
-std::string serialize_active_node_canon(
-    const DynamicTree& t,
-    int u,
-    std::vector<std::string>& payload_cache
-) {
-    if (u == -1 || !t.nodes[u].active) return {};
-    if (t.nodes[u].left == -1 && t.nodes[u].right == -1) {
-        return serialize_payload_canon(t, t.nodes[u].payload_id, payload_cache);
-    }
-    std::string a = serialize_active_node_canon(t, t.nodes[u].left, payload_cache);
-    std::string b = serialize_active_node_canon(t, t.nodes[u].right, payload_cache);
-    if (a.empty()) return b;
-    if (b.empty()) return a;
-    if (a > b) std::swap(a, b);
-    return "(" + a + "," + b + ")";
-}
-
-std::string serialize_active_forest_canon(const DynamicTree& t) {
-    std::vector<std::string> payload_cache(t.payloads.size());
-    std::vector<std::string> roots;
-    roots.reserve(count_root_components(t));
-    for (int u = 0; u < static_cast<int>(t.nodes.size()); ++u) {
-        if (!t.nodes[u].active || t.nodes[u].parent != -1) continue;
-        roots.push_back(serialize_active_node_canon(t, u, payload_cache));
-    }
-    std::sort(roots.begin(), roots.end());
-    std::string out;
-    for (const auto& s : roots) {
-        out += s;
-        out.push_back('|');
-    }
-    return out;
-}
-
 struct CanonHash {
     uint64_t a = 0;
     uint64_t b = 0;
@@ -2390,8 +2427,8 @@ ExactStateKey exact_state_key(const DynamicTree& t1, const DynamicTree& f) {
     ExactStateKey key;
     key.t1_hash = hash_active_forest_canon(t1);
     key.f_hash = hash_active_forest_canon(f);
-    key.active_leaves = active_leaf_count(t1);
-    key.forest_components = count_root_components(f);
+    key.active_leaves = t1.active_leaf_count;
+    key.forest_components = f.root_component_count;
     return key;
 }
 
@@ -2456,13 +2493,14 @@ void collect_current_components(const DynamicTree& f, std::vector<std::vector<in
 }
 
 void exact_kernel_dfs(
-    DynamicTree t1,
-    DynamicTree f,
-    int next_label,
+    DynamicTree& t1,
+    DynamicTree& f,
+    int& next_label,
     Clock::time_point deadline,
     int& best_components,
     std::vector<std::vector<int>>& best_comps,
     std::unordered_map<ExactStateKey, int, ExactStateKeyHash>& memo,
+    UndoLog& undo,
     ExactSearchStats* stats = nullptr
 ) {
     PathScratch path_scratch;
@@ -2473,7 +2511,7 @@ void exact_kernel_dfs(
     }
 
     contract_all_common_cherries(t1, f, next_label);
-    int current_components = count_root_components(f);
+    int current_components = f.root_component_count;
     if (current_components >= best_components) {
         if (stats) ++stats->bound_prunes;
         return;
@@ -2496,7 +2534,7 @@ void exact_kernel_dfs(
     memo[key] = current_components;
 
     auto cherries = cherries_by_label(t1);
-    if (cherries.empty() || active_leaf_count(t1) <= 2) {
+    if (cherries.empty() || t1.active_leaf_count <= 2) {
         best_components = current_components;
         collect_current_components(f, best_comps);
         return;
@@ -2506,7 +2544,7 @@ void exact_kernel_dfs(
     CherryCandidate best_cand;
     bool have = false;
     for (auto [a, b] : cherries) {
-        auto cand = build_cherry_candidate(t1, f, f_mass, a, b, active_leaf_count(t1), &path_scratch);
+        auto cand = build_cherry_candidate(t1, f, f_mass, a, b, t1.active_leaf_count, &path_scratch);
         if (!have || cand.score > best_cand.score) {
             best_cand = std::move(cand);
             have = true;
@@ -2538,7 +2576,7 @@ void exact_kernel_dfs(
         int nl = next_label;
         apply_cut_plan(f, plans[static_cast<size_t>(i)], &undo);
         contract_all_common_cherries(t1, f, nl, &undo);
-        double val = evaluate_reduced_state(t1, f, active_leaf_count(t1)) - 0.05 * static_cast<double>(plans[static_cast<size_t>(i)].size());
+        double val = evaluate_reduced_state(t1, f, t1.active_leaf_count) - 0.05 * static_cast<double>(plans[static_cast<size_t>(i)].size());
         undo.undo_to(mark);
         ranked.push_back({-val, i});
     }
@@ -2546,9 +2584,14 @@ void exact_kernel_dfs(
 
     for (const auto& rank : ranked) {
         const auto& plan = plans[static_cast<size_t>(rank.second)];
-        DynamicTree nf = f;
-        apply_cut_plan(nf, plan);
-        exact_kernel_dfs(t1, nf, next_label, deadline, best_components, best_comps, memo, stats);
+        size_t mark = undo.mark();
+        int saved_next_label = next_label;
+
+        apply_cut_plan(f, plan, &undo);
+        exact_kernel_dfs(t1, f, next_label, deadline, best_components, best_comps, memo, undo, stats);
+
+        next_label = saved_next_label;
+        undo.undo_to(mark);
         if (g_terminate || Clock::now() >= deadline) return;
     }
 }
@@ -2587,17 +2630,24 @@ ExactKernelResult solve_exact_kernel_bounded(
     stats.triggered = true;
     auto exact_start = Clock::now();
     ExactSearchStats* stats_ptr = exact_profile_enabled() ? &stats : nullptr;
+
+    DynamicTree t1 = dt1_base;
+    DynamicTree f = dt2_base;
+    int next_label = reduced_n + 1;
+    UndoLog undo;
+
     exact_kernel_dfs(
-        dt1_base,
-        dt2_base,
-        reduced_n + 1,
+        t1,
+        f,
+        next_label,
         exact_deadline,
         best_components,
         best_comps,
         memo,
+        undo,
         stats_ptr
     );
-    stats.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        stats.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - exact_start
     ).count();
     stats.incumbent_after = best_components;
@@ -4178,6 +4228,24 @@ std::vector<std::vector<int>> solve_decomposed_candidate(
     return expand_reduced_components(reduced_comps, reduced.expansion);
 }
 
+double score_after_single_cut(
+    const DynamicTree& t1,
+    DynamicTree& f,
+    int cut_node,
+    int n,
+    UndoLog& undo
+) {
+    size_t mark = undo.mark();
+
+    cut_edge_above(f, cut_node, &undo);
+
+    double score = 4.0 * static_cast<double>(count_common_cherries(t1, f))
+                 - 1.0 * static_cast<double>(f.root_component_count);
+
+    undo.undo_to(mark);
+    return score;
+}
+
 ThreeApproxResult run_three_approx(
     DynamicTree t1,
     DynamicTree f,
@@ -4195,13 +4263,20 @@ ThreeApproxResult run_three_approx(
     bool timed_out_or_terminated = false;
     bool medium_mode = is_medium_instance_size(n);
     size_t discrepancy_step = 0;
-    uint64_t decision_step = 0;
+    uint64_t decision_step = 0; 
     PathScratch path_scratch;
+    std::vector<std::pair<int, int>> cherries;
+    cherries.reserve(static_cast<size_t>(n));
+
+    // Reusable scratch for O(1) duplicate checks while sampling cherry candidates.
+    // This avoids repeated std::find(candidate_indices.begin(), candidate_indices.end(), idx).
+    std::vector<int> sampled_seen;
+    int sampled_seen_stamp = 1;
 
     // Exhaust common cherries before branching.
     contract_all_common_cherries(t1, f, next_label);
 
-    while (!g_terminate && Clock::now() < deadline && active_leaf_count(t1) > 2) {
+    while (!g_terminate && Clock::now() < deadline && t1.active_leaf_count > 2) {
         // --- Step 1: remove singleton leaves in F that are roots ---
         // For each leaf in F that is a root, cut its corresponding edge in T1.
         for (int u = 0; u < static_cast<int>(f.nodes.size()); ++u) {
@@ -4218,11 +4293,11 @@ ThreeApproxResult run_three_approx(
         // Cuts never decrease the number of forest components, so once the
         // current forest cannot beat the incumbent we can abandon this restart.
         if (incumbent_components < std::numeric_limits<int>::max() &&
-            count_root_components(f) >= incumbent_components) {
+            f.root_component_count >= incumbent_components) {
             break;
         }
 
-        auto cherries = cherries_by_label(t1);
+        fill_cherries_by_label(t1, cherries);
         if (cherries.empty()) break;
 
         int common_idx = -1;
@@ -4275,35 +4350,67 @@ ThreeApproxResult run_three_approx(
 
             std::vector<RankedCherry> ranked;
             std::vector<size_t> candidate_indices;
+
             if (cherry_sample_cap > 0 &&
                 cherries.size() > static_cast<size_t>(cherry_sample_cap)) {
-                candidate_indices.reserve(static_cast<size_t>(cherry_sample_cap));
+
+                const size_t cap = static_cast<size_t>(cherry_sample_cap);
+                const size_t m = cherries.size();
+
+                candidate_indices.reserve(cap);
+
+                // Ensure sampled_seen is large enough for this decision step.
+                if (sampled_seen.size() < m) {
+                    sampled_seen.assign(m, 0);
+                    sampled_seen_stamp = 1;
+                }
+
+                // New stamp for this sampling round.
+                ++sampled_seen_stamp;
+                if (sampled_seen_stamp == std::numeric_limits<int>::max()) {
+                    std::fill(sampled_seen.begin(), sampled_seen.end(), 0);
+                    sampled_seen_stamp = 1;
+                }
+
+                auto add_candidate_index = [&](size_t idx) {
+                    if (sampled_seen[idx] == sampled_seen_stamp) return false;
+                    sampled_seen[idx] = sampled_seen_stamp;
+                    candidate_indices.push_back(idx);
+                    return true;
+                };
+
                 uint64_t start_seed = deterministic_pair_key(
                     tie_salt,
                     step_key,
-                    static_cast<int>(cherries.size()),
+                    static_cast<int>(m),
                     n,
                     2
                 );
-                size_t start = static_cast<size_t>(start_seed % cherries.size());
-                size_t stride = static_cast<size_t>((mix64(start_seed ^ 0xd1b54a32d192ed03ULL) % cherries.size()) | 1ULL);
+
+                size_t start = static_cast<size_t>(start_seed % m);
+
+                size_t stride = static_cast<size_t>(
+                    (mix64(start_seed ^ 0xd1b54a32d192ed03ULL) % m) | 1ULL
+                );
+
                 for (size_t attempts = 0;
-                     candidate_indices.size() < static_cast<size_t>(cherry_sample_cap) &&
-                     attempts < cherries.size() + static_cast<size_t>(cherry_sample_cap) * 4ULL;
-                     ++attempts) {
-                    size_t idx = (start + attempts * stride) % cherries.size();
-                    if (std::find(candidate_indices.begin(), candidate_indices.end(), idx) == candidate_indices.end()) {
-                        candidate_indices.push_back(idx);
-                    }
+                    candidate_indices.size() < cap &&
+                    attempts < m + cap * 4ULL;
+                    ++attempts) {
+
+                    size_t idx = (start + attempts * stride) % m;
+                    add_candidate_index(idx);
                 }
-                for (size_t idx = start;
-                     candidate_indices.size() < static_cast<size_t>(cherry_sample_cap) &&
-                     candidate_indices.size() < cherries.size();
-                     idx = (idx + 1) % cherries.size()) {
-                    if (std::find(candidate_indices.begin(), candidate_indices.end(), idx) == candidate_indices.end()) {
-                        candidate_indices.push_back(idx);
-                    }
+
+                // Fallback linear pass in case the strided walk did not collect enough unique indices.
+                for (size_t offset = 0;
+                    candidate_indices.size() < cap && offset < m;
+                    ++offset) {
+
+                    size_t idx = (start + offset) % m;
+                    add_candidate_index(idx);
                 }
+
             } else {
                 candidate_indices.resize(cherries.size());
                 std::iota(candidate_indices.begin(), candidate_indices.end(), 0);
@@ -4326,21 +4433,17 @@ ThreeApproxResult run_three_approx(
                 if (elite_comp_map && elite_comp_map->size() > static_cast<size_t>(n)) {
                     int ida = (*elite_comp_map)[static_cast<size_t>(ca)];
                     int idb = (*elite_comp_map)[static_cast<size_t>(cb)];
-                    if (ida != 0 && ida == idb) score += elite_bonus;
+
+                    if (ida != 0 && idb != 0) {
+                        if (ida == idb) score += elite_bonus;
+                        else score -= 0.5 * elite_bonus;
+                    }
                 }
 
                 uint64_t tie = deterministic_pair_key(tie_salt, step_key, ca, cb, 3);
                 ranked.push_back({score, i, ca, cb, tie});
             }
             if (deadline_near || ranked.empty()) break;
-
-            std::sort(ranked.begin(), ranked.end(), [](const RankedCherry& x, const RankedCherry& y) {
-                if (x.score != y.score) return x.score > y.score;
-                if (x.tie != y.tie) return x.tie < y.tie;
-                if (x.a != y.a) return x.a < y.a;
-                if (x.b != y.b) return x.b < y.b;
-                return x.idx < y.idx;
-            });
 
             size_t top_k = std::min<size_t>(4, ranked.size());
 
@@ -4351,6 +4454,21 @@ ThreeApproxResult run_three_approx(
             } else if (is_large_instance_size(n)) {
                 top_k = std::min<size_t>(4, ranked.size());
             }
+
+            auto ranked_better = [](const RankedCherry& x, const RankedCherry& y) {
+                if (x.score != y.score) return x.score > y.score;
+                if (x.tie != y.tie) return x.tie < y.tie;
+                if (x.a != y.a) return x.a < y.a;
+                if (x.b != y.b) return x.b < y.b;
+                return x.idx < y.idx;
+            };
+
+            std::partial_sort(
+                ranked.begin(),
+                ranked.begin() + static_cast<std::ptrdiff_t>(top_k),
+                ranked.end(),
+                ranked_better
+            );
 
             size_t rank_choice = 0;
 
@@ -4376,15 +4494,8 @@ ThreeApproxResult run_three_approx(
 
         if (ra != rb) {
             UndoLog undo;
-            size_t mark = undo.mark();
-            cut_edge_above(f, na, &undo);
-            double ma = medium_mode ? evaluate_reduced_state(t1, f, n) : static_cast<double>(count_common_cherries(t1, f));
-            undo.undo_to(mark);
-
-            mark = undo.mark();
-            cut_edge_above(f, nb, &undo);
-            double mb = medium_mode ? evaluate_reduced_state(t1, f, n) : static_cast<double>(count_common_cherries(t1, f));
-            undo.undo_to(mark);
+            double ma = score_after_single_cut(t1, f, na, n, undo);
+            double mb = score_after_single_cut(t1, f, nb, n, undo);
 
             if (ma > mb) {
                 cut_edge_above(f, na);
