@@ -3783,56 +3783,151 @@ std::vector<DeterministicRunConfig> deterministic_configs_for_size(int n) {
     std::vector<DeterministicRunConfig> configs;
     std::unordered_set<std::string> seen;
 
-    if (n > 1000) {
-        int fast_sample = n > 4000 ? 64 : 128;
-        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, false, fast_sample, n > 4000 ? 9000 : 3500);
-        add_deterministic_config(configs, seen, true,  GreedyPolicy::Balanced, {}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, {}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, {}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::AggressiveMultiCut, {}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {1}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {2}, false);
-        add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, {1}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true);
+    auto add_core_policy_set = [&](bool swapped, const std::vector<int>& script, bool elite) {
+        add_deterministic_config(configs, seen, swapped, GreedyPolicy::Balanced, script, elite);
+        add_deterministic_config(configs, seen, swapped, GreedyPolicy::PreferDifferentComponent, script, elite);
+        add_deterministic_config(configs, seen, swapped, GreedyPolicy::PreferLowConflictMass, script, elite);
+        add_deterministic_config(configs, seen, swapped, GreedyPolicy::PreferImmediateGain, script, elite);
+    };
+
+    /*
+        VERY LARGE INSTANCES:
+        We cannot afford a deep LDS portfolio. Instead, run multiple shallow,
+        sampled passes with different policies and different sample caps.
+
+        The idea:
+        - one fast first pass to get a publishable incumbent quickly
+        - several medium-budget passes with different cherry sampling
+        - a few swapped-tree and discrepancy variants
+        - avoid exhaustive scripts because n is too large
+    */
+    if (n > 4000) {
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, false, 64, 9000);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, false, 96, 7000);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, false, 160, 6500);
+
+        add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, {}, false, 96, 6500);
+        add_deterministic_config(configs, seen, true, GreedyPolicy::PreferDifferentComponent, {}, false, 96, 6000);
+
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, {}, false, 128, 6500);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, {}, false, 128, 6500);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferFewPendants, {}, false, 128, 6000);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {}, false, 128, 6000);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::AggressiveMultiCut, {}, false, 96, 6000);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::ConservativeSingleCut, {}, false, 128, 5500);
+
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {1}, false, 128, 5500);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {2}, false, 128, 5500);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, {1}, false, 128, 5000);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, {1}, false, 128, 5000);
+        add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, {1}, false, 96, 5000);
+
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true, 128, 5000);
+        add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, {}, true, 96, 4500);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {}, true, 128, 4500);
+
         finalize_deterministic_configs(configs, n);
         return configs;
     }
 
+    /*
+        LARGE INSTANCES:
+        More room for LDS than n > 4000, but still not enough for the full
+        medium-instance portfolio. Use shallow scripts and policy diversity.
+    */
+    if (n > 1000) {
+        std::vector<std::vector<int>> scripts = {
+            {},
+            {1},
+            {2},
+            {1, 1},
+            {1, 2},
+            {2, 1},
+            {3}
+        };
+
+        for (const auto& script : scripts) {
+            add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, script, false, 160, script.empty() ? 4500 : 3500);
+            add_deterministic_config(configs, seen, true,  GreedyPolicy::Balanced, script, false, 160, 3300);
+
+            if (script.size() <= 1) {
+                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, script, false, 192, 3500);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, script, false, 192, 3500);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferFewPendants, script, false, 192, 3200);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, script, false, 160, 3200);
+            }
+        }
+
+        add_deterministic_config(configs, seen, false, GreedyPolicy::AggressiveMultiCut, {}, false, 160, 3500);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::ConservativeSingleCut, {}, false, 192, 3200);
+
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true, 160, 3000);
+        add_deterministic_config(configs, seen, true,  GreedyPolicy::Balanced, {}, true, 160, 3000);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, {}, true, 192, 2800);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {1}, true, 160, 2800);
+
+        finalize_deterministic_configs(configs, n);
+        return configs;
+    }
+
+    /*
+        UPPER-MEDIUM INSTANCES:
+        Here the current solver is too timid. We can afford a bigger LDS set.
+    */
     if (n > 600) {
         for (const auto& script : deterministic_lds_scripts(n)) {
             add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, script, false);
-            if (script.size() <= 2) {
+
+            if (script.size() <= 3) {
                 add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, script, false);
                 add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, script, false);
                 add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, script, false);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, script, false);
+            }
+
+            if (script.size() <= 1) {
+                add_deterministic_config(configs, seen, true, GreedyPolicy::PreferDifferentComponent, script, false);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferFewPendants, script, false);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::ConservativeSingleCut, script, false);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::AggressiveMultiCut, script, false);
             }
         }
-        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferFewPendants, {}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::ConservativeSingleCut, {}, false);
+
         add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true);
+        add_deterministic_config(configs, seen, true,  GreedyPolicy::Balanced, {}, true);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, {}, true);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {1}, true);
+
         finalize_deterministic_configs(configs, n);
         return configs;
     }
 
+    /*
+        SMALL / MEDIUM INSTANCES:
+        Here exhaustive portfolio diversity is useful, because each run is cheap.
+    */
     for (const auto& script : deterministic_lds_scripts(n)) {
-        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, script, false);
-        add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, script, false);
+        add_core_policy_set(false, script, false);
+        add_core_policy_set(true, script, false);
+
         if (script.size() <= 3) {
-            add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, script, false);
-            add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, script, false);
-            add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, script, false);
-        }
-        if (script.empty()) {
-            add_deterministic_config(configs, seen, true, GreedyPolicy::PreferDifferentComponent, script, false);
             add_deterministic_config(configs, seen, false, GreedyPolicy::PreferFewPendants, script, false);
             add_deterministic_config(configs, seen, false, GreedyPolicy::ConservativeSingleCut, script, false);
             add_deterministic_config(configs, seen, false, GreedyPolicy::AggressiveMultiCut, script, false);
         }
+
+        if (script.size() <= 2) {
+            add_core_policy_set(false, script, true);
+            add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, script, true);
+        }
     }
+
     add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true);
     add_deterministic_config(configs, seen, true,  GreedyPolicy::Balanced, {}, true);
     add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {1}, true);
+    add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, {1}, true);
+    add_deterministic_config(configs, seen, true,  GreedyPolicy::PreferDifferentComponent, {}, true);
+
     finalize_deterministic_configs(configs, n);
     return configs;
 }
@@ -4266,12 +4361,12 @@ ThreeApproxResult run_three_approx(
 
             size_t top_k = std::min<size_t>(4, ranked.size());
 
-            if (is_large_instance_size(n)) {
+            if (n > 4000) {
                 top_k = std::min<size_t>(3, ranked.size());
-            }
-
-            if (n > 1000) {
-                top_k = std::min<size_t>(2, ranked.size());
+            } else if (n > 1000) {
+                top_k = std::min<size_t>(4, ranked.size());
+            } else if (is_large_instance_size(n)) {
+                top_k = std::min<size_t>(4, ranked.size());
             }
 
             size_t rank_choice = 0;
