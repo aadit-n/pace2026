@@ -1901,77 +1901,60 @@ struct CherryCandidate {
     std::vector<int> pendants;
 };
 
+double score_cherry_candidate_normalized(const CherryCandidate& cand, int total_leaves) {
+    if (total_leaves <= 0) total_leaves = 1;
+    double inv = 1.0 / static_cast<double>(total_leaves);
+
+    double norm_dist       = cand.distance * inv;
+    double norm_pendants   = cand.pendant_count * inv;
+    double norm_conflict   = cand.conflict_mass * inv;
+    double norm_comp_size  = cand.component_size * inv;
+
+    // Base score – common cherries are enormously valuable
+    double score = (cand.common ? 12.0 : 0.0)
+                + (cand.same_component ? 0.0 : 5.0)
+                - 20.0 * norm_dist
+                - 25.0 * norm_pendants
+                - 12.0 * norm_conflict
+                + 3.0 * static_cast<double>(cand.immediate_gain)
+                - 2.0 * norm_comp_size;
+    return score;
+}   
+
 double score_cherry_candidate(const CherryCandidate& cand, int total_leaves) {
-    if (is_medium_instance_size(total_leaves)) {
-        return
-            (cand.common ? 10.0 : 0.0) +
-            (cand.same_component ? 0.0 : 5.0) -
-            1.0 * static_cast<double>(cand.distance) -
-            2.6 * static_cast<double>(cand.pendant_count) -
-            0.012 * static_cast<double>(cand.conflict_mass) +
-            3.5 * static_cast<double>(cand.immediate_gain) -
-            0.004 * static_cast<double>(cand.component_size);
-    }
-
-    if (is_large_instance_size(total_leaves)) {
-        return
-            (cand.common ? 11.0 : 0.0) +
-            (cand.same_component ? 0.0 : 4.75) -
-            1.15 * static_cast<double>(cand.distance) -
-            2.25 * static_cast<double>(cand.pendant_count) -
-            0.014 * static_cast<double>(cand.conflict_mass) +
-            3.6 * static_cast<double>(cand.immediate_gain) -
-            0.005 * static_cast<double>(cand.component_size);
-    }
-
-    return
-        (cand.common ? 12.0 : 0.0) +
-        (cand.same_component ? 0.0 : 4.0) -
-        1.5 * static_cast<double>(cand.distance) -
-        2.0 * static_cast<double>(cand.pendant_count) -
-        0.02 * static_cast<double>(cand.conflict_mass) +
-        3.0 * static_cast<double>(cand.immediate_gain) -
-        0.01 * static_cast<double>(cand.component_size);
+    return score_cherry_candidate_normalized(cand, total_leaves);
 }
 
 double score_cherry_candidate_policy(
     const CherryCandidate& cand,
     int total_leaves,
-    GreedyPolicy policy
-) {
-    double s = score_cherry_candidate(cand, total_leaves);
+    GreedyPolicy policy)
+{
+    double s = score_cherry_candidate_normalized(cand, total_leaves);
 
     switch (policy) {
-        case GreedyPolicy::Balanced:
-            return s;
-
         case GreedyPolicy::PreferDifferentComponent:
-            if (!cand.same_component) s += 5.0;
-            return s;
-
+            if (!cand.same_component) s += 5.0;   // keep original bonus
+            break;
         case GreedyPolicy::PreferLowConflictMass:
-            s -= 0.035 * static_cast<double>(cand.conflict_mass);
-            return s;
-
+            s -= 0.3;   // since mass is now normalised, adjust bonus
+            break;
         case GreedyPolicy::PreferFewPendants:
-            s -= 2.75 * static_cast<double>(cand.pendant_count);
-            return s;
-
+            s -= 2.0 * (cand.pendant_count / static_cast<double>(total_leaves > 0 ? total_leaves : 1));
+            break;
         case GreedyPolicy::PreferImmediateGain:
-            s += 4.50 * static_cast<double>(cand.immediate_gain);
-            return s;
-
+            s += 4.0 * static_cast<double>(cand.immediate_gain);
+            break;
         case GreedyPolicy::ConservativeSingleCut:
-            s -= 2.00 * static_cast<double>(cand.pendant_count);
-            s -= 0.020 * static_cast<double>(cand.conflict_mass);
-            return s;
-
+            s -= 1.5 * (cand.pendant_count / static_cast<double>(total_leaves > 0 ? total_leaves : 1));
+            s -= 0.015;   // conflict mass penalty
+            break;
         case GreedyPolicy::AggressiveMultiCut:
-            s += 2.00 * static_cast<double>(cand.immediate_gain);
-            s -= 0.005 * static_cast<double>(cand.conflict_mass);
-            return s;
+            s += 3.0 * static_cast<double>(cand.immediate_gain);
+            break;
+        default: // Balanced – no extra bonus
+            break;
     }
-
     return s;
 }
 
