@@ -2503,22 +2503,38 @@ void exact_kernel_dfs(
     UndoLog& undo,
     ExactSearchStats* stats = nullptr
 ) {
+    size_t entry_mark = undo.mark();
+    int entry_next_label = next_label;
+
+    auto cleanup = [&]() {
+        next_label = entry_next_label;
+        undo.undo_to(entry_mark);
+    };
+
     PathScratch path_scratch;
+
     if (stats) ++stats->nodes;
+
     if (g_terminate || Clock::now() >= deadline) {
         if (stats) ++stats->deadline_prunes;
+        cleanup();
         return;
     }
 
-    contract_all_common_cherries(t1, f, next_label);
+    contract_all_common_cherries(t1, f, next_label, &undo);
+
     int current_components = f.root_component_count;
+
     if (current_components >= best_components) {
         if (stats) ++stats->bound_prunes;
+        cleanup();
         return;
     }
+
     int lb = exact_conflict_lower_bound(t1, f);
     if (current_components + lb >= best_components) {
         if (stats) ++stats->lb_prunes;
+        cleanup();
         return;
     }
 
@@ -2529,14 +2545,17 @@ void exact_kernel_dfs(
             ++stats->memo_hits;
             ++stats->bound_prunes;
         }
+        cleanup();
         return;
     }
+
     memo[key] = current_components;
 
     auto cherries = cherries_by_label(t1);
     if (cherries.empty() || t1.active_leaf_count <= 2) {
         best_components = current_components;
         collect_current_components(f, best_comps);
+        cleanup();
         return;
     }
 
@@ -2592,8 +2611,12 @@ void exact_kernel_dfs(
 
         next_label = saved_next_label;
         undo.undo_to(mark);
-        if (g_terminate || Clock::now() >= deadline) return;
+        if (g_terminate || Clock::now() >= deadline) {
+            cleanup();
+            return;
+        }
     }
+    cleanup();
 }
 
 ExactKernelResult solve_exact_kernel_bounded(
