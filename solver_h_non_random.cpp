@@ -1773,7 +1773,19 @@ enum class GreedyPolicy {
     PreferFewPendants,
     PreferImmediateGain,
     ConservativeSingleCut,
-    AggressiveMultiCut
+    AggressiveMultiCut,
+    // --- new policies ---
+    PreferSmallComponents,
+    PreferLargeComponents,
+    PreferIsolatedLeaves,
+    AvoidPendantsAtAll,
+    MinimiseConflictLeafMass,
+    PreferSmallLabels,
+    PreferLargeLabels,
+    PreferFewestComponentsAfterCut,
+    PreferLeafCutsOverPendants,
+    PreferBalancedCuts,
+    PreferCuttingSmallestMass
 };
 
 struct DeterministicRunConfig {
@@ -1785,6 +1797,7 @@ struct DeterministicRunConfig {
     long long budget_ms = 0;
     uint64_t tie_salt = 0;
     int id = 0;
+    double elite_bonus = 5.0;   // <--- NEW
 };
 
 const char* greedy_policy_name(GreedyPolicy policy) {
@@ -1796,6 +1809,17 @@ const char* greedy_policy_name(GreedyPolicy policy) {
         case GreedyPolicy::PreferImmediateGain: return "immediate_gain";
         case GreedyPolicy::ConservativeSingleCut: return "single_cut";
         case GreedyPolicy::AggressiveMultiCut: return "multi_cut";
+        case GreedyPolicy::PreferSmallComponents: return "small_comp";
+        case GreedyPolicy::PreferLargeComponents: return "large_comp";
+        case GreedyPolicy::PreferIsolatedLeaves: return "isolated";
+        case GreedyPolicy::AvoidPendantsAtAll: return "no_pendants";
+        case GreedyPolicy::MinimiseConflictLeafMass: return "min_leafmass";
+        case GreedyPolicy::PreferSmallLabels: return "small_labels";
+        case GreedyPolicy::PreferLargeLabels: return "large_labels";
+        case GreedyPolicy::PreferFewestComponentsAfterCut: return "fewest_comp";
+        case GreedyPolicy::PreferLeafCutsOverPendants: return "leaf_cuts";
+        case GreedyPolicy::PreferBalancedCuts: return "balanced_cuts";
+        case GreedyPolicy::PreferCuttingSmallestMass: return "smallest_mass";
     }
     return "unknown";
 }
@@ -1937,42 +1961,47 @@ double score_cherry_candidate(const CherryCandidate& cand, int total_leaves) {
 double score_cherry_candidate_policy(
     const CherryCandidate& cand,
     int total_leaves,
-    GreedyPolicy policy
+    GreedyPolicy policy,
+    int a = 0, int b = 0  // leaf labels for tie-breaking policies
 ) {
     double s = score_cherry_candidate(cand, total_leaves);
 
     switch (policy) {
-        case GreedyPolicy::Balanced:
-            return s;
-
+        case GreedyPolicy::Balanced: return s;
         case GreedyPolicy::PreferDifferentComponent:
-            if (!cand.same_component) s += 5.0;
-            return s;
-
+            if (!cand.same_component) s += 5.0; return s;
         case GreedyPolicy::PreferLowConflictMass:
-            s -= 0.035 * static_cast<double>(cand.conflict_mass);
-            return s;
-
+            s -= 0.035 * cand.conflict_mass; return s;
         case GreedyPolicy::PreferFewPendants:
-            s -= 2.75 * static_cast<double>(cand.pendant_count);
-            return s;
-
+            s -= 2.75 * cand.pendant_count; return s;
         case GreedyPolicy::PreferImmediateGain:
-            s += 4.50 * static_cast<double>(cand.immediate_gain);
-            return s;
-
+            s += 4.50 * cand.immediate_gain; return s;
         case GreedyPolicy::ConservativeSingleCut:
-            s -= 2.00 * static_cast<double>(cand.pendant_count);
-            s -= 0.020 * static_cast<double>(cand.conflict_mass);
+            s -= 2.00 * cand.pendant_count;
+            s -= 0.020 * cand.conflict_mass;
             return s;
-
         case GreedyPolicy::AggressiveMultiCut:
-            s += 2.00 * static_cast<double>(cand.immediate_gain);
-            s -= 0.005 * static_cast<double>(cand.conflict_mass);
+            s += 2.00 * cand.immediate_gain;
+            s -= 0.005 * cand.conflict_mass;
+            return s;
+        case GreedyPolicy::PreferSmallComponents:
+            s -= 0.04 * cand.component_size; return s;
+        case GreedyPolicy::PreferLargeComponents:
+            s += 0.03 * cand.component_size; return s;
+        case GreedyPolicy::PreferIsolatedLeaves:
+            if (!cand.same_component) s += 3.0; return s;
+        case GreedyPolicy::AvoidPendantsAtAll:
+            s -= 4.0 * cand.pendant_count; return s;
+        case GreedyPolicy::MinimiseConflictLeafMass:
+            s -= 0.045 * cand.conflict_mass; // mass already computed as total subtree mass
+            return s;
+        case GreedyPolicy::PreferSmallLabels:
+            s -= 0.0001 * (a + b); return s;   // tiny bias
+        case GreedyPolicy::PreferLargeLabels:
+            s += 0.0001 * (a + b); return s;
+        default:
             return s;
     }
-
-    return s;
 }
 
 CherryCandidate build_cherry_candidate(
@@ -2170,8 +2199,48 @@ std::vector<int> choose_cut_plan(
         int nl = next_label;
         apply_cut_plan(f, plans[i], &undo);
         contract_all_common_cherries(t1, f, nl, &undo);
-        double val = evaluate_reduced_state(t1, f, total_leaves) - 0.05 * static_cast<double>(plans[i].size());
+        double val;
+        switch (policy) {
+            case GreedyPolicy::PreferFewestComponentsAfterCut:
+                val = -static_cast<double>(count_root_components(f)); break;
+            case GreedyPolicy::PreferLeafCutsOverPendants: {
+                val = evaluate_reduced_state(t1, f, total_leaves);
+                int leaf_cuts = 0;
+                for (int u : plans[i]) {
+                    if (is_active_leaf(f, u)) ++leaf_cuts;
+                }
+                val += 2.0 * leaf_cuts;
+                break;
+            }
+            case GreedyPolicy::PreferBalancedCuts: {
+                auto f_mass_after = compute_active_leaf_masses(f);
+                int max_mass = 0, sum_mass = 0;
+                for (int u = 0; u < static_cast<int>(f.nodes.size()); ++u) {
+                    if (!f.nodes[u].active || f.nodes[u].parent != -1) continue;
+                    int m = f_mass_after[u];
+                    max_mass = std::max(max_mass, m);
+                    sum_mass += m;
+                }
+                val = -static_cast<double>(max_mass) - 0.01 * sum_mass;
+                break;
+            }
+            case GreedyPolicy::PreferCuttingSmallestMass: {
+                // simplest: just pick the cut whose target node has smallest mass
+                int smallest_mass = std::numeric_limits<int>::max();
+                for (int u : plans[i]) {
+                    if (u >= 0 && u < static_cast<int>(f_mass.size())) {
+                        smallest_mass = std::min(smallest_mass, f_mass[u]);
+                    }
+                }
+                val = -static_cast<double>(smallest_mass);
+                break;
+            }
+            default:
+                val = evaluate_reduced_state(t1, f, total_leaves)
+                      - 0.05 * static_cast<double>(plans[i].size());
+        }
         undo.undo_to(mark);
+
         if (val > best + 1e-9) {
             best = val;
             best_indices = {i};
@@ -3540,6 +3609,7 @@ bool run_discrepancy_polish(
     Clock::time_point deadline,
     uint64_t seed_base,
     const std::vector<EliteSolution>& elite_pool
+
 ) {
     (void)seed_base;
     auto now = Clock::now();
@@ -3692,10 +3762,10 @@ std::vector<std::vector<int>> deterministic_lds_scripts(int n) {
     std::vector<std::vector<int>> scripts;
     scripts.push_back({});
 
-    int max_rank = n <= 600 ? 3 : 2;
-    int max_depth = n <= 300 ? 6 : (n <= 600 ? 5 : 4);
-    int max_cost = n <= 300 ? 9 : (n <= 600 ? 7 : 5);
-    size_t cap = n <= 300 ? 96 : (n <= 600 ? 64 : 32);
+    int max_rank = 3;
+    int max_depth = 8;   // was limited earlier, increase
+    int max_cost = 12;   // was 9 now 12
+    size_t cap = 256;    // aim for many scripts
 
     std::vector<int> cur;
     for (int cost = 1; cost <= max_cost && scripts.size() < cap; ++cost) {
@@ -3712,7 +3782,8 @@ void add_deterministic_config(
     std::vector<int> discrepancy,
     bool elite_guided,
     int cherry_sample_cap = 0,
-    long long budget_ms = 0
+    long long budget_ms = 0,
+    double elite_bonus = 5.0   // <--- NEW
 ) {
     std::string key;
     key.reserve(64 + discrepancy.size() * 3);
@@ -3734,6 +3805,7 @@ void add_deterministic_config(
     cfg.elite_guided = elite_guided;
     cfg.cherry_sample_cap = cherry_sample_cap;
     cfg.budget_ms = budget_ms;
+    cfg.elite_bonus = elite_bonus;
     configs.push_back(std::move(cfg));
 }
 
@@ -3783,56 +3855,101 @@ std::vector<DeterministicRunConfig> deterministic_configs_for_size(int n) {
     std::vector<DeterministicRunConfig> configs;
     std::unordered_set<std::string> seen;
 
-    if (n > 1000) {
-        int fast_sample = n > 4000 ? 64 : 128;
-        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, false, fast_sample, n > 4000 ? 9000 : 3500);
-        add_deterministic_config(configs, seen, true,  GreedyPolicy::Balanced, {}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, {}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, {}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::AggressiveMultiCut, {}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {1}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {2}, false);
-        add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, {1}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true);
-        finalize_deterministic_configs(configs, n);
-        return configs;
-    }
+    // Helper lambda to add a set of policies quickly
+    auto add_policy = [&](GreedyPolicy pol, bool elite=false, double elite_bonus=5.0,
+                          const std::vector<int>& disc={}) {
+        add_deterministic_config(configs, seen, false, pol, disc, elite, 0, 0, elite_bonus);
+        add_deterministic_config(configs, seen, true,  pol, disc, elite, 0, 0, elite_bonus);
+    };
 
-    if (n > 600) {
-        for (const auto& script : deterministic_lds_scripts(n)) {
-            add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, script, false);
-            if (script.size() <= 2) {
-                add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, script, false);
-                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, script, false);
-                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, script, false);
+    // Base policies, always added, with swapped and non-swapped.
+    const std::vector<GreedyPolicy> base_policies = {
+        GreedyPolicy::Balanced,
+        GreedyPolicy::PreferDifferentComponent,
+        GreedyPolicy::PreferLowConflictMass,
+        GreedyPolicy::PreferFewPendants,
+        GreedyPolicy::PreferImmediateGain,
+        GreedyPolicy::ConservativeSingleCut,
+        GreedyPolicy::AggressiveMultiCut,
+        GreedyPolicy::PreferSmallComponents,
+        GreedyPolicy::PreferLargeComponents,
+        GreedyPolicy::PreferIsolatedLeaves,
+        GreedyPolicy::AvoidPendantsAtAll,
+        GreedyPolicy::MinimiseConflictLeafMass
+    };
+
+    // Generate LDS scripts (more below)
+    auto scripts = deterministic_lds_scripts(n);
+
+    if (n > 1000) {
+        // Large instances: limited policy set, fast sample cap, few scripts
+        int fast_sample = n > 4000 ? 64 : 128;
+        for (auto pol : base_policies) {
+            add_deterministic_config(configs, seen, false, pol, {}, false, fast_sample);
+            if (pol == GreedyPolicy::Balanced || pol == GreedyPolicy::PreferDifferentComponent)
+                add_deterministic_config(configs, seen, true, pol, {}, false, fast_sample);
+        }
+        // scripts limited to first 4
+        for (size_t i = 0; i < std::min<size_t>(4, scripts.size()); ++i) {
+            add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, scripts[i], false);
+        }
+        // elite variants
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true, 0, 0, 2.0);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true, 0, 0, 10.0);
+    } else if (n > 600) {
+        // Medium-large: all base policies, deeper scripts, some plan policies
+        for (auto pol : base_policies) add_policy(pol);
+        // cut-plan specific policies, no swap needed (they affect choose_cut_plan internally)
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferFewestComponentsAfterCut, {}, false);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLeafCutsOverPendants, {}, false);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferBalancedCuts, {}, false);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferCuttingSmallestMass, {}, false);
+
+        // scripts up to 64
+        size_t max_script = std::min<size_t>(64, scripts.size());
+        for (size_t i = 0; i < max_script; ++i) {
+            add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, scripts[i], false);
+            if (i % 2 == 0) // also swap some
+                add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, scripts[i], false);
+        }
+        // elite variants with different bonuses
+        for (double bonus : {2.0, 5.0, 10.0}) {
+            add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true, 0, 0, bonus);
+            if (bonus != 5.0)
+                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {}, true, 0, 0, bonus);
+        }
+
+    } else {
+        // Small/medium: all base, all scripts, all plan policies, various elite bonuses
+        for (auto pol : base_policies) {
+            add_policy(pol);
+            // elite with each base policy
+            for (double bonus : {2.0, 5.0, 10.0}) {
+                add_deterministic_config(configs, seen, false, pol, {}, true, 0, 0, bonus);
+                if (pol == GreedyPolicy::Balanced || pol == GreedyPolicy::PreferImmediateGain)
+                    add_deterministic_config(configs, seen, true, pol, {}, true, 0, 0, bonus);
             }
         }
-        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferFewPendants, {}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::ConservativeSingleCut, {}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true);
-        finalize_deterministic_configs(configs, n);
-        return configs;
+        // plan policies
+        for (auto pol : {
+            GreedyPolicy::PreferFewestComponentsAfterCut,
+            GreedyPolicy::PreferLeafCutsOverPendants,
+            GreedyPolicy::PreferBalancedCuts,
+            GreedyPolicy::PreferCuttingSmallestMass
+        }) add_policy(pol);
+
+        // all LDS scripts
+        for (const auto& disc : scripts) {
+            add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, disc, false);
+            add_deterministic_config(configs, seen, true,  GreedyPolicy::Balanced, disc, false);
+            add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, disc, false);
+        }
+        // Some scripts with elite guidance
+        for (size_t i = 0; i < std::min<size_t>(20, scripts.size()); ++i) {
+            add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, scripts[i], true);
+        }
     }
 
-    for (const auto& script : deterministic_lds_scripts(n)) {
-        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, script, false);
-        add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, script, false);
-        if (script.size() <= 3) {
-            add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, script, false);
-            add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, script, false);
-            add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, script, false);
-        }
-        if (script.empty()) {
-            add_deterministic_config(configs, seen, true, GreedyPolicy::PreferDifferentComponent, script, false);
-            add_deterministic_config(configs, seen, false, GreedyPolicy::PreferFewPendants, script, false);
-            add_deterministic_config(configs, seen, false, GreedyPolicy::ConservativeSingleCut, script, false);
-            add_deterministic_config(configs, seen, false, GreedyPolicy::AggressiveMultiCut, script, false);
-        }
-    }
-    add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true);
-    add_deterministic_config(configs, seen, true,  GreedyPolicy::Balanced, {}, true);
-    add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {1}, true);
     finalize_deterministic_configs(configs, n);
     return configs;
 }
@@ -3914,7 +4031,7 @@ std::vector<std::vector<int>> solve_direct_reduced(
 
         if (cfg.elite_guided && !elite_pool.empty()) {
             elite_comp_map = &elite_pool.front().comp_of_leaf;
-            elite_bonus = 5.0;
+            elite_bonus = cfg.elite_bonus;
         }
 
         const std::vector<int>* discrepancy_ptr =
@@ -4246,7 +4363,7 @@ ThreeApproxResult run_three_approx(
                 auto [ca, cb] = cherries[i];
 
                 auto cand = build_cherry_candidate(t1, f, f_mass, ca, cb, n, &path_scratch);
-                double score = score_cherry_candidate_policy(cand, n, policy);
+                double score = score_cherry_candidate_policy(cand, n, policy, ca, cb);
 
                 if (elite_comp_map && elite_comp_map->size() > static_cast<size_t>(n)) {
                     int ida = (*elite_comp_map)[static_cast<size_t>(ca)];
@@ -4536,7 +4653,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
 
         if (cfg.elite_guided && !elite_pool.empty()) {
             elite_comp_map = &elite_pool.front().comp_of_leaf;
-            elite_bonus = 5.0;
+            elite_bonus = cfg.elite_bonus;
         }
 
         const std::vector<int>* discrepancy =
