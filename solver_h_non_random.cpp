@@ -91,6 +91,8 @@ struct DynNode {
 
 struct DynamicTree {
     int root = -1;
+    int active_leaf_count = 0;
+    int root_component_count = 1;
     std::vector<DynNode> nodes;
     std::vector<PayloadNode> payloads;
     std::vector<int> label_to_node; // active pseudo-label -> node, -1 if inactive
@@ -102,6 +104,8 @@ struct DynamicTree {
 struct UndoLog {
     enum class Kind {
         Root,
+        ActiveLeafCount,
+        RootComponentCount,
         NodeParent,
         NodeLeft,
         NodeRight,
@@ -140,6 +144,12 @@ struct UndoLog {
                     break;
                 case Kind::NodeParent:
                     e.tree->nodes[e.index].parent = e.old_value;
+                    break;
+                case Kind::ActiveLeafCount:
+                    e.tree->active_leaf_count = e.old_value;
+                    break;
+                case Kind::RootComponentCount:
+                    e.tree->root_component_count = e.old_value;
                     break;
                 case Kind::NodeLeft:
                     e.tree->nodes[e.index].left = e.old_value;
@@ -527,6 +537,15 @@ std::string join_ints_key(const std::vector<int>& vals) {
     return s;
 }
 
+uint64_t hash_int_vector(const std::vector<int>& vals) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (int x : vals) {
+        h ^= mix64(static_cast<uint64_t>(static_cast<uint32_t>(x + 1)));
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
 SimpleNodeInfo compute_simple_info_dfs(
     const SimpleTree& st,
     int u,
@@ -620,8 +639,6 @@ bool reduce_common_rooted_chains_once(
 
     struct Candidate {
         std::string key;
-        int u1 = -1;
-        int u2 = -1;
         int size = 0;
         std::vector<int> ordered_leaves;
     };
@@ -645,7 +662,7 @@ bool reduce_common_rooted_chains_once(
         auto it = map2.find(kv.first);
         if (it == map2.end()) continue;
         const auto& leaves = chain1[static_cast<size_t>(kv.second)].ordered_leaves;
-        candidates.push_back({kv.first, kv.second, it->second, static_cast<int>(leaves.size()), leaves});
+        candidates.push_back({kv.first, static_cast<int>(leaves.size()), leaves});
     }
     if (candidates.empty()) return false;
 
@@ -731,18 +748,19 @@ bool reduce_common_subtrees_once(
 
     struct Candidate {
         std::string key;
-        int u1 = -1;
-        int u2 = -1;
         int size = 0;
         std::vector<int> leaves;
     };
+
     std::vector<Candidate> candidates;
     candidates.reserve(std::min(map1.size(), map2.size()));
+
     for (const auto& kv : map1) {
         auto it = map2.find(kv.first);
         if (it == map2.end()) continue;
+
         const auto& inf = info1[static_cast<size_t>(kv.second)];
-        candidates.push_back({kv.first, kv.second, it->second, static_cast<int>(inf.leaves.size()), inf.leaves});
+        candidates.push_back({kv.first, static_cast<int>(inf.leaves.size()), inf.leaves});
     }
     if (candidates.empty()) return false;
 
@@ -935,7 +953,8 @@ bool find_common_cluster(
     cluster_labels.clear();
     if (t1.children.empty() || t2.children.empty()) return false;
     int n = static_cast<int>(simple_tree_leaf_labels(t1).size());
-    if (n < 6) return false;
+    if (n < 4) return false;
+    int min_cluster = (n > 1000 ? 2 : 3);
 
     std::vector<SimpleNodeInfo> info1(t1.children.size());
     std::vector<SimpleNodeInfo> info2(t2.children.size());
@@ -945,22 +964,25 @@ bool find_common_cluster(
     std::unordered_set<std::string> clusters2;
     for (int u = 0; u < static_cast<int>(t2.children.size()); ++u) {
         const auto& leaves = info2[static_cast<size_t>(u)].leaves;
-        if (static_cast<int>(leaves.size()) >= 3 && static_cast<int>(leaves.size()) <= n - 3) {
+        if (static_cast<int>(leaves.size()) >= min_cluster &&
+            static_cast<int>(leaves.size()) <= n - min_cluster) {
             clusters2.insert(join_ints_key(leaves));
         }
     }
 
-    int best_balance = std::numeric_limits<int>::max();
+    double best_score = -1e100;
     int best_size = -1;
     for (int u = 0; u < static_cast<int>(t1.children.size()); ++u) {
         const auto& leaves = info1[static_cast<size_t>(u)].leaves;
         int sz = static_cast<int>(leaves.size());
-        if (sz < 3 || sz > n - 3) continue;
+        if (sz < min_cluster || sz > n - min_cluster) continue;
         std::string key = join_ints_key(leaves);
         if (!clusters2.count(key)) continue;
-        int balance = std::abs(n - 2 * sz);
-        if (balance < best_balance || (balance == best_balance && sz > best_size)) {
-            best_balance = balance;
+        double score = static_cast<double>(std::min(sz, n - sz))
+                    - 0.15 * static_cast<double>(std::abs(n - 2 * sz));
+
+        if (score > best_score || (score == best_score && sz > best_size)) {
+            best_score = score;
             best_size = sz;
             cluster_labels = leaves;
         }
@@ -1094,6 +1116,7 @@ DynamicTree build_dynamic_tree(const SimpleTree& st) {
 
         if (st.children[u].empty()) {
             dn.label = st.leaf_label[u];
+            ++dt.active_leaf_count;
             dn.payload_id = push_payload(dt, PayloadNode{-1, -1, st.leaf_label[u]});
             dn.payload_size = 1;
             dt.label_to_node[static_cast<size_t>(dn.label)] = static_cast<int>(u);
@@ -1115,6 +1138,7 @@ DynamicTree build_dynamic_tree(const SimpleTree& st) {
             dt.cherry_nodes.push_back(u);
         }
     }
+    dt.root_component_count = 1;
     return dt;
 }
 
@@ -1204,12 +1228,6 @@ void set_cherry_node_slot(DynamicTree& t, int idx, int value, UndoLog* log = nul
 void push_node(DynamicTree& t, DynNode node, UndoLog* log = nullptr) {
     push_undo(log, UndoLog::Kind::NodesSize, &t, -1, static_cast<int>(t.nodes.size()));
     t.nodes.push_back(std::move(node));
-}
-
-void resize_nodes(DynamicTree& t, size_t new_size, UndoLog* log = nullptr) {
-    if (t.nodes.size() == new_size) return;
-    push_undo(log, UndoLog::Kind::NodesSize, &t, -1, static_cast<int>(t.nodes.size()));
-    t.nodes.resize(new_size);
 }
 
 void push_cherry_node(DynamicTree& t, int value, UndoLog* log = nullptr) {
@@ -1322,8 +1340,14 @@ void suppress_up(DynamicTree& t, int u, UndoLog* log = nullptr) {
 void cut_edge_above(DynamicTree& t, int child, UndoLog* log = nullptr) {
     if (child < 0 || child >= static_cast<int>(t.nodes.size())) return;
     if (!t.nodes[child].active) return;
+
     int p = t.nodes[child].parent;
     if (p == -1) return;
+
+    // Cutting one edge creates one additional forest component.
+    push_undo(log, UndoLog::Kind::RootComponentCount, &t, -1, t.root_component_count);
+    ++t.root_component_count;
+
     remove_cherry_node(t, p, log);
     replace_child(t, p, child, -1, log);
     set_node_parent(t, child, -1, log);
@@ -1385,6 +1409,11 @@ bool contract_cherry(DynamicTree& t, int la, int lb, int new_label, UndoLog* log
     remove_cherry_node(t, p, log);
     remove_cherry_node(t, a, log);
     remove_cherry_node(t, b, log);
+
+    // Two active leaves become one active leaf.
+    push_undo(log, UndoLog::Kind::ActiveLeafCount, &t, -1, t.active_leaf_count);
+    --t.active_leaf_count;
+
     set_node_active(t, a, false, log);
     set_node_active(t, b, false, log);
     set_node_parent(t, a, -1, log);
@@ -1410,6 +1439,27 @@ std::vector<std::pair<int, int>> cherries_by_label(const DynamicTree& t) {
         out.push_back({a, b});
     }
     return out;
+}
+
+void fill_cherries_by_label(const DynamicTree& t, std::vector<std::pair<int, int>>& out) {
+    out.clear();
+    out.reserve(t.cherry_nodes.size());
+
+    for (int u : t.cherry_nodes) {
+        if (u < 0 || u >= static_cast<int>(t.nodes.size())) continue;
+        if (!t.nodes[u].active) continue;
+
+        int l = t.nodes[u].left;
+        int r = t.nodes[u].right;
+
+        if (!is_active_leaf(t, l) || !is_active_leaf(t, r)) continue;
+
+        int a = t.nodes[l].label;
+        int b = t.nodes[r].label;
+
+        if (a > b) std::swap(a, b);
+        out.push_back({a, b});
+    }
 }
 
 template <typename Fn>
@@ -1449,24 +1499,11 @@ bool contract_one_common_cherry(
 
         if (!are_siblings_by_label(t2, a, b)) continue;
 
-        int nl = next_label;
-
-        if (!are_siblings_by_label(t1, a, b) ||
-            !are_siblings_by_label(t2, a, b)) {
-            continue;
-        }
-
-        ++next_label;
-
+        int nl = next_label++;
         bool ok1 = contract_cherry(t1, a, b, nl, log);
         bool ok2 = contract_cherry(t2, a, b, nl, log);
 
-        if (ok1 && ok2) {
-            return true;
-        }
-
-        // Defensive fallback. This should almost never happen.
-        return false;
+        return ok1 && ok2;
     }
 
     return false;
@@ -1575,6 +1612,28 @@ std::vector<int> pendant_children_on_path(const DynamicTree& t, const std::vecto
         if (r != -1 && t.nodes[r].active && r != prev && r != next) out.push_back(r);
     }
     return out;
+}
+
+void fill_pendant_children_on_path(
+    const DynamicTree& t,
+    const std::vector<int>& path,
+    std::vector<int>& out
+) {
+    out.clear();
+
+    if (path.size() < 3) return;
+
+    for (size_t i = 1; i + 1 < path.size(); ++i) {
+        int u = path[i];
+        int prev = path[i - 1];
+        int next = path[i + 1];
+
+        int l = t.nodes[u].left;
+        int r = t.nodes[u].right;
+
+        if (l != -1 && t.nodes[l].active && l != prev && l != next) out.push_back(l);
+        if (r != -1 && t.nodes[r].active && r != prev && r != next) out.push_back(r);
+    }
 }
 
 int count_common_cherries(const DynamicTree& t1, const DynamicTree& f) {
@@ -1773,19 +1832,7 @@ enum class GreedyPolicy {
     PreferFewPendants,
     PreferImmediateGain,
     ConservativeSingleCut,
-    AggressiveMultiCut,
-    // --- new policies ---
-    PreferSmallComponents,
-    PreferLargeComponents,
-    PreferIsolatedLeaves,
-    AvoidPendantsAtAll,
-    MinimiseConflictLeafMass,
-    PreferSmallLabels,
-    PreferLargeLabels,
-    PreferFewestComponentsAfterCut,
-    PreferLeafCutsOverPendants,
-    PreferBalancedCuts,
-    PreferCuttingSmallestMass
+    AggressiveMultiCut
 };
 
 struct DeterministicRunConfig {
@@ -1797,7 +1844,6 @@ struct DeterministicRunConfig {
     long long budget_ms = 0;
     uint64_t tie_salt = 0;
     int id = 0;
-    double elite_bonus = 5.0;   // <--- NEW
 };
 
 const char* greedy_policy_name(GreedyPolicy policy) {
@@ -1809,17 +1855,6 @@ const char* greedy_policy_name(GreedyPolicy policy) {
         case GreedyPolicy::PreferImmediateGain: return "immediate_gain";
         case GreedyPolicy::ConservativeSingleCut: return "single_cut";
         case GreedyPolicy::AggressiveMultiCut: return "multi_cut";
-        case GreedyPolicy::PreferSmallComponents: return "small_comp";
-        case GreedyPolicy::PreferLargeComponents: return "large_comp";
-        case GreedyPolicy::PreferIsolatedLeaves: return "isolated";
-        case GreedyPolicy::AvoidPendantsAtAll: return "no_pendants";
-        case GreedyPolicy::MinimiseConflictLeafMass: return "min_leafmass";
-        case GreedyPolicy::PreferSmallLabels: return "small_labels";
-        case GreedyPolicy::PreferLargeLabels: return "large_labels";
-        case GreedyPolicy::PreferFewestComponentsAfterCut: return "fewest_comp";
-        case GreedyPolicy::PreferLeafCutsOverPendants: return "leaf_cuts";
-        case GreedyPolicy::PreferBalancedCuts: return "balanced_cuts";
-        case GreedyPolicy::PreferCuttingSmallestMass: return "smallest_mass";
     }
     return "unknown";
 }
@@ -1859,6 +1894,12 @@ uint64_t deterministic_pair_key(
         (tag * 0xbf58476d1ce4e5b9ULL)
     );
 }
+
+uint64_t cherry_pair_key(int a, int b) {
+    if (a > b) std::swap(a, b);
+    return (static_cast<uint64_t>(static_cast<uint32_t>(a)) << 32)
+         | static_cast<uint32_t>(b);
+}   
 
 uint64_t deterministic_plan_key(uint64_t salt, const std::vector<int>& plan) {
     uint64_t h = salt ^ (static_cast<uint64_t>(plan.size()) * 0x94d049bb133111ebULL);
@@ -1925,83 +1966,86 @@ struct CherryCandidate {
     std::vector<int> pendants;
 };
 
+struct LightCherryCandidate {
+    int a = -1;
+    int b = -1;
+    int na = -1;
+    int nb = -1;
+    int ra = -1;
+    int rb = -1;
+    bool common = false;
+    bool same_component = false;
+    int distance = 0;
+    int pendant_count = 0;
+    int conflict_mass = 0;
+    int component_size = 0;
+    int immediate_gain = 0;
+    double score = -std::numeric_limits<double>::infinity();
+};
+
+double score_cherry_candidate_normalized(const CherryCandidate& cand, int total_leaves) {
+    if (total_leaves <= 0) total_leaves = 1;
+    double inv = 1.0 / static_cast<double>(total_leaves);
+
+    double norm_dist       = cand.distance * inv;
+    double norm_pendants   = cand.pendant_count * inv;
+    double norm_conflict   = cand.conflict_mass * inv;
+    double norm_comp_size  = cand.component_size * inv;
+
+    // Base score – common cherries are enormously valuable
+    double score = (cand.common ? 12.0 : 0.0)
+                + (cand.same_component ? 0.0 : 5.0)
+                - 20.0 * norm_dist
+                - 25.0 * norm_pendants
+                - 12.0 * norm_conflict
+                + 3.0 * static_cast<double>(cand.immediate_gain)
+                - 2.0 * norm_comp_size;
+    return score;
+}   
+
 double score_cherry_candidate(const CherryCandidate& cand, int total_leaves) {
-    if (is_medium_instance_size(total_leaves)) {
-        return
-            (cand.common ? 10.0 : 0.0) +
-            (cand.same_component ? 0.0 : 5.0) -
-            1.0 * static_cast<double>(cand.distance) -
-            2.6 * static_cast<double>(cand.pendant_count) -
-            0.012 * static_cast<double>(cand.conflict_mass) +
-            3.5 * static_cast<double>(cand.immediate_gain) -
-            0.004 * static_cast<double>(cand.component_size);
-    }
-
-    if (is_large_instance_size(total_leaves)) {
-        return
-            (cand.common ? 11.0 : 0.0) +
-            (cand.same_component ? 0.0 : 4.75) -
-            1.15 * static_cast<double>(cand.distance) -
-            2.25 * static_cast<double>(cand.pendant_count) -
-            0.014 * static_cast<double>(cand.conflict_mass) +
-            3.6 * static_cast<double>(cand.immediate_gain) -
-            0.005 * static_cast<double>(cand.component_size);
-    }
-
-    return
-        (cand.common ? 12.0 : 0.0) +
-        (cand.same_component ? 0.0 : 4.0) -
-        1.5 * static_cast<double>(cand.distance) -
-        2.0 * static_cast<double>(cand.pendant_count) -
-        0.02 * static_cast<double>(cand.conflict_mass) +
-        3.0 * static_cast<double>(cand.immediate_gain) -
-        0.01 * static_cast<double>(cand.component_size);
+    return score_cherry_candidate_normalized(cand, total_leaves);
 }
 
 double score_cherry_candidate_policy(
     const CherryCandidate& cand,
     int total_leaves,
-    GreedyPolicy policy,
-    int a = 0, int b = 0  // leaf labels for tie-breaking policies
-) {
-    double s = score_cherry_candidate(cand, total_leaves);
+    GreedyPolicy policy)
+{
+    double s = score_cherry_candidate_normalized(cand, total_leaves);
 
     switch (policy) {
-        case GreedyPolicy::Balanced: return s;
         case GreedyPolicy::PreferDifferentComponent:
-            if (!cand.same_component) s += 5.0; return s;
+            if (!cand.same_component) s += 5.0;
+            break;
+
         case GreedyPolicy::PreferLowConflictMass:
-            s -= 0.035 * cand.conflict_mass; return s;
+            s -= 8.0 * (cand.conflict_mass / static_cast<double>(total_leaves > 0 ? total_leaves : 1));
+            break;
+
         case GreedyPolicy::PreferFewPendants:
-            s -= 2.75 * cand.pendant_count; return s;
+            s -= 4.0 * (cand.pendant_count / static_cast<double>(total_leaves > 0 ? total_leaves : 1));
+            break;
+
         case GreedyPolicy::PreferImmediateGain:
-            s += 4.50 * cand.immediate_gain; return s;
+            s += 4.0 * static_cast<double>(cand.immediate_gain);
+            break;
+
         case GreedyPolicy::ConservativeSingleCut:
-            s -= 2.00 * cand.pendant_count;
-            s -= 0.020 * cand.conflict_mass;
-            return s;
+            s -= 4.0 * (cand.pendant_count / static_cast<double>(total_leaves > 0 ? total_leaves : 1));
+            s -= 6.0 * (cand.conflict_mass / static_cast<double>(total_leaves > 0 ? total_leaves : 1));
+            if (cand.pendant_count <= 1) s += 2.0;
+            break;
+
         case GreedyPolicy::AggressiveMultiCut:
-            s += 2.00 * cand.immediate_gain;
-            s -= 0.005 * cand.conflict_mass;
-            return s;
-        case GreedyPolicy::PreferSmallComponents:
-            s -= 0.04 * cand.component_size; return s;
-        case GreedyPolicy::PreferLargeComponents:
-            s += 0.03 * cand.component_size; return s;
-        case GreedyPolicy::PreferIsolatedLeaves:
-            if (!cand.same_component) s += 3.0; return s;
-        case GreedyPolicy::AvoidPendantsAtAll:
-            s -= 4.0 * cand.pendant_count; return s;
-        case GreedyPolicy::MinimiseConflictLeafMass:
-            s -= 0.045 * cand.conflict_mass; // mass already computed as total subtree mass
-            return s;
-        case GreedyPolicy::PreferSmallLabels:
-            s -= 0.0001 * (a + b); return s;   // tiny bias
-        case GreedyPolicy::PreferLargeLabels:
-            s += 0.0001 * (a + b); return s;
+            s += 3.0 * static_cast<double>(cand.immediate_gain);
+            if (cand.pendant_count >= 2) s += 1.5;
+            break;
+
         default:
-            return s;
+            break;
     }
+    return s;
 }
 
 CherryCandidate build_cherry_candidate(
@@ -2038,7 +2082,7 @@ CherryCandidate build_cherry_candidate(
         cand.path.assign(path_ref.begin(), path_ref.end());
 
         cand.distance = cand.path.empty() ? 0 : static_cast<int>(cand.path.size()) - 1;
-        cand.pendants = pendant_children_on_path(f, cand.path);
+        fill_pendant_children_on_path(f, cand.path, cand.pendants);
         cand.pendant_count = static_cast<int>(cand.pendants.size());
         for (int u : cand.pendants) {
             if (u >= 0 && u < static_cast<int>(f_mass.size())) cand.conflict_mass += f_mass[u];
@@ -2070,10 +2114,10 @@ double evaluate_reduced_state(
 ) {
     auto f_mass = compute_active_leaf_masses(f);
     PathScratch path_scratch;
-    int comp_count = count_root_components(f);
+    int comp_count = f.root_component_count;
     int sampled_pendants = 0;
     int sampled_conflict_mass = 0;
-    int active_leaves = active_leaf_count(t1);
+    int active_leaves = t1.active_leaf_count;
 
     int cherry_count = 0;
     int sampled = 0;
@@ -2199,48 +2243,8 @@ std::vector<int> choose_cut_plan(
         int nl = next_label;
         apply_cut_plan(f, plans[i], &undo);
         contract_all_common_cherries(t1, f, nl, &undo);
-        double val;
-        switch (policy) {
-            case GreedyPolicy::PreferFewestComponentsAfterCut:
-                val = -static_cast<double>(count_root_components(f)); break;
-            case GreedyPolicy::PreferLeafCutsOverPendants: {
-                val = evaluate_reduced_state(t1, f, total_leaves);
-                int leaf_cuts = 0;
-                for (int u : plans[i]) {
-                    if (is_active_leaf(f, u)) ++leaf_cuts;
-                }
-                val += 2.0 * leaf_cuts;
-                break;
-            }
-            case GreedyPolicy::PreferBalancedCuts: {
-                auto f_mass_after = compute_active_leaf_masses(f);
-                int max_mass = 0, sum_mass = 0;
-                for (int u = 0; u < static_cast<int>(f.nodes.size()); ++u) {
-                    if (!f.nodes[u].active || f.nodes[u].parent != -1) continue;
-                    int m = f_mass_after[u];
-                    max_mass = std::max(max_mass, m);
-                    sum_mass += m;
-                }
-                val = -static_cast<double>(max_mass) - 0.01 * sum_mass;
-                break;
-            }
-            case GreedyPolicy::PreferCuttingSmallestMass: {
-                // simplest: just pick the cut whose target node has smallest mass
-                int smallest_mass = std::numeric_limits<int>::max();
-                for (int u : plans[i]) {
-                    if (u >= 0 && u < static_cast<int>(f_mass.size())) {
-                        smallest_mass = std::min(smallest_mass, f_mass[u]);
-                    }
-                }
-                val = -static_cast<double>(smallest_mass);
-                break;
-            }
-            default:
-                val = evaluate_reduced_state(t1, f, total_leaves)
-                      - 0.05 * static_cast<double>(plans[i].size());
-        }
+        double val = evaluate_reduced_state(t1, f, total_leaves) - 0.05 * static_cast<double>(plans[i].size());
         undo.undo_to(mark);
-
         if (val > best + 1e-9) {
             best = val;
             best_indices = {i};
@@ -2303,59 +2307,6 @@ struct ThreeApproxResult {
     std::vector<std::vector<int>> comps;
     bool complete = false;
 };
-
-std::string serialize_payload_canon(
-    const DynamicTree& t,
-    int payload_id,
-    std::vector<std::string>& cache
-) {
-    if (payload_id < 0 || payload_id >= static_cast<int>(t.payloads.size())) return {};
-    if (!cache[static_cast<size_t>(payload_id)].empty()) return cache[static_cast<size_t>(payload_id)];
-    const auto& p = t.payloads[static_cast<size_t>(payload_id)];
-    if (p.leaf_label != -1) {
-        cache[static_cast<size_t>(payload_id)] = "L" + std::to_string(p.leaf_label);
-        return cache[static_cast<size_t>(payload_id)];
-    }
-    std::string a = serialize_payload_canon(t, p.left, cache);
-    std::string b = serialize_payload_canon(t, p.right, cache);
-    if (a > b) std::swap(a, b);
-    cache[static_cast<size_t>(payload_id)] = "(" + a + "," + b + ")";
-    return cache[static_cast<size_t>(payload_id)];
-}
-
-std::string serialize_active_node_canon(
-    const DynamicTree& t,
-    int u,
-    std::vector<std::string>& payload_cache
-) {
-    if (u == -1 || !t.nodes[u].active) return {};
-    if (t.nodes[u].left == -1 && t.nodes[u].right == -1) {
-        return serialize_payload_canon(t, t.nodes[u].payload_id, payload_cache);
-    }
-    std::string a = serialize_active_node_canon(t, t.nodes[u].left, payload_cache);
-    std::string b = serialize_active_node_canon(t, t.nodes[u].right, payload_cache);
-    if (a.empty()) return b;
-    if (b.empty()) return a;
-    if (a > b) std::swap(a, b);
-    return "(" + a + "," + b + ")";
-}
-
-std::string serialize_active_forest_canon(const DynamicTree& t) {
-    std::vector<std::string> payload_cache(t.payloads.size());
-    std::vector<std::string> roots;
-    roots.reserve(count_root_components(t));
-    for (int u = 0; u < static_cast<int>(t.nodes.size()); ++u) {
-        if (!t.nodes[u].active || t.nodes[u].parent != -1) continue;
-        roots.push_back(serialize_active_node_canon(t, u, payload_cache));
-    }
-    std::sort(roots.begin(), roots.end());
-    std::string out;
-    for (const auto& s : roots) {
-        out += s;
-        out.push_back('|');
-    }
-    return out;
-}
 
 struct CanonHash {
     uint64_t a = 0;
@@ -2476,8 +2427,8 @@ ExactStateKey exact_state_key(const DynamicTree& t1, const DynamicTree& f) {
     ExactStateKey key;
     key.t1_hash = hash_active_forest_canon(t1);
     key.f_hash = hash_active_forest_canon(f);
-    key.active_leaves = active_leaf_count(t1);
-    key.forest_components = count_root_components(f);
+    key.active_leaves = t1.active_leaf_count;
+    key.forest_components = f.root_component_count;
     return key;
 }
 
@@ -2542,31 +2493,48 @@ void collect_current_components(const DynamicTree& f, std::vector<std::vector<in
 }
 
 void exact_kernel_dfs(
-    DynamicTree t1,
-    DynamicTree f,
-    int next_label,
+    DynamicTree& t1,
+    DynamicTree& f,
+    int& next_label,
     Clock::time_point deadline,
     int& best_components,
     std::vector<std::vector<int>>& best_comps,
     std::unordered_map<ExactStateKey, int, ExactStateKeyHash>& memo,
+    UndoLog& undo,
     ExactSearchStats* stats = nullptr
 ) {
+    size_t entry_mark = undo.mark();
+    int entry_next_label = next_label;
+
+    auto cleanup = [&]() {
+        next_label = entry_next_label;
+        undo.undo_to(entry_mark);
+    };
+
     PathScratch path_scratch;
+
     if (stats) ++stats->nodes;
+
     if (g_terminate || Clock::now() >= deadline) {
         if (stats) ++stats->deadline_prunes;
+        cleanup();
         return;
     }
 
-    contract_all_common_cherries(t1, f, next_label);
-    int current_components = count_root_components(f);
+    contract_all_common_cherries(t1, f, next_label, &undo);
+
+    int current_components = f.root_component_count;
+
     if (current_components >= best_components) {
         if (stats) ++stats->bound_prunes;
+        cleanup();
         return;
     }
+
     int lb = exact_conflict_lower_bound(t1, f);
     if (current_components + lb >= best_components) {
         if (stats) ++stats->lb_prunes;
+        cleanup();
         return;
     }
 
@@ -2577,14 +2545,17 @@ void exact_kernel_dfs(
             ++stats->memo_hits;
             ++stats->bound_prunes;
         }
+        cleanup();
         return;
     }
+
     memo[key] = current_components;
 
     auto cherries = cherries_by_label(t1);
-    if (cherries.empty() || active_leaf_count(t1) <= 2) {
+    if (cherries.empty() || t1.active_leaf_count <= 2) {
         best_components = current_components;
         collect_current_components(f, best_comps);
+        cleanup();
         return;
     }
 
@@ -2592,7 +2563,7 @@ void exact_kernel_dfs(
     CherryCandidate best_cand;
     bool have = false;
     for (auto [a, b] : cherries) {
-        auto cand = build_cherry_candidate(t1, f, f_mass, a, b, active_leaf_count(t1), &path_scratch);
+        auto cand = build_cherry_candidate(t1, f, f_mass, a, b, t1.active_leaf_count, &path_scratch);
         if (!have || cand.score > best_cand.score) {
             best_cand = std::move(cand);
             have = true;
@@ -2624,7 +2595,7 @@ void exact_kernel_dfs(
         int nl = next_label;
         apply_cut_plan(f, plans[static_cast<size_t>(i)], &undo);
         contract_all_common_cherries(t1, f, nl, &undo);
-        double val = evaluate_reduced_state(t1, f, active_leaf_count(t1)) - 0.05 * static_cast<double>(plans[static_cast<size_t>(i)].size());
+        double val = evaluate_reduced_state(t1, f, t1.active_leaf_count) - 0.05 * static_cast<double>(plans[static_cast<size_t>(i)].size());
         undo.undo_to(mark);
         ranked.push_back({-val, i});
     }
@@ -2632,11 +2603,20 @@ void exact_kernel_dfs(
 
     for (const auto& rank : ranked) {
         const auto& plan = plans[static_cast<size_t>(rank.second)];
-        DynamicTree nf = f;
-        apply_cut_plan(nf, plan);
-        exact_kernel_dfs(t1, nf, next_label, deadline, best_components, best_comps, memo, stats);
-        if (g_terminate || Clock::now() >= deadline) return;
+        size_t mark = undo.mark();
+        int saved_next_label = next_label;
+
+        apply_cut_plan(f, plan, &undo);
+        exact_kernel_dfs(t1, f, next_label, deadline, best_components, best_comps, memo, undo, stats);
+
+        next_label = saved_next_label;
+        undo.undo_to(mark);
+        if (g_terminate || Clock::now() >= deadline) {
+            cleanup();
+            return;
+        }
     }
+    cleanup();
 }
 
 ExactKernelResult solve_exact_kernel_bounded(
@@ -2673,17 +2653,24 @@ ExactKernelResult solve_exact_kernel_bounded(
     stats.triggered = true;
     auto exact_start = Clock::now();
     ExactSearchStats* stats_ptr = exact_profile_enabled() ? &stats : nullptr;
+
+    DynamicTree t1 = dt1_base;
+    DynamicTree f = dt2_base;
+    int next_label = reduced_n + 1;
+    UndoLog undo;
+
     exact_kernel_dfs(
-        dt1_base,
-        dt2_base,
-        reduced_n + 1,
+        t1,
+        f,
+        next_label,
         exact_deadline,
         best_components,
         best_comps,
         memo,
+        undo,
         stats_ptr
     );
-    stats.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        stats.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - exact_start
     ).count();
     stats.incumbent_after = best_components;
@@ -3609,7 +3596,6 @@ bool run_discrepancy_polish(
     Clock::time_point deadline,
     uint64_t seed_base,
     const std::vector<EliteSolution>& elite_pool
-
 ) {
     (void)seed_base;
     auto now = Clock::now();
@@ -3762,10 +3748,10 @@ std::vector<std::vector<int>> deterministic_lds_scripts(int n) {
     std::vector<std::vector<int>> scripts;
     scripts.push_back({});
 
-    int max_rank = 3;
-    int max_depth = 8;   // was limited earlier, increase
-    int max_cost = 12;   // was 9 now 12
-    size_t cap = 256;    // aim for many scripts
+    int max_rank = n <= 600 ? 3 : 2;
+    int max_depth = n <= 300 ? 6 : (n <= 600 ? 5 : 4);
+    int max_cost = n <= 300 ? 9 : (n <= 600 ? 7 : 5);
+    size_t cap = n <= 300 ? 96 : (n <= 600 ? 64 : 32);
 
     std::vector<int> cur;
     for (int cost = 1; cost <= max_cost && scripts.size() < cap; ++cost) {
@@ -3782,8 +3768,7 @@ void add_deterministic_config(
     std::vector<int> discrepancy,
     bool elite_guided,
     int cherry_sample_cap = 0,
-    long long budget_ms = 0,
-    double elite_bonus = 5.0   // <--- NEW
+    long long budget_ms = 0
 ) {
     std::string key;
     key.reserve(64 + discrepancy.size() * 3);
@@ -3805,7 +3790,6 @@ void add_deterministic_config(
     cfg.elite_guided = elite_guided;
     cfg.cherry_sample_cap = cherry_sample_cap;
     cfg.budget_ms = budget_ms;
-    cfg.elite_bonus = elite_bonus;
     configs.push_back(std::move(cfg));
 }
 
@@ -3855,100 +3839,150 @@ std::vector<DeterministicRunConfig> deterministic_configs_for_size(int n) {
     std::vector<DeterministicRunConfig> configs;
     std::unordered_set<std::string> seen;
 
-    // Helper lambda to add a set of policies quickly
-    auto add_policy = [&](GreedyPolicy pol, bool elite=false, double elite_bonus=5.0,
-                          const std::vector<int>& disc={}) {
-        add_deterministic_config(configs, seen, false, pol, disc, elite, 0, 0, elite_bonus);
-        add_deterministic_config(configs, seen, true,  pol, disc, elite, 0, 0, elite_bonus);
+    auto add_core_policy_set = [&](bool swapped, const std::vector<int>& script, bool elite) {
+        add_deterministic_config(configs, seen, swapped, GreedyPolicy::Balanced, script, elite);
+        add_deterministic_config(configs, seen, swapped, GreedyPolicy::PreferDifferentComponent, script, elite);
+        add_deterministic_config(configs, seen, swapped, GreedyPolicy::PreferLowConflictMass, script, elite);
+        add_deterministic_config(configs, seen, swapped, GreedyPolicy::PreferImmediateGain, script, elite);
     };
 
-    // Base policies, always added, with swapped and non-swapped.
-    const std::vector<GreedyPolicy> base_policies = {
-        GreedyPolicy::Balanced,
-        GreedyPolicy::PreferDifferentComponent,
-        GreedyPolicy::PreferLowConflictMass,
-        GreedyPolicy::PreferFewPendants,
-        GreedyPolicy::PreferImmediateGain,
-        GreedyPolicy::ConservativeSingleCut,
-        GreedyPolicy::AggressiveMultiCut,
-        GreedyPolicy::PreferSmallComponents,
-        GreedyPolicy::PreferLargeComponents,
-        GreedyPolicy::PreferIsolatedLeaves,
-        GreedyPolicy::AvoidPendantsAtAll,
-        GreedyPolicy::MinimiseConflictLeafMass
-    };
+    /*
+        VERY LARGE INSTANCES:
+        We cannot afford a deep LDS portfolio. Instead, run multiple shallow,
+        sampled passes with different policies and different sample caps.
 
-    // Generate LDS scripts (more below)
-    auto scripts = deterministic_lds_scripts(n);
+        The idea:
+        - one fast first pass to get a publishable incumbent quickly
+        - several medium-budget passes with different cherry sampling
+        - a few swapped-tree and discrepancy variants
+        - avoid exhaustive scripts because n is too large
+    */
+    if (n > 4000) {
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, false, 64, 9000);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, false, 96, 7000);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, false, 160, 6500);
 
+        add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, {}, false, 96, 6500);
+        add_deterministic_config(configs, seen, true, GreedyPolicy::PreferDifferentComponent, {}, false, 96, 6000);
+
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, {}, false, 128, 6500);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, {}, false, 128, 6500);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferFewPendants, {}, false, 128, 6000);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {}, false, 128, 6000);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::AggressiveMultiCut, {}, false, 96, 6000);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::ConservativeSingleCut, {}, false, 128, 5500);
+
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {1}, false, 128, 5500);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {2}, false, 128, 5500);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, {1}, false, 128, 5000);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, {1}, false, 128, 5000);
+        add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, {1}, false, 96, 5000);
+
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true, 128, 5000);
+        add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, {}, true, 96, 4500);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {}, true, 128, 4500);
+
+        finalize_deterministic_configs(configs, n);
+        return configs;
+    }
+
+    /*
+        LARGE INSTANCES:
+        More room for LDS than n > 4000, but still not enough for the full
+        medium-instance portfolio. Use shallow scripts and policy diversity.
+    */
     if (n > 1000) {
-        // Large instances: limited policy set, fast sample cap, few scripts
-        int fast_sample = n > 4000 ? 64 : 128;
-        for (auto pol : base_policies) {
-            add_deterministic_config(configs, seen, false, pol, {}, false, fast_sample);
-            if (pol == GreedyPolicy::Balanced || pol == GreedyPolicy::PreferDifferentComponent)
-                add_deterministic_config(configs, seen, true, pol, {}, false, fast_sample);
-        }
-        // scripts limited to first 4
-        for (size_t i = 0; i < std::min<size_t>(4, scripts.size()); ++i) {
-            add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, scripts[i], false);
-        }
-        // elite variants
-        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true, 0, 0, 2.0);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true, 0, 0, 10.0);
-    } else if (n > 600) {
-        // Medium-large: all base policies, deeper scripts, some plan policies
-        for (auto pol : base_policies) add_policy(pol);
-        // cut-plan specific policies, no swap needed (they affect choose_cut_plan internally)
-        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferFewestComponentsAfterCut, {}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLeafCutsOverPendants, {}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferBalancedCuts, {}, false);
-        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferCuttingSmallestMass, {}, false);
+        std::vector<std::vector<int>> scripts = {
+            {},
+            {1},
+            {2},
+            {1, 1},
+            {1, 2},
+            {2, 1},
+            {3}
+        };
 
-        // scripts up to 64
-        size_t max_script = std::min<size_t>(64, scripts.size());
-        for (size_t i = 0; i < max_script; ++i) {
-            add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, scripts[i], false);
-            if (i % 2 == 0) // also swap some
-                add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, scripts[i], false);
-        }
-        // elite variants with different bonuses
-        for (double bonus : {2.0, 5.0, 10.0}) {
-            add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true, 0, 0, bonus);
-            if (bonus != 5.0)
-                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {}, true, 0, 0, bonus);
-        }
+        for (const auto& script : scripts) {
+            add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, script, false, 160, script.empty() ? 4500 : 3500);
+            add_deterministic_config(configs, seen, true,  GreedyPolicy::Balanced, script, false, 160, 3300);
 
-    } else {
-        // Small/medium: all base, all scripts, all plan policies, various elite bonuses
-        for (auto pol : base_policies) {
-            add_policy(pol);
-            // elite with each base policy
-            for (double bonus : {2.0, 5.0, 10.0}) {
-                add_deterministic_config(configs, seen, false, pol, {}, true, 0, 0, bonus);
-                if (pol == GreedyPolicy::Balanced || pol == GreedyPolicy::PreferImmediateGain)
-                    add_deterministic_config(configs, seen, true, pol, {}, true, 0, 0, bonus);
+            if (script.size() <= 1) {
+                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, script, false, 192, 3500);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, script, false, 192, 3500);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferFewPendants, script, false, 192, 3200);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, script, false, 160, 3200);
             }
         }
-        // plan policies
-        for (auto pol : {
-            GreedyPolicy::PreferFewestComponentsAfterCut,
-            GreedyPolicy::PreferLeafCutsOverPendants,
-            GreedyPolicy::PreferBalancedCuts,
-            GreedyPolicy::PreferCuttingSmallestMass
-        }) add_policy(pol);
 
-        // all LDS scripts
-        for (const auto& disc : scripts) {
-            add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, disc, false);
-            add_deterministic_config(configs, seen, true,  GreedyPolicy::Balanced, disc, false);
-            add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, disc, false);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::AggressiveMultiCut, {}, false, 160, 3500);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::ConservativeSingleCut, {}, false, 192, 3200);
+
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true, 160, 3000);
+        add_deterministic_config(configs, seen, true,  GreedyPolicy::Balanced, {}, true, 160, 3000);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, {}, true, 192, 2800);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {1}, true, 160, 2800);
+
+        finalize_deterministic_configs(configs, n);
+        return configs;
+    }
+
+    /*
+        UPPER-MEDIUM INSTANCES:
+        Here the current solver is too timid. We can afford a bigger LDS set.
+    */
+    if (n > 600) {
+        for (const auto& script : deterministic_lds_scripts(n)) {
+            add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, script, false);
+
+            if (script.size() <= 3) {
+                add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, script, false);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, script, false);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, script, false);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, script, false);
+            }
+
+            if (script.size() <= 1) {
+                add_deterministic_config(configs, seen, true, GreedyPolicy::PreferDifferentComponent, script, false);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::PreferFewPendants, script, false);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::ConservativeSingleCut, script, false);
+                add_deterministic_config(configs, seen, false, GreedyPolicy::AggressiveMultiCut, script, false);
+            }
         }
-        // Some scripts with elite guidance
-        for (size_t i = 0; i < std::min<size_t>(20, scripts.size()); ++i) {
-            add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, scripts[i], true);
+
+        add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true);
+        add_deterministic_config(configs, seen, true,  GreedyPolicy::Balanced, {}, true);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferDifferentComponent, {}, true);
+        add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {1}, true);
+
+        finalize_deterministic_configs(configs, n);
+        return configs;
+    }
+
+    /*
+        SMALL / MEDIUM INSTANCES:
+        Here exhaustive portfolio diversity is useful, because each run is cheap.
+    */
+    for (const auto& script : deterministic_lds_scripts(n)) {
+        add_core_policy_set(false, script, false);
+        add_core_policy_set(true, script, false);
+
+        if (script.size() <= 3) {
+            add_deterministic_config(configs, seen, false, GreedyPolicy::PreferFewPendants, script, false);
+            add_deterministic_config(configs, seen, false, GreedyPolicy::ConservativeSingleCut, script, false);
+            add_deterministic_config(configs, seen, false, GreedyPolicy::AggressiveMultiCut, script, false);
+        }
+
+        if (script.size() <= 2) {
+            add_core_policy_set(false, script, true);
+            add_deterministic_config(configs, seen, true, GreedyPolicy::Balanced, script, true);
         }
     }
+
+    add_deterministic_config(configs, seen, false, GreedyPolicy::Balanced, {}, true);
+    add_deterministic_config(configs, seen, true,  GreedyPolicy::Balanced, {}, true);
+    add_deterministic_config(configs, seen, false, GreedyPolicy::PreferImmediateGain, {1}, true);
+    add_deterministic_config(configs, seen, false, GreedyPolicy::PreferLowConflictMass, {1}, true);
+    add_deterministic_config(configs, seen, true,  GreedyPolicy::PreferDifferentComponent, {}, true);
 
     finalize_deterministic_configs(configs, n);
     return configs;
@@ -4031,7 +4065,7 @@ std::vector<std::vector<int>> solve_direct_reduced(
 
         if (cfg.elite_guided && !elite_pool.empty()) {
             elite_comp_map = &elite_pool.front().comp_of_leaf;
-            elite_bonus = cfg.elite_bonus;
+            elite_bonus = 5.0;
         }
 
         const std::vector<int>* discrepancy_ptr =
@@ -4217,6 +4251,24 @@ std::vector<std::vector<int>> solve_decomposed_candidate(
     return expand_reduced_components(reduced_comps, reduced.expansion);
 }
 
+double score_after_single_cut(
+    const DynamicTree& t1,
+    DynamicTree& f,
+    int cut_node,
+    int n,
+    UndoLog& undo
+) {
+    size_t mark = undo.mark();
+
+    cut_edge_above(f, cut_node, &undo);
+
+    double score = 4.0 * static_cast<double>(count_common_cherries(t1, f))
+                 - 1.0 * static_cast<double>(f.root_component_count);
+
+    undo.undo_to(mark);
+    return score;
+}
+
 ThreeApproxResult run_three_approx(
     DynamicTree t1,
     DynamicTree f,
@@ -4231,19 +4283,23 @@ ThreeApproxResult run_three_approx(
     int cherry_sample_cap
 ) {
     int next_label = n + 1;
-    auto close_common = [&]() {
-        contract_all_common_cherries(t1, f, next_label);
-    };
     bool timed_out_or_terminated = false;
     bool medium_mode = is_medium_instance_size(n);
     size_t discrepancy_step = 0;
-    uint64_t decision_step = 0;
+    uint64_t decision_step = 0; 
     PathScratch path_scratch;
+    std::vector<std::pair<int, int>> cherries;
+    cherries.reserve(static_cast<size_t>(n));
+
+    // Reusable scratch for O(1) duplicate checks while sampling cherry candidates.
+    // This avoids repeated std::find(candidate_indices.begin(), candidate_indices.end(), idx).
+    std::vector<int> sampled_seen;
+    int sampled_seen_stamp = 1;
 
     // Exhaust common cherries before branching.
-    close_common();
+    contract_all_common_cherries(t1, f, next_label);
 
-    while (!g_terminate && Clock::now() < deadline && active_leaf_count(t1) > 2) {
+    while (!g_terminate && Clock::now() < deadline && t1.active_leaf_count > 2) {
         // --- Step 1: remove singleton leaves in F that are roots ---
         // For each leaf in F that is a root, cut its corresponding edge in T1.
         for (int u = 0; u < static_cast<int>(f.nodes.size()); ++u) {
@@ -4260,11 +4316,11 @@ ThreeApproxResult run_three_approx(
         // Cuts never decrease the number of forest components, so once the
         // current forest cannot beat the incumbent we can abandon this restart.
         if (incumbent_components < std::numeric_limits<int>::max() &&
-            count_root_components(f) >= incumbent_components) {
+            f.root_component_count >= incumbent_components) {
             break;
         }
 
-        auto cherries = cherries_by_label(t1);
+        fill_cherries_by_label(t1, cherries);
         if (cherries.empty()) break;
 
         int common_idx = -1;
@@ -4317,35 +4373,67 @@ ThreeApproxResult run_three_approx(
 
             std::vector<RankedCherry> ranked;
             std::vector<size_t> candidate_indices;
+
             if (cherry_sample_cap > 0 &&
                 cherries.size() > static_cast<size_t>(cherry_sample_cap)) {
-                candidate_indices.reserve(static_cast<size_t>(cherry_sample_cap));
+
+                const size_t cap = static_cast<size_t>(cherry_sample_cap);
+                const size_t m = cherries.size();
+
+                candidate_indices.reserve(cap);
+
+                // Ensure sampled_seen is large enough for this decision step.
+                if (sampled_seen.size() < m) {
+                    sampled_seen.assign(m, 0);
+                    sampled_seen_stamp = 1;
+                }
+
+                // New stamp for this sampling round.
+                ++sampled_seen_stamp;
+                if (sampled_seen_stamp == std::numeric_limits<int>::max()) {
+                    std::fill(sampled_seen.begin(), sampled_seen.end(), 0);
+                    sampled_seen_stamp = 1;
+                }
+
+                auto add_candidate_index = [&](size_t idx) {
+                    if (sampled_seen[idx] == sampled_seen_stamp) return false;
+                    sampled_seen[idx] = sampled_seen_stamp;
+                    candidate_indices.push_back(idx);
+                    return true;
+                };
+
                 uint64_t start_seed = deterministic_pair_key(
                     tie_salt,
                     step_key,
-                    static_cast<int>(cherries.size()),
+                    static_cast<int>(m),
                     n,
                     2
                 );
-                size_t start = static_cast<size_t>(start_seed % cherries.size());
-                size_t stride = static_cast<size_t>((mix64(start_seed ^ 0xd1b54a32d192ed03ULL) % cherries.size()) | 1ULL);
+
+                size_t start = static_cast<size_t>(start_seed % m);
+
+                size_t stride = static_cast<size_t>(
+                    (mix64(start_seed ^ 0xd1b54a32d192ed03ULL) % m) | 1ULL
+                );
+
                 for (size_t attempts = 0;
-                     candidate_indices.size() < static_cast<size_t>(cherry_sample_cap) &&
-                     attempts < cherries.size() + static_cast<size_t>(cherry_sample_cap) * 4ULL;
-                     ++attempts) {
-                    size_t idx = (start + attempts * stride) % cherries.size();
-                    if (std::find(candidate_indices.begin(), candidate_indices.end(), idx) == candidate_indices.end()) {
-                        candidate_indices.push_back(idx);
-                    }
+                    candidate_indices.size() < cap &&
+                    attempts < m + cap * 4ULL;
+                    ++attempts) {
+
+                    size_t idx = (start + attempts * stride) % m;
+                    add_candidate_index(idx);
                 }
-                for (size_t idx = start;
-                     candidate_indices.size() < static_cast<size_t>(cherry_sample_cap) &&
-                     candidate_indices.size() < cherries.size();
-                     idx = (idx + 1) % cherries.size()) {
-                    if (std::find(candidate_indices.begin(), candidate_indices.end(), idx) == candidate_indices.end()) {
-                        candidate_indices.push_back(idx);
-                    }
+
+                // Fallback linear pass in case the strided walk did not collect enough unique indices.
+                for (size_t offset = 0;
+                    candidate_indices.size() < cap && offset < m;
+                    ++offset) {
+
+                    size_t idx = (start + offset) % m;
+                    add_candidate_index(idx);
                 }
+
             } else {
                 candidate_indices.resize(cherries.size());
                 std::iota(candidate_indices.begin(), candidate_indices.end(), 0);
@@ -4363,12 +4451,16 @@ ThreeApproxResult run_three_approx(
                 auto [ca, cb] = cherries[i];
 
                 auto cand = build_cherry_candidate(t1, f, f_mass, ca, cb, n, &path_scratch);
-                double score = score_cherry_candidate_policy(cand, n, policy, ca, cb);
+                double score = score_cherry_candidate_policy(cand, n, policy);
 
                 if (elite_comp_map && elite_comp_map->size() > static_cast<size_t>(n)) {
                     int ida = (*elite_comp_map)[static_cast<size_t>(ca)];
                     int idb = (*elite_comp_map)[static_cast<size_t>(cb)];
-                    if (ida != 0 && ida == idb) score += elite_bonus;
+
+                    if (ida != 0 && idb != 0) {
+                        if (ida == idb) score += elite_bonus;
+                        else score -= 0.5 * elite_bonus;
+                    }
                 }
 
                 uint64_t tie = deterministic_pair_key(tie_salt, step_key, ca, cb, 3);
@@ -4376,23 +4468,30 @@ ThreeApproxResult run_three_approx(
             }
             if (deadline_near || ranked.empty()) break;
 
-            std::sort(ranked.begin(), ranked.end(), [](const RankedCherry& x, const RankedCherry& y) {
+            size_t top_k = std::min<size_t>(4, ranked.size());
+
+            if (n > 4000) {
+                top_k = std::min<size_t>(3, ranked.size());
+            } else if (n > 1000) {
+                top_k = std::min<size_t>(4, ranked.size());
+            } else if (is_large_instance_size(n)) {
+                top_k = std::min<size_t>(4, ranked.size());
+            }
+
+            auto ranked_better = [](const RankedCherry& x, const RankedCherry& y) {
                 if (x.score != y.score) return x.score > y.score;
                 if (x.tie != y.tie) return x.tie < y.tie;
                 if (x.a != y.a) return x.a < y.a;
                 if (x.b != y.b) return x.b < y.b;
                 return x.idx < y.idx;
-            });
+            };
 
-            size_t top_k = std::min<size_t>(4, ranked.size());
-
-            if (is_large_instance_size(n)) {
-                top_k = std::min<size_t>(3, ranked.size());
-            }
-
-            if (n > 1000) {
-                top_k = std::min<size_t>(2, ranked.size());
-            }
+            std::partial_sort(
+                ranked.begin(),
+                ranked.begin() + static_cast<std::ptrdiff_t>(top_k),
+                ranked.end(),
+                ranked_better
+            );
 
             size_t rank_choice = 0;
 
@@ -4418,15 +4517,8 @@ ThreeApproxResult run_three_approx(
 
         if (ra != rb) {
             UndoLog undo;
-            size_t mark = undo.mark();
-            cut_edge_above(f, na, &undo);
-            double ma = medium_mode ? evaluate_reduced_state(t1, f, n) : static_cast<double>(count_common_cherries(t1, f));
-            undo.undo_to(mark);
-
-            mark = undo.mark();
-            cut_edge_above(f, nb, &undo);
-            double mb = medium_mode ? evaluate_reduced_state(t1, f, n) : static_cast<double>(count_common_cherries(t1, f));
-            undo.undo_to(mark);
+            double ma = score_after_single_cut(t1, f, na, n, undo);
+            double mb = score_after_single_cut(t1, f, nb, n, undo);
 
             if (ma > mb) {
                 cut_edge_above(f, na);
@@ -4447,7 +4539,7 @@ ThreeApproxResult run_three_approx(
                     else cut_edge_above(f, nb);
                 }
             }
-            close_common();
+
             continue;
         }
 
@@ -4455,7 +4547,6 @@ ThreeApproxResult run_three_approx(
         auto pendants = pendant_children_on_path(f, path);
         if (pendants.size() == 1) {
             cut_edge_above(f, pendants[0]);
-            close_common();
         } else {
             auto f_mass = compute_active_leaf_masses(f);
 
@@ -4467,7 +4558,6 @@ ThreeApproxResult run_three_approx(
 
                 if (!plan.empty() && static_cast<int>(plan.size()) <= max_plan_cuts) {
                     apply_cut_plan(f, plan);
-                    close_common();
                     continue;
                 }
             }
@@ -4500,7 +4590,6 @@ ThreeApproxResult run_three_approx(
                 } else {
                     cut_edge_above(f, na);
                 }
-                close_common();
             }
         }
     }
@@ -4653,7 +4742,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
 
         if (cfg.elite_guided && !elite_pool.empty()) {
             elite_comp_map = &elite_pool.front().comp_of_leaf;
-            elite_bonus = cfg.elite_bonus;
+            elite_bonus = 5.0;
         }
 
         const std::vector<int>* discrepancy =
