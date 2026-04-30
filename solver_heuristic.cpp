@@ -4114,9 +4114,6 @@ ThreeApproxResult run_three_approx(
     int cherry_sample_cap
 ) {
     int next_label = n + 1;
-    auto close_common = [&]() {
-        contract_all_common_cherries(t1, f, next_label);
-    };
     bool timed_out_or_terminated = false;
     bool medium_mode = is_medium_instance_size(n);
     size_t discrepancy_step = 0;
@@ -4124,7 +4121,7 @@ ThreeApproxResult run_three_approx(
     PathScratch path_scratch;
 
     // Exhaust common cherries before branching.
-    close_common();
+    contract_all_common_cherries(t1, f, next_label);
 
     while (!g_terminate && Clock::now() < deadline && active_leaf_count(t1) > 2) {
         // --- Step 1: remove singleton leaves in F that are roots ---
@@ -4330,7 +4327,7 @@ ThreeApproxResult run_three_approx(
                     else cut_edge_above(f, nb);
                 }
             }
-            close_common();
+
             continue;
         }
 
@@ -4338,7 +4335,6 @@ ThreeApproxResult run_three_approx(
         auto pendants = pendant_children_on_path(f, path);
         if (pendants.size() == 1) {
             cut_edge_above(f, pendants[0]);
-            close_common();
         } else {
             auto f_mass = compute_active_leaf_masses(f);
 
@@ -4350,7 +4346,6 @@ ThreeApproxResult run_three_approx(
 
                 if (!plan.empty() && static_cast<int>(plan.size()) <= max_plan_cuts) {
                     apply_cut_plan(f, plan);
-                    close_common();
                     continue;
                 }
             }
@@ -4383,7 +4378,6 @@ ThreeApproxResult run_three_approx(
                 } else {
                     cut_edge_above(f, na);
                 }
-                close_common();
             }
         }
     }
