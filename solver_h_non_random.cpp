@@ -4023,6 +4023,473 @@ DualitySeedResult run_duality_seed_candidate(
     return out;
 }
 
+// -----------------------------------------------------------------------------
+// ResolveSet-style 2-approx-inspired portfolio runner.
+//
+// This is the first real structural use of the 2-approx idea:
+// instead of only running run_three_approx() with a conservative policy,
+// this repeatedly selects an active sibling/cherry pair from T1 and applies
+// ResolvePair-like rules against the current forest F.
+//
+// It is intentionally safe:
+// - candidate is validated outside before acceptance;
+// - it never replaces the existing portfolio;
+// - it is deterministic;
+// - it can be disabled simply by removing the call sites.
+// -----------------------------------------------------------------------------
+
+enum class ResolveSetMode {
+    SmallConflict,
+    LargeConflict,
+    PreferDifferentComponent,
+    PreferPendantBatch,
+    PreferFinalCut
+};
+
+const char* resolve_set_mode_name(ResolveSetMode mode) {
+    switch (mode) {
+        case ResolveSetMode::SmallConflict: return "small_conflict";
+        case ResolveSetMode::LargeConflict: return "large_conflict";
+        case ResolveSetMode::PreferDifferentComponent: return "diff_component";
+        case ResolveSetMode::PreferPendantBatch: return "pendant_batch";
+        case ResolveSetMode::PreferFinalCut: return "final_cut";
+    }
+    return "unknown";
+}
+
+bool resolve_set_profile_enabled() {
+    static int enabled = []() {
+        const char* env = std::getenv("STRIDE_RESOLVE_PROFILE");
+        return (env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
+    }();
+    return enabled != 0;
+}
+
+void emit_resolve_set_profile(
+    const char* phase,
+    int n,
+    ResolveSetMode mode,
+    bool complete,
+    int components,
+    int steps,
+    int contractions,
+    int cuts,
+    long long elapsed_ms
+) {
+    if (!resolve_set_profile_enabled()) return;
+
+    std::cerr
+        << "RESOLVESET"
+        << " phase=" << phase
+        << " n=" << n
+        << " mode=" << resolve_set_mode_name(mode)
+        << " complete=" << (complete ? 1 : 0)
+        << " components=" << components
+        << " steps=" << steps
+        << " contractions=" << contractions
+        << " cuts=" << cuts
+        << " ms=" << elapsed_ms
+        << '\n';
+}
+
+double score_resolve_set_candidate(
+    const CherryCandidate& cand,
+    int n,
+    ResolveSetMode mode,
+    uint64_t tie
+) {
+    double inv = 1.0 / static_cast<double>(std::max(1, n));
+
+    // Common cherries should almost always be resolved immediately.
+    double s = cand.common ? 1000000.0 : 0.0;
+
+    switch (mode) {
+        case ResolveSetMode::SmallConflict:
+            s += cand.same_component ? 20.0 : 30.0;
+            s -= 4.0 * cand.conflict_mass * inv;
+            s -= 2.0 * cand.pendant_count;
+            s -= 0.05 * cand.distance;
+            break;
+
+        case ResolveSetMode::LargeConflict:
+            s += cand.same_component ? 25.0 : 20.0;
+            s += 5.0 * cand.conflict_mass * inv;
+            s += 2.0 * cand.pendant_count;
+            s -= 0.03 * cand.distance;
+            break;
+
+        case ResolveSetMode::PreferDifferentComponent:
+            s += cand.same_component ? 0.0 : 100.0;
+            s -= 2.0 * cand.conflict_mass * inv;
+            s -= 0.03 * cand.distance;
+            break;
+
+        case ResolveSetMode::PreferPendantBatch:
+            s += cand.same_component ? 80.0 : 10.0;
+            s += 4.0 * cand.pendant_count;
+            s += 2.0 * cand.immediate_gain;
+            s -= 0.03 * cand.distance;
+            break;
+
+        case ResolveSetMode::PreferFinalCut:
+            s += cand.same_component ? 40.0 : 45.0;
+            if (cand.pendant_count <= 1) s += 80.0;
+            s += 3.0 * cand.immediate_gain;
+            s -= 0.02 * cand.distance;
+            break;
+    }
+
+    // Stable deterministic tie-breaker.
+    s -= static_cast<double>(tie & 0xffffULL) * 1e-9;
+    return s;
+}
+
+int resolve_set_sample_cap_for_size(int n) {
+    if (n > 4000) return 192;
+    if (n > 1000) return 256;
+    if (n > 600)  return 384;
+    return 0;
+}
+
+std::chrono::milliseconds resolve_set_budget_for_size(int n, long long ms_left) {
+    long long budget_ms = 0;
+
+    if (n > 4000) {
+        budget_ms = std::min<long long>(9000, std::max<long long>(1500, ms_left / 14));
+    } else if (n > 1000) {
+        budget_ms = std::min<long long>(4200, std::max<long long>(800, ms_left / 20));
+    } else if (n > 600) {
+        budget_ms = std::min<long long>(2200, std::max<long long>(450, ms_left / 28));
+    } else if (n > 300) {
+        budget_ms = std::min<long long>(1200, std::max<long long>(250, ms_left / 35));
+    } else {
+        budget_ms = std::min<long long>(700, std::max<long long>(120, ms_left / 45));
+    }
+
+    return std::chrono::milliseconds(std::max<long long>(40, budget_ms));
+}
+
+std::vector<int> choose_resolve_set_cut_plan(
+    DynamicTree& t1,
+    DynamicTree& f,
+    const CherryCandidate& cand,
+    int next_label,
+    int n,
+    const std::vector<int>& f_mass,
+    ResolveSetMode mode,
+    uint64_t tie_salt
+) {
+    std::vector<int> plan;
+
+    if (cand.na == -1 || cand.nb == -1) return plan;
+
+    // Different components: this mimics the ResolvePair behaviour where
+    // one endpoint is detached. Prefer the smaller component because it
+    // usually causes less downstream damage.
+    if (!cand.same_component) {
+        int ma = (cand.ra >= 0 && cand.ra < static_cast<int>(f_mass.size())) ? f_mass[cand.ra] : 1;
+        int mb = (cand.rb >= 0 && cand.rb < static_cast<int>(f_mass.size())) ? f_mass[cand.rb] : 1;
+
+        if (mode == ResolveSetMode::LargeConflict) {
+            // Diversification variant: sometimes detach the heavier side.
+            if (ma >= mb) plan.push_back(cand.na);
+            else plan.push_back(cand.nb);
+        } else {
+            if (ma <= mb) plan.push_back(cand.na);
+            else plan.push_back(cand.nb);
+        }
+        return plan;
+    }
+
+    // Same component: if there are pendant subtrees on the path, ResolvePair
+    // style behaviour is to cut pendant material from the path.
+    if (!cand.pendants.empty()) {
+        std::vector<int> sorted = cand.pendants;
+        std::sort(sorted.begin(), sorted.end(), [&](int x, int y) {
+            int mx = (x >= 0 && x < static_cast<int>(f_mass.size())) ? f_mass[x] : 1;
+            int my = (y >= 0 && y < static_cast<int>(f_mass.size())) ? f_mass[y] : 1;
+            if (mx != my) return mx < my;
+            return x < y;
+        });
+
+        if (mode == ResolveSetMode::PreferPendantBatch) {
+            int cap = 0;
+            if (n > 4000) cap = 2;
+            else if (n > 1000) cap = 3;
+            else if (n > 600) cap = 4;
+            else cap = 5;
+
+            cap = std::min<int>(cap, static_cast<int>(sorted.size()));
+            for (int i = 0; i < cap; ++i) {
+                plan.push_back(sorted[static_cast<size_t>(i)]);
+            }
+            return plan;
+        }
+
+        // Conservative/final-cut variants cut one pendant only.
+        plan.push_back(sorted.front());
+        return plan;
+    }
+
+    // No pendant available. Fall back to cutting one endpoint.
+    int ma = (cand.na >= 0 && cand.na < static_cast<int>(f_mass.size())) ? f_mass[cand.na] : 1;
+    int mb = (cand.nb >= 0 && cand.nb < static_cast<int>(f_mass.size())) ? f_mass[cand.nb] : 1;
+
+    if (ma != mb) {
+        if (ma <= mb) plan.push_back(cand.na);
+        else plan.push_back(cand.nb);
+    } else {
+        uint64_t h = deterministic_pair_key(tie_salt, 0, cand.a, cand.b, 777);
+        if ((h & 1ULL) == 0ULL) plan.push_back(cand.na);
+        else plan.push_back(cand.nb);
+    }
+
+    return plan;
+}
+
+ThreeApproxResult run_resolve_set_approx(
+    DynamicTree t1,
+    DynamicTree f,
+    Clock::time_point deadline,
+    int n,
+    int incumbent_components,
+    ResolveSetMode mode,
+    uint64_t tie_salt,
+    int cherry_sample_cap = 0,
+    const char* phase = "main"
+) {
+    auto started = Clock::now();
+
+    int next_label = n + 1;
+    int steps = 0;
+    int contractions = 0;
+    int cuts = 0;
+    bool timed_out_or_terminated = false;
+
+    PathScratch path_scratch;
+    std::vector<std::pair<int, int>> cherries;
+    cherries.reserve(static_cast<size_t>(n));
+
+    if (cherry_sample_cap <= 0) {
+        cherry_sample_cap = resolve_set_sample_cap_for_size(n);
+    }
+
+    contract_all_common_cherries(t1, f, next_label);
+
+    while (!g_terminate && Clock::now() < deadline && t1.active_leaf_count > 2) {
+        ++steps;
+
+        // Remove singleton roots in F from T1 as in the existing heuristic.
+        for (int u = 0; u < static_cast<int>(f.nodes.size()); ++u) {
+            if (!f.nodes[u].active) continue;
+            if (f.nodes[u].left == -1 && f.nodes[u].right == -1 && f.nodes[u].parent == -1) {
+                int lbl = f.nodes[u].label;
+                int v = find_node_of_label(t1, lbl);
+                if (v != -1) {
+                    cut_edge_above(t1, v);
+                }
+            }
+        }
+
+        if (incumbent_components < std::numeric_limits<int>::max() &&
+            f.root_component_count >= incumbent_components) {
+            break;
+        }
+
+        contract_all_common_cherries(t1, f, next_label);
+
+        fill_cherries_by_label(t1, cherries);
+        if (cherries.empty()) break;
+
+        bool deadline_near = false;
+        auto f_mass = compute_active_leaf_masses(f);
+
+        struct RankedResolveCandidate {
+            double score = -std::numeric_limits<double>::infinity();
+            size_t idx = 0;
+            int a = -1;
+            int b = -1;
+            uint64_t tie = 0;
+            CherryCandidate cand;
+        };
+
+        std::vector<size_t> candidate_indices;
+
+        if (cherry_sample_cap > 0 &&
+            cherries.size() > static_cast<size_t>(cherry_sample_cap)) {
+
+            size_t m = cherries.size();
+            size_t cap = static_cast<size_t>(cherry_sample_cap);
+            candidate_indices.reserve(cap);
+
+            uint64_t start_seed = deterministic_pair_key(
+                tie_salt,
+                static_cast<uint64_t>(steps),
+                static_cast<int>(m),
+                n,
+                901
+            );
+
+            size_t start = static_cast<size_t>(start_seed % m);
+            size_t stride = static_cast<size_t>(
+                (mix64(start_seed ^ 0x4cf5ad432745937fULL) % m) | 1ULL
+            );
+
+            std::vector<char> seen(m, 0);
+            for (size_t attempts = 0;
+                 candidate_indices.size() < cap && attempts < m + cap * 4ULL;
+                 ++attempts) {
+                size_t idx = (start + attempts * stride) % m;
+                if (seen[idx]) continue;
+                seen[idx] = 1;
+                candidate_indices.push_back(idx);
+            }
+
+            for (size_t offset = 0;
+                 candidate_indices.size() < cap && offset < m;
+                 ++offset) {
+                size_t idx = (start + offset) % m;
+                if (seen[idx]) continue;
+                seen[idx] = 1;
+                candidate_indices.push_back(idx);
+            }
+        } else {
+            candidate_indices.resize(cherries.size());
+            std::iota(candidate_indices.begin(), candidate_indices.end(), 0);
+        }
+
+        std::vector<RankedResolveCandidate> ranked;
+        ranked.reserve(candidate_indices.size());
+
+        for (size_t k = 0; k < candidate_indices.size(); ++k) {
+            if ((k & 63ULL) == 0ULL &&
+                (g_terminate || Clock::now() + std::chrono::milliseconds(2) >= deadline)) {
+                deadline_near = true;
+                break;
+            }
+
+            size_t idx = candidate_indices[k];
+            auto [a, b] = cherries[idx];
+
+            CherryCandidate cand = build_cherry_candidate(
+                t1,
+                f,
+                f_mass,
+                a,
+                b,
+                n,
+                &path_scratch
+            );
+
+            if (cand.na == -1 || cand.nb == -1) continue;
+
+            uint64_t tie = deterministic_pair_key(
+                tie_salt,
+                static_cast<uint64_t>(steps),
+                a,
+                b,
+                902
+            );
+
+            double score = score_resolve_set_candidate(cand, n, mode, tie);
+
+            ranked.push_back({
+                score,
+                idx,
+                a,
+                b,
+                tie,
+                std::move(cand)
+            });
+        }
+
+        if (deadline_near || ranked.empty()) break;
+
+        std::sort(ranked.begin(), ranked.end(), [](const RankedResolveCandidate& x, const RankedResolveCandidate& y) {
+            if (x.score != y.score) return x.score > y.score;
+            if (x.tie != y.tie) return x.tie < y.tie;
+            if (x.a != y.a) return x.a < y.a;
+            if (x.b != y.b) return x.b < y.b;
+            return x.idx < y.idx;
+        });
+
+        CherryCandidate cand = ranked.front().cand;
+
+        // ResolvePair case 1: common cherry.
+        if (cand.common) {
+            int nl = next_label++;
+            if (contract_cherry(t1, cand.a, cand.b, nl) &&
+                contract_cherry(f, cand.a, cand.b, nl)) {
+                ++contractions;
+                continue;
+            }
+        }
+
+        // ResolvePair cases 2/3: cut endpoint or pendant path material.
+        auto plan = choose_resolve_set_cut_plan(
+            t1,
+            f,
+            cand,
+            next_label,
+            n,
+            f_mass,
+            mode,
+            tie_salt ^ static_cast<uint64_t>(steps)
+        );
+
+        if (plan.empty()) {
+            if (cand.na != -1) plan.push_back(cand.na);
+            else break;
+        }
+
+        // Keep batch cuts bounded. This avoids the classic heuristic mistake:
+        // one heroic multi-cut that destroys a good forest.
+        int max_cuts = 1;
+        if (mode == ResolveSetMode::PreferPendantBatch) {
+            if (n > 4000) max_cuts = 2;
+            else if (n > 1000) max_cuts = 3;
+            else max_cuts = 4;
+        }
+
+        if (static_cast<int>(plan.size()) > max_cuts) {
+            plan.resize(static_cast<size_t>(max_cuts));
+        }
+
+        int before_components = f.root_component_count;
+        apply_cut_plan(f, plan);
+        cuts += std::max(0, f.root_component_count - before_components);
+
+        contract_all_common_cherries(t1, f, next_label);
+    }
+
+    if (g_terminate || Clock::now() >= deadline) {
+        timed_out_or_terminated = true;
+    }
+
+    ThreeApproxResult res;
+    collect_current_components(f, res.comps);
+    normalize_partition(res.comps);
+    res.complete = !timed_out_or_terminated;
+
+    long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - started
+    ).count();
+
+    emit_resolve_set_profile(
+        phase,
+        n,
+        mode,
+        res.complete,
+        static_cast<int>(res.comps.size()),
+        steps,
+        contractions,
+        cuts,
+        elapsed_ms
+    );
+
+    return res;
+}
+
 bool run_discrepancy_polish(
     const ReducedInstance& reduced,
     const DynamicTree& dt1_base,
@@ -4527,6 +4994,68 @@ std::vector<std::vector<int>> solve_direct_reduced(
     }
     if (static_cast<int>(best_reduced.size()) <= prune_limit + 2) {
         maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
+    }
+    // ResolveSet-style 2-approx-inspired candidate.
+    // Test patch #1: one conservative mode only.
+    if (!g_terminate && Clock::now() + std::chrono::milliseconds(30) < deadline) {
+        auto now = Clock::now();
+        auto ms_left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        auto resolve_deadline = std::min(
+            deadline,
+            now + resolve_set_budget_for_size(reduced_n, ms_left)
+        );
+
+        auto resolve_res = run_resolve_set_approx(
+            dt1_base,
+            dt2_base,
+            resolve_deadline,
+            reduced_n,
+            prune_limit,
+            ResolveSetMode::PreferFinalCut,
+            mix64(seed_base ^ 0xa8b31f4c72d95e11ULL),
+            resolve_set_sample_cap_for_size(reduced_n),
+            "direct"
+        );
+
+        if (!resolve_res.comps.empty()) {
+            auto candidate = resolve_res.comps;
+            normalize_partition(candidate);
+
+            int cand_components = static_cast<int>(candidate.size());
+
+            if (cand_components <= best_components + elite_acceptance_slack_for_dual2(reduced_n) &&
+                partition_is_valid_agreement_forest(
+                    reduced.t1,
+                    reduced.t2,
+                    candidate,
+                    reduced.reduced_leaf_count)) {
+
+                maybe_add_elite_solution(
+                    elite_pool,
+                    candidate,
+                    reduced_n,
+                    elite_limit
+                );
+
+                if (cand_components < best_components) {
+                    best_reduced = std::move(candidate);
+                    best_components = static_cast<int>(best_reduced.size());
+                    prune_limit = std::min(prune_limit, best_components);
+
+                    run_greedy_merge_portfolio(
+                        reduced,
+                        best_reduced,
+                        best_components,
+                        elite_pool,
+                        elite_limit,
+                        deadline,
+                        false
+                    );
+
+                    prune_limit = std::min(prune_limit, best_components);
+                }
+            }
+        }
     }
     if (best_components < reduced_n) {
         if (run_exact_repair_portfolio(reduced, best_reduced, best_components, elite_pool, deadline, false)) {
@@ -5293,6 +5822,93 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                     best_out = std::move(out);
                     best_components = static_cast<int>(best_out.size());
                     publish_best_solution(best_out);
+                }
+            }
+        }
+    }
+
+    // ResolveSet-style 2-approx-inspired candidate.
+    // Test patch #1: one conservative mode only.
+    if (!g_terminate && Clock::now() + std::chrono::milliseconds(40) < soft_deadline) {
+        auto now = Clock::now();
+        auto ms_left = std::chrono::duration_cast<std::chrono::milliseconds>(soft_deadline - now).count();
+        auto resolve_deadline = std::min(
+            soft_deadline,
+            now + resolve_set_budget_for_size(reduced_n, ms_left)
+        );
+
+        auto resolve_res = run_resolve_set_approx(
+            dt1_base,
+            dt2_base,
+            resolve_deadline,
+            reduced_n,
+            std::min(best_components, best_reduced_components),
+            ResolveSetMode::PreferFinalCut,
+            mix64(base_seed ^ 0x3459a71ccf023b9dULL),
+            resolve_set_sample_cap_for_size(reduced_n),
+            "main"
+        );
+
+        if (!resolve_res.comps.empty()) {
+            auto candidate = resolve_res.comps;
+            normalize_partition(candidate);
+
+            int cand_components = static_cast<int>(candidate.size());
+
+            if (cand_components <= std::min(best_components, best_reduced_components) + elite_acceptance_slack_for_dual2(reduced_n) &&
+                partition_is_valid_agreement_forest(
+                    reduced.t1,
+                    reduced.t2,
+                    candidate,
+                    reduced.reduced_leaf_count)) {
+
+                maybe_add_elite_solution(
+                    elite_pool,
+                    candidate,
+                    reduced_n,
+                    elite_limit
+                );
+
+                if (cand_components < best_reduced_components) {
+                    best_reduced = candidate;
+                    best_reduced_components = cand_components;
+                }
+
+                if (cand_components < best_components) {
+                    auto expanded = expand_reduced_components(candidate, reduced.expansion);
+                    auto out = forest_from_partition(expanded, n, original_t1);
+
+                    if (!out.empty() && static_cast<int>(out.size()) < best_components) {
+                        best_out = std::move(out);
+                        best_components = static_cast<int>(best_out.size());
+                        publish_best_solution(best_out);
+                    }
+                }
+
+                if (best_reduced_components < reduced_n &&
+                    run_greedy_merge_portfolio(
+                        reduced,
+                        best_reduced,
+                        best_reduced_components,
+                        elite_pool,
+                        elite_limit,
+                        soft_deadline,
+                        false) &&
+                    best_reduced_components < best_components &&
+                    partition_is_valid_agreement_forest(
+                        reduced.t1,
+                        reduced.t2,
+                        best_reduced,
+                        reduced.reduced_leaf_count)) {
+
+                    auto expanded = expand_reduced_components(best_reduced, reduced.expansion);
+                    auto out = forest_from_partition(expanded, n, original_t1);
+
+                    if (!out.empty() && static_cast<int>(out.size()) < best_components) {
+                        best_out = std::move(out);
+                        best_components = static_cast<int>(best_out.size());
+                        publish_best_solution(best_out);
+                    }
                 }
             }
         }
