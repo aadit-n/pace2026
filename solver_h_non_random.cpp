@@ -3374,6 +3374,189 @@ std::vector<RepairCandidateGroup> build_repair_candidates(
     return candidates;
 }
 
+// -----------------------------------------------------------------------------
+// Greedy TryAndMerge-style component merge pass.
+// Conceptual port of the Java TryAndMerge idea:
+// if two currently separated components can be merged while remaining a valid
+// agreement forest in both trees, merge them immediately.
+// -----------------------------------------------------------------------------
+
+int greedy_merge_leaf_limit_for_size(int n, bool final_phase) {
+    if (n > 4000) return final_phase ? 384 : 256;
+    if (n > 1000) return final_phase ? 768 : 512;
+    if (n > 600)  return final_phase ? 1024 : 768;
+    if (n > 300)  return final_phase ? 1200 : 900;
+    return final_phase ? 2000 : 1200;
+}
+
+int greedy_merge_candidate_limit_for_size(int n, bool final_phase) {
+    if (n > 4000) return final_phase ? 80 : 48;
+    if (n > 1000) return final_phase ? 96 : 64;
+    if (n > 600)  return final_phase ? 120 : 80;
+    return final_phase ? 160 : 96;
+}
+
+bool apply_greedy_merge_group(
+    const ReducedInstance& reduced,
+    const std::vector<std::vector<int>>& current_partition,
+    const std::vector<int>& group_indices,
+    std::vector<std::vector<int>>& next_partition
+) {
+    if (group_indices.size() < 2) return false;
+
+    std::vector<int> sorted_indices = group_indices;
+    std::sort(sorted_indices.begin(), sorted_indices.end());
+    sorted_indices.erase(std::unique(sorted_indices.begin(), sorted_indices.end()), sorted_indices.end());
+
+    if (sorted_indices.size() < 2) return false;
+
+    std::vector<int> merged;
+    for (int idx : sorted_indices) {
+        if (idx < 0 || idx >= static_cast<int>(current_partition.size())) return false;
+        merged.insert(
+            merged.end(),
+            current_partition[static_cast<size_t>(idx)].begin(),
+            current_partition[static_cast<size_t>(idx)].end()
+        );
+    }
+
+    std::sort(merged.begin(), merged.end());
+    merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
+    if (merged.empty()) return false;
+
+    next_partition = current_partition;
+
+    std::sort(sorted_indices.begin(), sorted_indices.end(), std::greater<int>());
+    for (int idx : sorted_indices) {
+        next_partition.erase(next_partition.begin() + idx);
+    }
+
+    next_partition.push_back(std::move(merged));
+    normalize_partition(next_partition);
+
+    if (static_cast<int>(next_partition.size()) >= static_cast<int>(current_partition.size())) {
+        return false;
+    }
+
+    return partition_is_valid_agreement_forest(
+        reduced.t1,
+        reduced.t2,
+        next_partition,
+        reduced.reduced_leaf_count
+    );
+}
+
+bool run_greedy_merge_pass(
+    const ReducedInstance& reduced,
+    std::vector<std::vector<int>>& best_reduced,
+    int& best_components,
+    std::vector<EliteSolution>& elite_pool,
+    int elite_limit,
+    Clock::time_point deadline,
+    bool final_phase,
+    int max_group_size
+) {
+    if (best_reduced.size() < 2) return false;
+    if (g_terminate || Clock::now() + std::chrono::milliseconds(5) >= deadline) return false;
+
+    int leaf_limit = greedy_merge_leaf_limit_for_size(reduced.reduced_leaf_count, final_phase);
+    int max_candidates = greedy_merge_candidate_limit_for_size(reduced.reduced_leaf_count, final_phase);
+
+    auto candidates = build_repair_candidates(
+        reduced,
+        best_reduced,
+        elite_pool,
+        max_group_size,
+        leaf_limit,
+        max_candidates
+    );
+
+    for (const auto& cand : candidates) {
+        if (g_terminate || Clock::now() + std::chrono::milliseconds(5) >= deadline) break;
+
+        std::vector<std::vector<int>> merged_partition;
+        if (!apply_greedy_merge_group(
+                reduced,
+                best_reduced,
+                cand.component_indices,
+                merged_partition)) {
+            continue;
+        }
+
+        int merged_components = static_cast<int>(merged_partition.size());
+        if (merged_components < best_components) {
+            best_reduced = std::move(merged_partition);
+            best_components = merged_components;
+
+            maybe_add_elite_solution(
+                elite_pool,
+                best_reduced,
+                reduced.reduced_leaf_count,
+                elite_limit
+            );
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool run_greedy_merge_portfolio(
+    const ReducedInstance& reduced,
+    std::vector<std::vector<int>>& best_reduced,
+    int& best_components,
+    std::vector<EliteSolution>& elite_pool,
+    int elite_limit,
+    Clock::time_point deadline,
+    bool final_phase
+) {
+    auto now = Clock::now();
+    auto ms_left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+    if (ms_left < 20) return false;
+
+    long long budget_ms = final_phase
+        ? std::min<long long>(500, std::max<long long>(80, ms_left / 8))
+        : std::min<long long>(160, std::max<long long>(30, ms_left / 18));
+
+    auto merge_deadline = std::min(deadline, now + std::chrono::milliseconds(budget_ms));
+
+    bool improved_any = false;
+
+    while (!g_terminate && Clock::now() + std::chrono::milliseconds(5) < merge_deadline) {
+        bool improved = false;
+
+        improved = run_greedy_merge_pass(
+            reduced,
+            best_reduced,
+            best_components,
+            elite_pool,
+            elite_limit,
+            merge_deadline,
+            final_phase,
+            2
+        );
+
+        if (!improved && final_phase) {
+            improved = run_greedy_merge_pass(
+                reduced,
+                best_reduced,
+                best_components,
+                elite_pool,
+                elite_limit,
+                merge_deadline,
+                final_phase,
+                3
+            );
+        }
+
+        if (!improved) break;
+        improved_any = true;
+    }
+
+    return improved_any;
+}
+
 bool apply_exact_repair_group(
     const ReducedInstance& reduced,
     const std::vector<std::vector<int>>& current_partition,
@@ -3586,6 +3769,260 @@ ThreeApproxResult run_three_approx(
     int cherry_sample_cap = 0
 );
 
+// -----------------------------------------------------------------------------
+// Duality-inspired 2-approx portfolio seed.
+//
+// This is intentionally conservative:
+// - It does NOT claim to be a faithful LP-dual port of the Java implementation.
+// - It gives us the integration hooks now:
+//   1) deterministic portfolio candidate after reductions,
+//   2) early incumbent candidate,
+//   3) elite-pool seed even if not best,
+//   4) lower-bound diagnostic,
+//   5) TryAndMerge-style greedy merge on the result.
+// -----------------------------------------------------------------------------
+
+struct DualitySeedResult {
+    bool complete = false;
+    bool valid = false;
+    int components = 0;
+    int lb_proxy = 0;
+    long long elapsed_ms = 0;
+    std::vector<std::vector<int>> comps;
+};
+
+bool dual2_profile_enabled() {
+    static int enabled = []() {
+        const char* env = std::getenv("STRIDE_DUAL2_PROFILE");
+        return (env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
+    }();
+    return enabled != 0;
+}
+
+void emit_dual2_profile(
+    const char* phase,
+    int reduced_n,
+    int lb_proxy,
+    int raw_components,
+    int final_components,
+    bool complete,
+    bool valid,
+    bool improved,
+    long long elapsed_ms
+) {
+    if (!dual2_profile_enabled()) return;
+
+    std::cerr
+        << "DUAL2"
+        << " phase=" << phase
+        << " n=" << reduced_n
+        << " lb_proxy=" << lb_proxy
+        << " raw_components=" << raw_components
+        << " final_components=" << final_components
+        << " complete=" << (complete ? 1 : 0)
+        << " valid=" << (valid ? 1 : 0)
+        << " improved=" << (improved ? 1 : 0)
+        << " ms=" << elapsed_ms
+        << '\n';
+}
+
+int dual2_seed_sample_cap_for_size(int n) {
+    if (n > 4000) return 192;
+    if (n > 1000) return 256;
+    if (n > 600)  return 0;
+    return 0;
+}
+
+std::chrono::milliseconds dual2_seed_budget_for_size(int n, long long ms_left) {
+    long long budget_ms = 0;
+
+    if (n > 4000) {
+        budget_ms = std::min<long long>(10000, std::max<long long>(1800, ms_left / 12));
+    } else if (n > 1000) {
+        budget_ms = std::min<long long>(4500, std::max<long long>(900, ms_left / 18));
+    } else if (n > 600) {
+        budget_ms = std::min<long long>(2200, std::max<long long>(500, ms_left / 25));
+    } else {
+        budget_ms = std::min<long long>(1000, std::max<long long>(180, ms_left / 35));
+    }
+
+    return std::chrono::milliseconds(std::max<long long>(50, budget_ms));
+}
+
+int elite_acceptance_slack_for_dual2(int n) {
+    if (n > 4000) return 16;
+    if (n > 1000) return 12;
+    if (n > 600)  return 8;
+    if (n > 300)  return 6;
+    return 4;
+}
+
+DualitySeedResult run_duality_seed_candidate(
+    const ReducedInstance& reduced,
+    const DynamicTree& dt1_base,
+    const DynamicTree& dt2_base,
+    Clock::time_point global_deadline,
+    uint64_t seed_base,
+    std::vector<EliteSolution>& elite_pool,
+    int elite_limit,
+    bool final_phase
+) {
+    DualitySeedResult out;
+
+    const int n = reduced.reduced_leaf_count;
+    if (n <= 0) return out;
+    if (g_terminate || Clock::now() + std::chrono::milliseconds(20) >= global_deadline) return out;
+
+    auto started = Clock::now();
+    auto ms_left = std::chrono::duration_cast<std::chrono::milliseconds>(
+        global_deadline - started
+    ).count();
+
+    auto local_deadline = std::min(
+        global_deadline,
+        started + dual2_seed_budget_for_size(n, ms_left)
+    );
+
+    // Lower-bound diagnostic proxy.
+    // This is not the exact LP-dual value from the Java paper/implementation.
+    // Keep it diagnostic only.
+    {
+        DynamicTree t1_lb = dt1_base;
+        DynamicTree t2_lb = dt2_base;
+        int next_label = n + 1;
+        contract_all_common_cherries(t1_lb, t2_lb, next_label);
+        out.lb_proxy = exact_conflict_lower_bound(t1_lb, t2_lb);
+    }
+
+    uint64_t salt = mix64(seed_base ^ 0x2a6f9d7c1b3e5a91ULL ^ static_cast<uint64_t>(n));
+
+    // Use a conservative deterministic policy as the "duality-style" seed.
+    // It is deliberately different from the aggressive/default portfolio.
+    auto res = run_three_approx(
+        dt1_base,
+        dt2_base,
+        local_deadline,
+        n,
+        std::numeric_limits<int>::max(),   // do not prune this seed by incumbent
+        GreedyPolicy::ConservativeSingleCut,
+        nullptr,
+        0.0,
+        nullptr,
+        salt,
+        dual2_seed_sample_cap_for_size(n)
+    );
+
+    out.complete = res.complete;
+    if (res.comps.empty()) {
+        out.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - started
+        ).count();
+        emit_dual2_profile(
+            final_phase ? "final_seed" : "seed",
+            n,
+            out.lb_proxy,
+            -1,
+            -1,
+            out.complete,
+            false,
+            false,
+            out.elapsed_ms
+        );
+        return out;
+    }
+
+    out.comps = std::move(res.comps);
+    normalize_partition(out.comps);
+    int raw_components = static_cast<int>(out.comps.size());
+
+    out.valid = partition_is_valid_agreement_forest(
+        reduced.t1,
+        reduced.t2,
+        out.comps,
+        reduced.reduced_leaf_count
+    );
+
+    if (!out.valid) {
+        out.comps.clear();
+        out.components = 0;
+        out.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - started
+        ).count();
+        emit_dual2_profile(
+            final_phase ? "final_seed" : "seed",
+            n,
+            out.lb_proxy,
+            raw_components,
+            -1,
+            out.complete,
+            false,
+            false,
+            out.elapsed_ms
+        );
+        return out;
+    }
+
+    // Add the raw valid seed to the elite pool even if it is not best.
+    maybe_add_elite_solution(
+        elite_pool,
+        out.comps,
+        reduced.reduced_leaf_count,
+        elite_limit
+    );
+
+    // Now apply the cheap TryAndMerge-style pass to the seed itself.
+    int seed_components = static_cast<int>(out.comps.size());
+    std::vector<std::vector<int>> merged = out.comps;
+    int merged_components = seed_components;
+
+    std::vector<EliteSolution> temp_elite = elite_pool;
+    run_greedy_merge_portfolio(
+        reduced,
+        merged,
+        merged_components,
+        temp_elite,
+        elite_limit,
+        local_deadline,
+        final_phase
+    );
+
+    if (merged_components < seed_components &&
+        partition_is_valid_agreement_forest(
+            reduced.t1,
+            reduced.t2,
+            merged,
+            reduced.reduced_leaf_count)) {
+        out.comps = std::move(merged);
+        out.components = merged_components;
+        maybe_add_elite_solution(
+            elite_pool,
+            out.comps,
+            reduced.reduced_leaf_count,
+            elite_limit
+        );
+    } else {
+        out.components = seed_components;
+    }
+
+    out.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - started
+    ).count();
+
+    emit_dual2_profile(
+        final_phase ? "final_seed" : "seed",
+        n,
+        out.lb_proxy,
+        raw_components,
+        out.components,
+        out.complete,
+        out.valid,
+        false,
+        out.elapsed_ms
+    );
+
+    return out;
+}
+
 bool run_discrepancy_polish(
     const ReducedInstance& reduced,
     const DynamicTree& dt1_base,
@@ -3696,6 +4133,20 @@ bool run_final_polishing_portfolio(
     if (run_exact_repair_portfolio(reduced, best_reduced, best_components, elite_pool, deadline, true)) {
         improved = true;
     }
+
+    // Cheap TryAndMerge-style pass. This is intentionally placed after exact
+    // repair because exact repair may create mergeable neighboring components.
+    if (run_greedy_merge_portfolio(
+            reduced,
+            best_reduced,
+            best_components,
+            elite_pool,
+            elite_limit,
+            deadline,
+            true)) {
+        improved = true;
+    }
+
     if (run_discrepancy_polish(
             reduced,
             dt1_base,
@@ -4022,6 +4473,54 @@ std::vector<std::vector<int>> solve_direct_reduced(
 
     std::vector<EliteSolution> elite_pool;
     int elite_limit = elite_pool_limit_for_size(reduced_n);
+
+    // Deterministic duality-inspired seed after reductions.
+    // Useful especially on large instances, and useful as elite-pool material
+    // even when it does not beat the current best.
+    {
+        auto dual2 = run_duality_seed_candidate(
+            reduced,
+            dt1_base,
+            dt2_base,
+            deadline,
+            mix64(seed_base ^ 0x7c3a21d9e8f04b55ULL),
+            elite_pool,
+            elite_limit,
+            false
+        );
+
+        if (dual2.valid && !dual2.comps.empty()) {
+            int dual_components = static_cast<int>(dual2.comps.size());
+
+            if (dual_components <= best_components + elite_acceptance_slack_for_dual2(reduced_n)) {
+                maybe_add_elite_solution(
+                    elite_pool,
+                    dual2.comps,
+                    reduced_n,
+                    elite_limit
+                );
+            }
+
+            if (dual_components < best_components) {
+                best_reduced = std::move(dual2.comps);
+                best_components = static_cast<int>(best_reduced.size());
+                prune_limit = std::min(prune_limit, best_components);
+
+                run_greedy_merge_portfolio(
+                    reduced,
+                    best_reduced,
+                    best_components,
+                    elite_pool,
+                    elite_limit,
+                    deadline,
+                    false
+                );
+
+                prune_limit = std::min(prune_limit, best_components);
+            }
+        }
+    }
+
     if (!best_reduced.empty() &&
         static_cast<int>(best_reduced.size()) < reduced_n) {
         maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
@@ -4725,6 +5224,80 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     }
     std::vector<EliteSolution> elite_pool;
     int elite_limit = elite_pool_limit_for_size(reduced_n);
+
+    // Deterministic duality-inspired candidate after reductions.
+    // This can become an early incumbent and is also fed to the elite pool
+    // even if it is only near-best.
+    {
+        auto dual2 = run_duality_seed_candidate(
+            reduced,
+            dt1_base,
+            dt2_base,
+            soft_deadline,
+            mix64(base_seed ^ 0x6d0f27bb35a91e43ULL),
+            elite_pool,
+            elite_limit,
+            false
+        );
+
+        if (dual2.valid && !dual2.comps.empty()) {
+            int dual_components = static_cast<int>(dual2.comps.size());
+
+            int elite_reference = std::min(best_components, best_reduced_components);
+            if (dual_components <= elite_reference + elite_acceptance_slack_for_dual2(reduced_n)) {
+                maybe_add_elite_solution(
+                    elite_pool,
+                    dual2.comps,
+                    reduced_n,
+                    elite_limit
+                );
+            }
+
+            if (dual_components < best_reduced_components) {
+                best_reduced = dual2.comps;
+                best_reduced_components = dual_components;
+            }
+
+            if (dual_components < best_components) {
+                auto expanded = expand_reduced_components(dual2.comps, reduced.expansion);
+                auto out = forest_from_partition(expanded, n, original_t1);
+
+                if (!out.empty() && static_cast<int>(out.size()) < best_components) {
+                    best_out = std::move(out);
+                    best_components = static_cast<int>(best_out.size());
+                    publish_best_solution(best_out);
+                }
+            }
+
+            // Try cheap merge immediately after accepting/recording the seed.
+            if (best_reduced_components < reduced_n &&
+                run_greedy_merge_portfolio(
+                    reduced,
+                    best_reduced,
+                    best_reduced_components,
+                    elite_pool,
+                    elite_limit,
+                    soft_deadline,
+                    false) &&
+                best_reduced_components < best_components &&
+                partition_is_valid_agreement_forest(
+                    reduced.t1,
+                    reduced.t2,
+                    best_reduced,
+                    reduced.reduced_leaf_count)) {
+
+                auto expanded = expand_reduced_components(best_reduced, reduced.expansion);
+                auto out = forest_from_partition(expanded, n, original_t1);
+
+                if (!out.empty() && static_cast<int>(out.size()) < best_components) {
+                    best_out = std::move(out);
+                    best_components = static_cast<int>(best_out.size());
+                    publish_best_solution(best_out);
+                }
+            }
+        }
+    }
+
     auto configs = deterministic_configs_for_size(reduced_n);
 
     if (!best_reduced.empty() &&
@@ -4832,20 +5405,36 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                 accepted = true;
                 improved = true;
 
+                bool repaired_or_merged = false;
+
                 if (run_exact_repair_portfolio(
                         reduced,
                         best_reduced,
                         best_reduced_components,
                         elite_pool,
                         soft_deadline,
-                        false) &&
+                        false)) {
+                    repaired_or_merged = true;
+                }
+
+                if (run_greedy_merge_portfolio(
+                        reduced,
+                        best_reduced,
+                        best_reduced_components,
+                        elite_pool,
+                        elite_limit,
+                        soft_deadline,
+                        false)) {
+                    repaired_or_merged = true;
+                }
+
+                if (repaired_or_merged &&
                     best_reduced_components < best_components &&
                     partition_is_valid_agreement_forest(
                         reduced.t1,
                         reduced.t2,
                         best_reduced,
                         reduced.reduced_leaf_count)) {
-
                     auto repaired_expanded = expand_reduced_components(best_reduced, reduced.expansion);
                     auto repaired_out = forest_from_partition(repaired_expanded, n, original_t1);
 
