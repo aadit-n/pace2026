@@ -530,20 +530,12 @@ int add_simple_node(SimpleTree& st, int lbl) {
 
 std::string join_ints_key(const std::vector<int>& vals) {
     std::string s;
+    s.reserve(vals.size() * 8);
     for (int x : vals) {
         s += std::to_string(x);
         s.push_back(',');
     }
     return s;
-}
-
-uint64_t hash_int_vector(const std::vector<int>& vals) {
-    uint64_t h = 0xcbf29ce484222325ULL;
-    for (int x : vals) {
-        h ^= mix64(static_cast<uint64_t>(static_cast<uint32_t>(x + 1)));
-        h *= 0x100000001b3ULL;
-    }
-    return h;
 }
 
 SimpleNodeInfo compute_simple_info_dfs(
@@ -1599,21 +1591,6 @@ const std::vector<int>& path_nodes_fast(
     return scratch.result;
 }
 
-std::vector<int> pendant_children_on_path(const DynamicTree& t, const std::vector<int>& path) {
-    std::vector<int> out;
-    if (path.size() < 3) return out;
-    for (size_t i = 1; i + 1 < path.size(); ++i) {
-        int u = path[i];
-        int prev = path[i - 1];
-        int next = path[i + 1];
-        int l = t.nodes[u].left;
-        int r = t.nodes[u].right;
-        if (l != -1 && t.nodes[l].active && l != prev && l != next) out.push_back(l);
-        if (r != -1 && t.nodes[r].active && r != prev && r != next) out.push_back(r);
-    }
-    return out;
-}
-
 void fill_pendant_children_on_path(
     const DynamicTree& t,
     const std::vector<int>& path,
@@ -1643,18 +1620,6 @@ int count_common_cherries(const DynamicTree& t1, const DynamicTree& f) {
         return true;
     });
     return cnt;
-}
-
-int active_leaf_count(const DynamicTree& t) {
-    int c = 0;
-    for (const auto& n : t.nodes) if (n.active && n.left == -1 && n.right == -1) ++c;
-    return c;
-}
-
-int count_root_components(const DynamicTree& t) {
-    int c = 0;
-    for (const auto& n : t.nodes) if (n.active && n.parent == -1) ++c;
-    return c;
 }
 
 int exact_conflict_lower_bound(const DynamicTree& t1, const DynamicTree& f) {
@@ -1920,12 +1885,6 @@ uint64_t deterministic_pair_key(
     );
 }
 
-uint64_t cherry_pair_key(int a, int b) {
-    if (a > b) std::swap(a, b);
-    return (static_cast<uint64_t>(static_cast<uint32_t>(a)) << 32)
-         | static_cast<uint32_t>(b);
-}   
-
 uint64_t deterministic_plan_key(uint64_t salt, const std::vector<int>& plan) {
     uint64_t h = salt ^ (static_cast<uint64_t>(plan.size()) * 0x94d049bb133111ebULL);
     for (int x : plan) {
@@ -2030,10 +1989,6 @@ double score_cherry_candidate_normalized(const CherryCandidate& cand, int total_
     return score;
 }   
 
-double score_cherry_candidate(const CherryCandidate& cand, int total_leaves) {
-    return score_cherry_candidate_normalized(cand, total_leaves);
-}
-
 double score_cherry_candidate_policy(
     const CherryCandidate& cand,
     int total_leaves,
@@ -2124,7 +2079,7 @@ CherryCandidate build_cherry_candidate(
         cand.immediate_gain += 1;
     }
 
-    cand.score = score_cherry_candidate(cand, total_leaves);
+    cand.score = score_cherry_candidate_normalized(cand, total_leaves);
 
     (void)t1;
     return cand;
@@ -2141,6 +2096,7 @@ double evaluate_reduced_state(
 ) {
     auto f_mass = compute_active_leaf_masses(f);
     PathScratch path_scratch;
+    std::vector<int> pendants_scratch;
     int comp_count = f.root_component_count;
     int sampled_pendants = 0;
     int sampled_conflict_mass = 0;
@@ -2170,9 +2126,9 @@ double evaluate_reduced_state(
         }
 
         const auto& path = path_nodes_fast(f, na, nb, path_scratch);
-        auto pendants = pendant_children_on_path(f, path);
-        sampled_pendants += static_cast<int>(pendants.size());
-        for (int u : pendants) sampled_conflict_mass += f_mass[u];
+        fill_pendant_children_on_path(f, path, pendants_scratch);
+        sampled_pendants += static_cast<int>(pendants_scratch.size());
+        for (int u : pendants_scratch) sampled_conflict_mass += f_mass[u];
         return true;
     });
 
@@ -2410,7 +2366,7 @@ CanonHash hash_active_forest_canon(const DynamicTree& t) {
     std::vector<CanonHash> payload_cache(t.payloads.size());
     std::vector<char> payload_seen(t.payloads.size(), 0);
     std::vector<CanonHash> roots;
-    roots.reserve(count_root_components(t));
+    roots.reserve(static_cast<size_t>(std::max(0, t.root_component_count)));
     for (int u = 0; u < static_cast<int>(t.nodes.size()); ++u) {
         if (!t.nodes[u].active || t.nodes[u].parent != -1) continue;
         roots.push_back(hash_active_node_canon(t, u, payload_cache, payload_seen));
@@ -5546,10 +5502,10 @@ ThreeApproxResult run_three_approx(
 ) {
     int next_label = n + 1;
     bool timed_out_or_terminated = false;
-    bool medium_mode = is_medium_instance_size(n);
     size_t discrepancy_step = 0;
     uint64_t decision_step = 0; 
     PathScratch path_scratch;
+    std::vector<int> pendants_scratch;
     std::vector<std::pair<int, int>> cherries;
     cherries.reserve(static_cast<size_t>(n));
 
@@ -5557,6 +5513,17 @@ ThreeApproxResult run_three_approx(
     // This avoids repeated std::find(candidate_indices.begin(), candidate_indices.end(), idx).
     std::vector<int> sampled_seen;
     int sampled_seen_stamp = 1;
+
+    struct RankedCherry {
+        double score = -std::numeric_limits<double>::infinity();
+        size_t idx = 0;
+        int a = -1;
+        int b = -1;
+        uint64_t tie = 0;
+    };
+
+    std::vector<RankedCherry> ranked;
+    std::vector<size_t> candidate_indices;
 
     // Exhaust common cherries before branching.
     contract_all_common_cherries(t1, f, next_label);
@@ -5621,20 +5588,11 @@ ThreeApproxResult run_three_approx(
 
         size_t chosen_idx = 0;
         uint64_t step_key = decision_step++;
+        std::vector<int> f_mass = compute_active_leaf_masses(f);
 
         {
-            auto f_mass = compute_active_leaf_masses(f);
-
-            struct RankedCherry {
-                double score = -std::numeric_limits<double>::infinity();
-                size_t idx = 0;
-                int a = -1;
-                int b = -1;
-                uint64_t tie = 0;
-            };
-
-            std::vector<RankedCherry> ranked;
-            std::vector<size_t> candidate_indices;
+            ranked.clear();
+            candidate_indices.clear();
 
             if (cherry_sample_cap > 0 &&
                 cherries.size() > static_cast<size_t>(cherry_sample_cap)) {
@@ -5701,7 +5659,9 @@ ThreeApproxResult run_three_approx(
                 std::iota(candidate_indices.begin(), candidate_indices.end(), 0);
             }
 
-            ranked.reserve(candidate_indices.size());
+            if (ranked.capacity() < candidate_indices.size()) {
+                ranked.reserve(candidate_indices.size());
+            }
 
             for (size_t k = 0; k < candidate_indices.size(); ++k) {
                 if ((k & 63ULL) == 0ULL &&
@@ -5787,8 +5747,6 @@ ThreeApproxResult run_three_approx(
             } else if (mb > ma) {
                 cut_edge_above(f, nb);
             } else {
-                auto f_mass = compute_active_leaf_masses(f);
-
                 int mass_a = (ra >= 0 && ra < static_cast<int>(f_mass.size())) ? f_mass[ra] : 1;
                 int mass_b = (rb >= 0 && rb < static_cast<int>(f_mass.size())) ? f_mass[rb] : 1;
 
@@ -5806,13 +5764,11 @@ ThreeApproxResult run_three_approx(
         }
 
         const auto& path = path_nodes_fast(f, na, nb, path_scratch);
-        auto pendants = pendant_children_on_path(f, path);
-        if (pendants.size() == 1) {
-            cut_edge_above(f, pendants[0]);
+        fill_pendant_children_on_path(f, path, pendants_scratch);
+        if (pendants_scratch.size() == 1) {
+            cut_edge_above(f, pendants_scratch[0]);
         } else {
-            auto f_mass = compute_active_leaf_masses(f);
-
-            if (use_expensive_same_component_plan(n, path, pendants)) {
+            if (use_expensive_same_component_plan(n, path, pendants_scratch)) {
                 auto cand = build_cherry_candidate(t1, f, f_mass, a, b, n, &path_scratch);
                 auto plan = choose_cut_plan(t1, f, cand, next_label, n, f_mass, policy, tie_salt ^ step_key);
 
@@ -5828,7 +5784,7 @@ ThreeApproxResult run_three_approx(
                 int best_cut = -1;
                 int best_mass = std::numeric_limits<int>::max();
 
-                for (int c : pendants) {
+                for (int c : pendants_scratch) {
                     if (c >= 0 && c < static_cast<int>(f_mass.size()) && f_mass[c] < best_mass) {
                         best_mass = f_mass[c];
                         best_cut = c;
