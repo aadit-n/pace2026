@@ -3266,13 +3266,186 @@ void add_cherry_conflict_repair_candidates(
     dfs(t1.root);
 }
 
+void add_witness_pair_repair_candidates(
+    const SimpleTree& tree,
+    const std::vector<std::vector<int>>& comps,
+    int n,
+    int leaf_limit,
+    int append_limit,
+    std::unordered_set<std::string>& seen,
+    std::vector<RepairCandidateGroup>& out
+) {
+    if (tree.root < 0 || comps.size() < 2 || append_limit <= 0) return;
+
+    auto comp_of_leaf = build_component_of_leaf(comps, n);
+
+    struct SubtreeComponentSummary {
+        int leaf_count = 0;
+        int pure_comp = -1;
+        std::vector<int> comps;
+    };
+
+    std::vector<SubtreeComponentSummary> summary(tree.children.size());
+    std::vector<RepairCandidateGroup> local;
+    local.reserve(static_cast<size_t>(std::max(8, append_limit * 2)));
+
+    auto trim_component_list = [&](std::vector<int>& ids) {
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        std::sort(ids.begin(), ids.end(), [&](int a, int b) {
+            int sa = (a >= 0 && a < static_cast<int>(comps.size()))
+                ? static_cast<int>(comps[static_cast<size_t>(a)].size())
+                : std::numeric_limits<int>::max();
+            int sb = (b >= 0 && b < static_cast<int>(comps.size()))
+                ? static_cast<int>(comps[static_cast<size_t>(b)].size())
+                : std::numeric_limits<int>::max();
+            if (sa != sb) return sa < sb;
+            return a < b;
+        });
+        if (ids.size() > 10) ids.resize(10);
+    };
+
+    auto add_witness_pair = [&](
+        int w_comp,
+        int neighbor_comp,
+        int w_leaf_count,
+        int sibling_part_count,
+        bool sibling_pure
+    ) {
+        if (w_comp == -1 || neighbor_comp == -1 || w_comp == neighbor_comp) return;
+
+        std::vector<int> group{w_comp, neighbor_comp};
+        std::sort(group.begin(), group.end());
+
+        int union_size = repair_group_union_size(comps, group);
+        if (union_size > leaf_limit) return;
+
+        std::string key = repair_group_key(group);
+        if (!seen.insert(key).second) return;
+
+        RepairCandidateGroup cand;
+        cand.component_indices = std::move(group);
+        cand.union_size = union_size;
+
+        // Witness pairs are less certain than split cherries, but a small
+        // pure W-subtree beside a simple sibling side is a strong signal.
+        cand.score = union_size - 5
+                   - std::min(4, w_leaf_count)
+                   + std::min(6, std::max(0, sibling_part_count - 1));
+        if (sibling_pure) cand.score -= 2;
+
+        local.push_back(std::move(cand));
+    };
+
+    std::function<void(int)> dfs = [&](int u) {
+        if (u < 0 || u >= static_cast<int>(tree.children.size())) return;
+
+        auto& cur = summary[static_cast<size_t>(u)];
+        const auto& children = tree.children[static_cast<size_t>(u)];
+
+        if (children.empty()) {
+            int label = tree.leaf_label[static_cast<size_t>(u)];
+            if (label >= 1 && label <= n) {
+                int comp = comp_of_leaf[static_cast<size_t>(label)];
+                if (comp != -1) {
+                    cur.leaf_count = 1;
+                    cur.pure_comp = comp;
+                    cur.comps = {comp};
+                }
+            }
+            return;
+        }
+
+        for (int child : children) dfs(child);
+
+        cur.leaf_count = 0;
+        cur.pure_comp = -1;
+        cur.comps.clear();
+
+        for (int child : children) {
+            if (child < 0 || child >= static_cast<int>(summary.size())) continue;
+            const auto& child_summary = summary[static_cast<size_t>(child)];
+            cur.leaf_count += child_summary.leaf_count;
+            cur.comps.insert(
+                cur.comps.end(),
+                child_summary.comps.begin(),
+                child_summary.comps.end()
+            );
+        }
+
+        if (cur.comps.empty()) return;
+
+        std::sort(cur.comps.begin(), cur.comps.end());
+        cur.comps.erase(std::unique(cur.comps.begin(), cur.comps.end()), cur.comps.end());
+        if (cur.comps.size() == 1) cur.pure_comp = cur.comps.front();
+
+        if (children.size() == 2) {
+            int a = children[0];
+            int b = children[1];
+            if (a >= 0 && a < static_cast<int>(summary.size()) &&
+                b >= 0 && b < static_cast<int>(summary.size())) {
+                const auto& left = summary[static_cast<size_t>(a)];
+                const auto& right = summary[static_cast<size_t>(b)];
+
+                auto right_neighbors = right.comps;
+                auto left_neighbors = left.comps;
+                trim_component_list(right_neighbors);
+                trim_component_list(left_neighbors);
+
+                if (left.pure_comp != -1) {
+                    for (int neighbor : right_neighbors) {
+                        add_witness_pair(
+                            left.pure_comp,
+                            neighbor,
+                            left.leaf_count,
+                            static_cast<int>(right.comps.size()),
+                            right.pure_comp != -1
+                        );
+                    }
+                }
+
+                if (right.pure_comp != -1) {
+                    for (int neighbor : left_neighbors) {
+                        add_witness_pair(
+                            right.pure_comp,
+                            neighbor,
+                            right.leaf_count,
+                            static_cast<int>(left.comps.size()),
+                            left.pure_comp != -1
+                        );
+                    }
+                }
+            }
+        }
+
+        trim_component_list(cur.comps);
+    };
+
+    dfs(tree.root);
+
+    std::sort(local.begin(), local.end(), [](const RepairCandidateGroup& a, const RepairCandidateGroup& b) {
+        if (a.score != b.score) return a.score < b.score;
+        if (a.union_size != b.union_size) return a.union_size < b.union_size;
+        return a.component_indices < b.component_indices;
+    });
+
+    int limit = std::min<int>(
+        static_cast<int>(local.size()),
+        append_limit
+    );
+    for (int i = 0; i < limit; ++i) {
+        out.push_back(std::move(local[static_cast<size_t>(i)]));
+    }
+}
+
 std::vector<RepairCandidateGroup> build_repair_candidates(
     const ReducedInstance& reduced,
     const std::vector<std::vector<int>>& comps,
     const std::vector<EliteSolution>& elite_pool,
     int max_group_size,
     int leaf_limit,
-    int max_candidates
+    int max_candidates,
+    bool append_witness_tail = false
 ) {
     if (comps.size() < 2 || max_group_size < 2) return {};
 
@@ -3371,6 +3544,30 @@ std::vector<RepairCandidateGroup> build_repair_candidates(
     if (static_cast<int>(candidates.size()) > max_candidates) {
         candidates.resize(static_cast<size_t>(max_candidates));
     }
+
+    if (append_witness_tail && max_group_size == 2) {
+        int witness_limit = std::min<int>(6, std::max<int>(2, max_candidates / 4));
+
+        add_witness_pair_repair_candidates(
+            reduced.t1,
+            comps,
+            reduced.reduced_leaf_count,
+            leaf_limit,
+            witness_limit,
+            seen,
+            candidates
+        );
+
+        add_witness_pair_repair_candidates(
+            reduced.t2,
+            comps,
+            reduced.reduced_leaf_count,
+            leaf_limit,
+            witness_limit,
+            seen,
+            candidates
+        );
+    }
     return candidates;
 }
 
@@ -3468,7 +3665,8 @@ bool run_greedy_merge_pass(
         elite_pool,
         max_group_size,
         leaf_limit,
-        max_candidates
+        max_candidates,
+        final_phase && max_group_size == 2
     );
 
     for (const auto& cand : candidates) {
@@ -3667,7 +3865,8 @@ bool run_exact_repair_pass(
         elite_pool,
         max_group_size,
         repair_leaf_limit,
-        max_candidates
+        max_candidates,
+        final_phase && max_group_size == 2
     );
     for (const auto& cand : candidates) {
         if (g_terminate || Clock::now() + std::chrono::milliseconds(5) >= deadline) break;
