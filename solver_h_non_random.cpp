@@ -1764,6 +1764,31 @@ void maybe_add_elite_solution(
     }
 }
 
+struct DeterministicRestartDeduper {
+    std::vector<EliteSolution> seen_partitions;
+    int duplicates = 0;
+
+    void reserve(size_t count) {
+        seen_partitions.reserve(count);
+    }
+
+    bool remember_if_new(const std::vector<std::vector<int>>& comps, int n) {
+        if (comps.empty()) return true;
+
+        EliteSolution signature = build_elite_solution(comps, n);
+        for (const auto& cur : seen_partitions) {
+            if (cur.hash == signature.hash &&
+                cur.comp_of_leaf == signature.comp_of_leaf) {
+                ++duplicates;
+                return false;
+            }
+        }
+
+        seen_partitions.push_back(std::move(signature));
+        return true;
+    }
+};
+
 void collect_payload_leaves(const DynamicTree& t, int payload_id, std::vector<int>& out) {
     if (payload_id < 0 || payload_id >= static_cast<int>(t.payloads.size())) return;
     const auto& payload = t.payloads[static_cast<size_t>(payload_id)];
@@ -1925,7 +1950,8 @@ void emit_deterministic_profile(
     int components,
     bool accepted,
     bool improved,
-    long long elapsed_ms
+    long long elapsed_ms,
+    bool duplicate = false
 ) {
     if (!deterministic_profile_enabled()) return;
     std::cerr
@@ -1943,6 +1969,7 @@ void emit_deterministic_profile(
         << " components=" << components
         << " accepted=" << (accepted ? 1 : 0)
         << " improved=" << (improved ? 1 : 0)
+        << " duplicate=" << (duplicate ? 1 : 0)
         << " ms=" << elapsed_ms
         << '\n';
 }
@@ -5266,6 +5293,8 @@ std::vector<std::vector<int>> solve_direct_reduced(
     }
     auto configs = deterministic_configs_for_size(reduced_n);   
     bool final_polish_done = false;
+    DeterministicRestartDeduper restart_deduper;
+    restart_deduper.reserve(configs.size() + 4);
 
     for (const auto& cfg : configs) {
         if (g_terminate || Clock::now() + std::chrono::milliseconds(10) >= deadline) {
@@ -5326,6 +5355,12 @@ std::vector<std::vector<int>> solve_direct_reduced(
         normalize_partition(candidate);
 
         int cand_components = static_cast<int>(candidate.size());
+        bool duplicate_restart = !restart_deduper.remember_if_new(candidate, reduced_n);
+        if (duplicate_restart) {
+            emit_deterministic_profile("direct", cfg, reduced_n, res.complete, cand_components, false, false, cfg_ms, true);
+            continue;
+        }
+
         bool accepted = false;
         bool improved = false;
 
@@ -6120,6 +6155,9 @@ std::vector<std::string> solve(const PaceInstance& inst) {
         maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
     }
 
+    DeterministicRestartDeduper restart_deduper;
+    restart_deduper.reserve(configs.size() + elite_pool.size() + 4);
+
     for (const auto& cfg : configs) {
         if (g_terminate || Clock::now() + std::chrono::milliseconds(10) >= soft_deadline) {
             break;
@@ -6164,6 +6202,12 @@ std::vector<std::string> solve(const PaceInstance& inst) {
         normalize_partition(candidate_reduced);
 
         int cand_components = static_cast<int>(candidate_reduced.size());
+        bool duplicate_restart = !restart_deduper.remember_if_new(candidate_reduced, reduced_n);
+        if (duplicate_restart) {
+            emit_deterministic_profile("main", cfg, reduced_n, res.complete, cand_components, false, false, cfg_ms, true);
+            continue;
+        }
+
         bool accepted = false;
         bool improved = false;
 
