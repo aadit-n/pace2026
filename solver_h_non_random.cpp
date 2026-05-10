@@ -2482,6 +2482,230 @@ struct ExactRootBounds {
     int active_leaves = 0;
 };
 
+int exact_branch_plan_count(const CherryCandidate& cand) {
+    if (!cand.same_component) return 2;
+    if (cand.pendant_count == 1) return 1;
+    return cand.pendants.empty() ? 2 : 3;
+}
+
+std::vector<std::vector<int>> build_exact_branch_plans(const CherryCandidate& cand) {
+    std::vector<std::vector<int>> plans;
+    if (!cand.same_component) {
+        plans.push_back({cand.na});
+        plans.push_back({cand.nb});
+        return plans;
+    }
+
+    if (cand.pendant_count == 1) {
+        plans.push_back({cand.pendants[0]});
+        return plans;
+    }
+
+    plans.push_back({cand.na});
+    plans.push_back({cand.nb});
+    if (!cand.pendants.empty()) {
+        plans.push_back(cand.pendants);
+    }
+    return plans;
+}
+
+int exact_branch_candidate_scan_limit(int active_leaves, int cherry_count) {
+    if (cherry_count <= 0) return 0;
+    if (cherry_count <= 6) return cherry_count;
+    if (active_leaves <= 24) return std::min(cherry_count, 10);
+    if (active_leaves <= 40) return std::min(cherry_count, 8);
+    return std::min(cherry_count, 6);
+}
+
+struct ExactBranchPlanEval {
+    std::vector<int> plan;
+    double order_score = -std::numeric_limits<double>::infinity();
+    int projected_components = 0;
+    int projected_lb = 0;
+    int projected_total = 0;
+    int projected_active_leaves = 0;
+    ExactStateKey state_key;
+};
+
+struct ExactBranchChoice {
+    bool valid = false;
+    CherryCandidate cand;
+    std::vector<ExactBranchPlanEval> live_plans;
+    int total_plans = 0;
+    int pruned_plans = 0;
+    int min_projected_total = std::numeric_limits<int>::max();
+    int max_projected_total = 0;
+    int sum_projected_total = 0;
+    int sum_active_leaves = 0;
+};
+
+bool exact_branch_prefilter_better(const CherryCandidate& a, const CherryCandidate& b) {
+    int ba = exact_branch_plan_count(a);
+    int bb = exact_branch_plan_count(b);
+    if (ba != bb) return ba < bb;
+    if (a.immediate_gain != b.immediate_gain) return a.immediate_gain > b.immediate_gain;
+    if (a.pendant_count != b.pendant_count) return a.pendant_count < b.pendant_count;
+    if (a.conflict_mass != b.conflict_mass) return a.conflict_mass > b.conflict_mass;
+    if (a.component_size != b.component_size) return a.component_size < b.component_size;
+    if (std::abs(a.score - b.score) > 1e-9) return a.score > b.score;
+    if (a.a != b.a) return a.a < b.a;
+    return a.b < b.b;
+}
+
+bool exact_branch_choice_better(const ExactBranchChoice& a, const ExactBranchChoice& b) {
+    if (a.live_plans.size() != b.live_plans.size()) {
+        return a.live_plans.size() < b.live_plans.size();
+    }
+    if (a.pruned_plans != b.pruned_plans) {
+        return a.pruned_plans > b.pruned_plans;
+    }
+    if (a.min_projected_total != b.min_projected_total) {
+        return a.min_projected_total > b.min_projected_total;
+    }
+    if (a.sum_projected_total != b.sum_projected_total) {
+        return a.sum_projected_total > b.sum_projected_total;
+    }
+    if (a.sum_active_leaves != b.sum_active_leaves) {
+        return a.sum_active_leaves < b.sum_active_leaves;
+    }
+    int ba = exact_branch_plan_count(a.cand);
+    int bb = exact_branch_plan_count(b.cand);
+    if (ba != bb) return ba < bb;
+    if (std::abs(a.cand.score - b.cand.score) > 1e-9) {
+        return a.cand.score > b.cand.score;
+    }
+    if (a.cand.a != b.cand.a) return a.cand.a < b.cand.a;
+    return a.cand.b < b.cand.b;
+}
+
+ExactBranchChoice choose_exact_branch(
+    DynamicTree& t1,
+    DynamicTree& f,
+    int& next_label,
+    int best_components,
+    UndoLog& undo
+) {
+    ExactBranchChoice best_choice;
+    PathScratch path_scratch;
+    auto cherries = cherries_by_label(t1);
+    if (cherries.empty()) return best_choice;
+
+    auto f_mass = compute_active_leaf_masses(f);
+    std::vector<CherryCandidate> candidates;
+    candidates.reserve(cherries.size());
+    for (auto [a, b] : cherries) {
+        CherryCandidate cand = build_cherry_candidate(
+            t1,
+            f,
+            f_mass,
+            a,
+            b,
+            t1.active_leaf_count,
+            &path_scratch
+        );
+        if (cand.na == -1 || cand.nb == -1) continue;
+        candidates.push_back(std::move(cand));
+    }
+    if (candidates.empty()) return best_choice;
+
+    std::sort(candidates.begin(), candidates.end(), exact_branch_prefilter_better);
+    int scan_limit = exact_branch_candidate_scan_limit(
+        t1.active_leaf_count,
+        static_cast<int>(candidates.size())
+    );
+
+    for (int ci = 0; ci < scan_limit; ++ci) {
+        const CherryCandidate& cand = candidates[static_cast<size_t>(ci)];
+        auto plans = build_exact_branch_plans(cand);
+
+        ExactBranchChoice choice;
+        choice.valid = true;
+        choice.cand = cand;
+        choice.total_plans = static_cast<int>(plans.size());
+
+        std::unordered_map<ExactStateKey, size_t, ExactStateKeyHash> seen_children;
+
+        for (auto& plan : plans) {
+            size_t mark = undo.mark();
+            int saved_next_label = next_label;
+
+            apply_cut_plan(f, plan, &undo);
+            contract_all_common_cherries(t1, f, next_label, &undo);
+
+            int current_components = f.root_component_count;
+            int lb = exact_conflict_lower_bound(t1, f);
+            int total = current_components + lb;
+
+            if (current_components < best_components && total < best_components) {
+                ExactBranchPlanEval eval;
+                eval.plan = plan;
+                eval.projected_components = current_components;
+                eval.projected_lb = lb;
+                eval.projected_total = total;
+                eval.projected_active_leaves = t1.active_leaf_count;
+                eval.order_score =
+                    evaluate_reduced_state(t1, f, t1.active_leaf_count) -
+                    0.05 * static_cast<double>(plan.size());
+                eval.state_key = exact_state_key(t1, f);
+
+                auto [it, inserted] = seen_children.emplace(
+                    eval.state_key,
+                    choice.live_plans.size()
+                );
+                if (inserted) {
+                    choice.min_projected_total = std::min(choice.min_projected_total, total);
+                    choice.max_projected_total = std::max(choice.max_projected_total, total);
+                    choice.sum_projected_total += total;
+                    choice.sum_active_leaves += eval.projected_active_leaves;
+                    choice.live_plans.push_back(std::move(eval));
+                } else {
+                    auto& cur = choice.live_plans[it->second];
+                    bool better =
+                        eval.order_score > cur.order_score + 1e-9 ||
+                        (std::abs(eval.order_score - cur.order_score) <= 1e-9 &&
+                         eval.projected_components < cur.projected_components) ||
+                        (std::abs(eval.order_score - cur.order_score) <= 1e-9 &&
+                         eval.projected_components == cur.projected_components &&
+                         eval.plan.size() < cur.plan.size()) ||
+                        (std::abs(eval.order_score - cur.order_score) <= 1e-9 &&
+                         eval.projected_components == cur.projected_components &&
+                         eval.plan.size() == cur.plan.size() &&
+                         eval.plan < cur.plan);
+                    if (better) cur = std::move(eval);
+                }
+            } else {
+                ++choice.pruned_plans;
+            }
+
+            next_label = saved_next_label;
+            undo.undo_to(mark);
+        }
+
+        if (choice.live_plans.empty()) {
+            return choice;
+        }
+
+        std::sort(choice.live_plans.begin(), choice.live_plans.end(), [](const ExactBranchPlanEval& x, const ExactBranchPlanEval& y) {
+            if (std::abs(x.order_score - y.order_score) > 1e-9) return x.order_score > y.order_score;
+            if (x.projected_components != y.projected_components) {
+                return x.projected_components < y.projected_components;
+            }
+            if (x.projected_active_leaves != y.projected_active_leaves) {
+                return x.projected_active_leaves < y.projected_active_leaves;
+            }
+            if (x.projected_total != y.projected_total) return x.projected_total < y.projected_total;
+            if (x.plan.size() != y.plan.size()) return x.plan.size() < y.plan.size();
+            return x.plan < y.plan;
+        });
+
+        if (!best_choice.valid || exact_branch_choice_better(choice, best_choice)) {
+            best_choice = std::move(choice);
+        }
+    }
+
+    return best_choice;
+}
+
 ExactRootBounds analyze_exact_root_bounds(
     const DynamicTree& dt1_base,
     const DynamicTree& dt2_base,
@@ -2530,8 +2754,6 @@ void exact_kernel_dfs(
         next_label = entry_next_label;
         undo.undo_to(entry_mark);
     };
-
-    PathScratch path_scratch;
 
     if (control.aborted) {
         cleanup();
@@ -2584,59 +2806,32 @@ void exact_kernel_dfs(
 
     memo[key] = current_components;
 
-    auto cherries = cherries_by_label(t1);
-    if (cherries.empty() || t1.active_leaf_count <= 2) {
+    if (t1.active_leaf_count <= 2) {
         best_components = current_components;
         collect_current_components(f, best_comps);
         cleanup();
         return;
     }
 
-    auto f_mass = compute_active_leaf_masses(f);
-    CherryCandidate best_cand;
-    bool have = false;
-    for (auto [a, b] : cherries) {
-        auto cand = build_cherry_candidate(t1, f, f_mass, a, b, t1.active_leaf_count, &path_scratch);
-        if (!have || cand.score > best_cand.score) {
-            best_cand = std::move(cand);
-            have = true;
-        }
+    ExactBranchChoice branch = choose_exact_branch(
+        t1,
+        f,
+        next_label,
+        best_components,
+        undo
+    );
+    if (!branch.valid) {
+        cleanup();
+        return;
     }
-    if (!have || best_cand.na == -1 || best_cand.nb == -1) {
+    if (branch.live_plans.empty()) {
+        if (stats) ++stats->lb_prunes;
         cleanup();
         return;
     }
 
-    std::vector<std::vector<int>> plans;
-    if (!best_cand.same_component) {
-        plans.push_back({best_cand.na});
-        plans.push_back({best_cand.nb});
-    } else if (best_cand.pendant_count == 1) {
-        plans.push_back({best_cand.pendants[0]});
-    } else {
-        plans.push_back({best_cand.na});
-        plans.push_back({best_cand.nb});
-        if (!best_cand.pendants.empty()) {
-            plans.push_back(best_cand.pendants);
-        }
-    }
-
-    std::vector<std::pair<double, int>> ranked;
-    ranked.reserve(plans.size());
-    for (int i = 0; i < static_cast<int>(plans.size()); ++i) {
-        UndoLog undo;
-        size_t mark = undo.mark();
-        int nl = next_label;
-        apply_cut_plan(f, plans[static_cast<size_t>(i)], &undo);
-        contract_all_common_cherries(t1, f, nl, &undo);
-        double val = evaluate_reduced_state(t1, f, t1.active_leaf_count) - 0.05 * static_cast<double>(plans[static_cast<size_t>(i)].size());
-        undo.undo_to(mark);
-        ranked.push_back({-val, i});
-    }
-    std::sort(ranked.begin(), ranked.end());
-
-    for (const auto& rank : ranked) {
-        const auto& plan = plans[static_cast<size_t>(rank.second)];
+    for (const auto& child : branch.live_plans) {
+        const auto& plan = child.plan;
         size_t mark = undo.mark();
         int saved_next_label = next_label;
 
