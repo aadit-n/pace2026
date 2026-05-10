@@ -2422,7 +2422,8 @@ struct ExactKernelResult {
 
 struct ExactSearchStats {
     int reduced_n = 0;
-    int threshold = 24;
+    int gap_cap = 0;
+    int root_lower_bound = 0;
     int incumbent_before = 0;
     int incumbent_after = 0;
     long long elapsed_ms = 0;
@@ -2431,6 +2432,8 @@ struct ExactSearchStats {
     uint64_t bound_prunes = 0;
     uint64_t lb_prunes = 0;
     uint64_t deadline_prunes = 0;
+    uint64_t node_budget = 0;
+    uint64_t node_budget_prunes = 0;
     bool triggered = false;
     bool improved = false;
 };
@@ -2449,18 +2452,51 @@ void emit_exact_profile(const char* phase, const ExactSearchStats& stats) {
         << "EXACT"
         << " phase=" << phase
         << " reduced_n=" << stats.reduced_n
-        << " threshold=" << stats.threshold
+        << " gap_cap=" << stats.gap_cap
+        << " root_lb=" << stats.root_lower_bound
         << " triggered=" << (stats.triggered ? 1 : 0)
         << " incumbent_before=" << stats.incumbent_before
         << " incumbent_after=" << stats.incumbent_after
         << " improved=" << (stats.improved ? 1 : 0)
         << " ms=" << stats.elapsed_ms
         << " nodes=" << stats.nodes
+        << " node_budget=" << stats.node_budget
         << " memo_hits=" << stats.memo_hits
         << " bound_prunes=" << stats.bound_prunes
         << " lb_prunes=" << stats.lb_prunes
         << " deadline_prunes=" << stats.deadline_prunes
+        << " node_budget_prunes=" << stats.node_budget_prunes
         << '\n';
+}
+
+struct ExactSearchControl {
+    uint64_t node_budget = 0;
+    uint64_t nodes = 0;
+    bool aborted = false;
+};
+
+struct ExactRootBounds {
+    int current_components = 0;
+    int additional_lb = 0;
+    int lower_bound_total = 0;
+    int active_leaves = 0;
+};
+
+ExactRootBounds analyze_exact_root_bounds(
+    const DynamicTree& dt1_base,
+    const DynamicTree& dt2_base,
+    int reduced_n
+) {
+    ExactRootBounds out;
+    DynamicTree t1 = dt1_base;
+    DynamicTree f = dt2_base;
+    int next_label = reduced_n + 1;
+    contract_all_common_cherries(t1, f, next_label);
+    out.current_components = f.root_component_count;
+    out.additional_lb = exact_conflict_lower_bound(t1, f);
+    out.lower_bound_total = out.current_components + out.additional_lb;
+    out.active_leaves = t1.active_leaf_count;
+    return out;
 }
 
 void collect_current_components(const DynamicTree& f, std::vector<std::vector<int>>& comps) {
@@ -2484,6 +2520,7 @@ void exact_kernel_dfs(
     std::vector<std::vector<int>>& best_comps,
     std::unordered_map<ExactStateKey, int, ExactStateKeyHash>& memo,
     UndoLog& undo,
+    ExactSearchControl& control,
     ExactSearchStats* stats = nullptr
 ) {
     size_t entry_mark = undo.mark();
@@ -2496,6 +2533,19 @@ void exact_kernel_dfs(
 
     PathScratch path_scratch;
 
+    if (control.aborted) {
+        cleanup();
+        return;
+    }
+
+    if (control.node_budget != 0 && control.nodes >= control.node_budget) {
+        control.aborted = true;
+        if (stats) ++stats->node_budget_prunes;
+        cleanup();
+        return;
+    }
+
+    ++control.nodes;
     if (stats) ++stats->nodes;
 
     if (g_terminate || Clock::now() >= deadline) {
@@ -2553,6 +2603,7 @@ void exact_kernel_dfs(
         }
     }
     if (!have || best_cand.na == -1 || best_cand.nb == -1) {
+        cleanup();
         return;
     }
 
@@ -2590,11 +2641,11 @@ void exact_kernel_dfs(
         int saved_next_label = next_label;
 
         apply_cut_plan(f, plan, &undo);
-        exact_kernel_dfs(t1, f, next_label, deadline, best_components, best_comps, memo, undo, stats);
+        exact_kernel_dfs(t1, f, next_label, deadline, best_components, best_comps, memo, undo, control, stats);
 
         next_label = saved_next_label;
         undo.undo_to(mark);
-        if (g_terminate || Clock::now() >= deadline) {
+        if (control.aborted || g_terminate || Clock::now() >= deadline) {
             cleanup();
             return;
         }
@@ -2608,20 +2659,20 @@ ExactKernelResult solve_exact_kernel_bounded(
     int reduced_n,
     int incumbent_components,
     Clock::time_point exact_deadline,
-    int threshold,
+    int gap_cap,
+    int root_lower_bound,
+    uint64_t node_budget,
     const char* phase
 ) {
     ExactKernelResult res;
     ExactSearchStats stats;
     stats.reduced_n = reduced_n;
-    stats.threshold = threshold;
+    stats.gap_cap = gap_cap;
+    stats.root_lower_bound = root_lower_bound;
     stats.incumbent_before = incumbent_components;
     stats.incumbent_after = incumbent_components;
-    if (reduced_n > threshold) {
-        emit_exact_profile(phase, stats);
-        return res;
-    }
-    if (incumbent_components <= 1) {
+    stats.node_budget = node_budget;
+    if (incumbent_components <= root_lower_bound) {
         emit_exact_profile(phase, stats);
         return res;
     }
@@ -2641,6 +2692,8 @@ ExactKernelResult solve_exact_kernel_bounded(
     DynamicTree f = dt2_base;
     int next_label = reduced_n + 1;
     UndoLog undo;
+    ExactSearchControl control;
+    control.node_budget = node_budget;
 
     exact_kernel_dfs(
         t1,
@@ -2651,9 +2704,10 @@ ExactKernelResult solve_exact_kernel_bounded(
         best_comps,
         memo,
         undo,
+        control,
         stats_ptr
     );
-        stats.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    stats.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - exact_start
     ).count();
     stats.incumbent_after = best_components;
@@ -2672,51 +2726,97 @@ ExactKernelResult maybe_solve_exact_kernel(
     int reduced_n,
     int heuristic_components,
     Clock::time_point soft_deadline,
-    const char* phase = "initial"
+    const char* phase = "initial",
+    int gap_cap_override = 0,
+    uint64_t node_budget_override = 0
 ) {
     ExactSearchStats stats;
     stats.reduced_n = reduced_n;
     stats.incumbent_before = heuristic_components;
     stats.incumbent_after = heuristic_components;
-
-    int threshold = 24;
-    if (reduced_n <= 20) {
-        threshold = reduced_n;
-    } else if (reduced_n <= 28) {
-        threshold = std::min(reduced_n, 28);
-    } else if (reduced_n <= 32 && heuristic_components <= 16) {
-        threshold = std::min(reduced_n, 32);
-    } else if (reduced_n <= 36 && heuristic_components <= 12) {
-        threshold = std::min(reduced_n, 32);
-    } else if (reduced_n <= 40 && heuristic_components <= 10) {
-        threshold = 32;
-    }
-    stats.threshold = std::min(threshold, reduced_n);
-
-    if (reduced_n > stats.threshold) {
-        emit_exact_profile(phase, stats);
-        return {};
-    }
     if (heuristic_components <= 1) {
         emit_exact_profile(phase, stats);
         return {};
     }
-    if (heuristic_components - 1 > stats.threshold + 4) {
+
+    auto now = Clock::now();
+    auto ms_left = std::chrono::duration_cast<std::chrono::milliseconds>(soft_deadline - now).count();
+    long long min_ms_needed = (gap_cap_override > 0 || node_budget_override > 0) ? 10 : 40;
+    if (ms_left < min_ms_needed) {
         emit_exact_profile(phase, stats);
         return {};
     }
-    if (Clock::now() + std::chrono::milliseconds(50) >= soft_deadline) {
+
+    ExactRootBounds root = analyze_exact_root_bounds(dt1_base, dt2_base, reduced_n);
+    stats.root_lower_bound = root.lower_bound_total;
+
+    int gap = heuristic_components - root.lower_bound_total;
+    if (gap <= 0) {
         emit_exact_profile(phase, stats);
         return {};
     }
-    auto exact_deadline = std::min(soft_deadline, Clock::now() + std::chrono::milliseconds(1200));
+
+    int gap_cap = gap_cap_override;
+    long long budget_ms = 0;
+    uint64_t node_budget = node_budget_override;
+
+    if (gap_cap <= 0) {
+        if (gap <= 2) {
+            gap_cap = 2;
+            budget_ms = (reduced_n > 2000) ? 1700 : 1200;
+            node_budget = 260000;
+        } else if (gap <= 4) {
+            gap_cap = 4;
+            budget_ms = (reduced_n > 1200) ? 900 : 650;
+            node_budget = 140000;
+        } else if (gap <= 6 && heuristic_components <= 24) {
+            gap_cap = 6;
+            budget_ms = 420;
+            node_budget = 70000;
+        } else if (gap <= 8 && heuristic_components <= 14) {
+            gap_cap = 8;
+            budget_ms = 220;
+            node_budget = 30000;
+        } else if (gap <= 10 && heuristic_components <= 16) {
+            gap_cap = 10;
+            budget_ms = 260;
+            node_budget = 45000;
+        } else if (gap <= 12 && heuristic_components <= 10) {
+            gap_cap = 12;
+            budget_ms = 180;
+            node_budget = 28000;
+        } else {
+            emit_exact_profile(phase, stats);
+            return {};
+        }
+    } else if (node_budget == 0) {
+        if (gap_cap <= 4) node_budget = 160000;
+        else if (gap_cap <= 6) node_budget = 90000;
+        else node_budget = 50000;
+    }
+
+    stats.gap_cap = gap_cap;
+    stats.node_budget = node_budget;
+    if (gap > gap_cap) {
+        emit_exact_profile(phase, stats);
+        return {};
+    }
+
+    if (budget_ms <= 0) {
+        budget_ms = ms_left;
+    }
+    long long share_cap = std::max<long long>(40, ms_left / 3);
+    budget_ms = std::max<long long>(40, std::min<long long>(budget_ms, std::min<long long>(2200, share_cap)));
+    auto exact_deadline = std::min(soft_deadline, now + std::chrono::milliseconds(budget_ms));
     return solve_exact_kernel_bounded(
         dt1_base,
         dt2_base,
         reduced_n,
         heuristic_components,
         exact_deadline,
-        stats.threshold,
+        gap_cap,
+        root.lower_bound_total,
+        node_budget,
         phase
     );
 }
@@ -2937,8 +3037,9 @@ struct RepairCandidateGroup {
 };
 
 struct LocalExactSearchPlan {
-    int threshold = 0;
+    int gap_cap = 0;
     std::chrono::milliseconds budget{0};
+    uint64_t node_budget = 0;
 };
 
 std::string repair_group_key(const std::vector<int>& group) {
@@ -3031,30 +3132,36 @@ LocalExactSearchPlan plan_local_exact_search(
     int incumbent = std::max(1, incumbent_components);
 
     if (incumbent <= 2) {
-        plan.threshold = final_phase ? 44 : 40;
-        plan.budget = std::chrono::milliseconds(final_phase ? 110 : 70);
+        plan.gap_cap = final_phase ? 12 : 10;
+        plan.budget = std::chrono::milliseconds(final_phase ? 120 : 80);
+        plan.node_budget = final_phase ? 160000 : 120000;
     } else if (incumbent == 3) {
-        plan.threshold = final_phase ? 42 : 38;
-        plan.budget = std::chrono::milliseconds(final_phase ? 90 : 55);
+        plan.gap_cap = final_phase ? 10 : 8;
+        plan.budget = std::chrono::milliseconds(final_phase ? 95 : 60);
+        plan.node_budget = final_phase ? 120000 : 90000;
     } else if (incumbent == 4) {
-        plan.threshold = final_phase ? 38 : 36;
-        plan.budget = std::chrono::milliseconds(final_phase ? 70 : 45);
+        plan.gap_cap = final_phase ? 8 : 7;
+        plan.budget = std::chrono::milliseconds(final_phase ? 75 : 50);
+        plan.node_budget = final_phase ? 90000 : 65000;
     } else {
-        plan.threshold = final_phase ? 34 : 32;
-        plan.budget = std::chrono::milliseconds(final_phase ? 55 : 35);
+        plan.gap_cap = final_phase ? 7 : 6;
+        plan.budget = std::chrono::milliseconds(final_phase ? 60 : 40);
+        plan.node_budget = final_phase ? 70000 : 50000;
     }
 
     if (reduced_n <= 24) {
-        plan.threshold = reduced_n;
+        plan.gap_cap += 2;
         plan.budget += std::chrono::milliseconds(final_phase ? 50 : 30);
+        plan.node_budget += final_phase ? 30000 : 20000;
     } else if (reduced_n <= 32 && incumbent <= 5) {
-        plan.threshold = std::min(plan.threshold + 2, reduced_n);
+        plan.gap_cap += 1;
         plan.budget += std::chrono::milliseconds(final_phase ? 20 : 10);
+        plan.node_budget += final_phase ? 15000 : 10000;
     } else if (reduced_n >= 40) {
         plan.budget -= std::chrono::milliseconds(10);
+        plan.node_budget = static_cast<uint64_t>(plan.node_budget * 85 / 100);
     }
 
-    plan.threshold = std::min(plan.threshold, reduced_n);
     long long budget_ms = plan.budget.count();
     long long max_cap = final_phase ? 220 : 140;
     long long share_cap = std::max<long long>(15, ms_left / (final_phase ? 3 : 5));
@@ -3072,31 +3179,36 @@ LocalExactSearchPlan plan_polish_exact_search(
     int incumbent = std::max(1, incumbent_components);
 
     if (reduced_n <= 24) {
-        plan.threshold = reduced_n;
+        plan.gap_cap = 12;
         plan.budget = std::chrono::milliseconds(1200);
+        plan.node_budget = 320000;
     } else if (incumbent <= 6) {
-        plan.threshold = 40;
+        plan.gap_cap = 10;
         plan.budget = std::chrono::milliseconds(900);
+        plan.node_budget = 240000;
     } else if (incumbent <= 8) {
-        plan.threshold = 36;
+        plan.gap_cap = 8;
         plan.budget = std::chrono::milliseconds(650);
+        plan.node_budget = 170000;
     } else if (incumbent <= 10) {
-        plan.threshold = 32;
+        plan.gap_cap = 6;
         plan.budget = std::chrono::milliseconds(450);
+        plan.node_budget = 110000;
     } else if (incumbent <= 12) {
-        plan.threshold = 28;
+        plan.gap_cap = 5;
         plan.budget = std::chrono::milliseconds(300);
+        plan.node_budget = 80000;
     } else {
-        plan.threshold = 24;
-        plan.budget = std::chrono::milliseconds(180);
+        plan.gap_cap = 4;
+        plan.budget = std::chrono::milliseconds(220);
+        plan.node_budget = 55000;
     }
 
     if (reduced_n <= 32 && incumbent <= 5) {
-        plan.threshold = std::min(plan.threshold, reduced_n);
         plan.budget = std::chrono::milliseconds(std::max<long long>(plan.budget.count(), 850));
+        plan.node_budget = std::max<uint64_t>(plan.node_budget, 220000);
     }
 
-    plan.threshold = std::min(plan.threshold, reduced_n);
     long long budget_ms = plan.budget.count();
     long long share_cap = std::max<long long>(40, ms_left / 4);
     budget_ms = std::max<long long>(40, std::min<long long>(budget_ms, std::min<long long>(1400, share_cap)));
@@ -3779,6 +3891,27 @@ bool apply_exact_repair_group(
     if (local_reduced.reduced_leaf_count <= 0 || local_reduced.reduced_leaf_count > repair_leaf_limit) {
         return false;
     }
+    if (local_reduced.reduced_leaf_count == 1) {
+        next_partition = current_partition;
+        std::vector<int> erase_indices = group_indices;
+        std::sort(erase_indices.begin(), erase_indices.end(), std::greater<int>());
+        for (int idx : erase_indices) {
+            next_partition.erase(next_partition.begin() + idx);
+        }
+        next_partition.push_back(union_labels);
+        normalize_partition(next_partition);
+
+        if (static_cast<int>(union_labels.size()) == 0 ||
+            static_cast<int>(group_indices.size()) <= 1 ||
+            !partition_is_valid_agreement_forest(
+                reduced.t1,
+                reduced.t2,
+                next_partition,
+                reduced.reduced_leaf_count)) {
+            return false;
+        }
+        return true;
+    }
 
     auto now = Clock::now();
     auto ms_left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
@@ -3788,21 +3921,18 @@ bool apply_exact_repair_group(
         final_phase,
         ms_left
     );
-    if (local_reduced.reduced_leaf_count > plan.threshold) {
-        return false;
-    }
-
+    auto exact_deadline = std::min(deadline, now + plan.budget);
     DynamicTree dt1_base = build_dynamic_tree(local_reduced.t1);
     DynamicTree dt2_base = build_dynamic_tree(local_reduced.t2);
-    auto exact_deadline = std::min(deadline, now + plan.budget);
-    auto exact = solve_exact_kernel_bounded(
+    auto exact = maybe_solve_exact_kernel(
         dt1_base,
         dt2_base,
         local_reduced.reduced_leaf_count,
         static_cast<int>(group_indices.size()),
         exact_deadline,
-        plan.threshold,
-        "repair"
+        "repair",
+        plan.gap_cap,
+        plan.node_budget
     );
     if (!exact.solved || exact.comps.empty()) return false;
 
@@ -4749,17 +4879,17 @@ bool run_final_polishing_portfolio(
         best_components,
         ms_left
     );
-    if (reduced.reduced_leaf_count <= polish_plan.threshold &&
-        now + std::chrono::milliseconds(20) < deadline) {
+    if (now + std::chrono::milliseconds(20) < deadline) {
         auto exact_deadline = std::min(deadline, now + polish_plan.budget);
-        auto exact = solve_exact_kernel_bounded(
+        auto exact = maybe_solve_exact_kernel(
             dt1_base,
             dt2_base,
             reduced.reduced_leaf_count,
             best_components,
             exact_deadline,
-            polish_plan.threshold,
-            "polish"
+            "polish",
+            polish_plan.gap_cap,
+            polish_plan.node_budget
         );
         if (exact.solved && !exact.comps.empty() &&
             static_cast<int>(exact.comps.size()) < best_components) {
@@ -5244,6 +5374,45 @@ std::vector<std::vector<int>> solve_direct_reduced(
             prune_limit = std::min(prune_limit, best_components);
             if (static_cast<int>(best_reduced.size()) <= prune_limit + 2) {
                 maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
+            }
+        }
+    }
+    if (!g_terminate &&
+        best_components > 1 &&
+        best_components < reduced_n &&
+        Clock::now() + std::chrono::milliseconds(40) < deadline) {
+        auto late_exact = maybe_solve_exact_kernel(
+            dt1_base,
+            dt2_base,
+            reduced_n,
+            best_components,
+            deadline,
+            "mid"
+        );
+        if (late_exact.solved && !late_exact.comps.empty()) {
+            auto candidate = late_exact.comps;
+            normalize_partition(candidate);
+
+            if (static_cast<int>(candidate.size()) < best_components &&
+                partition_is_valid_agreement_forest(
+                    reduced.t1,
+                    reduced.t2,
+                    candidate,
+                    reduced.reduced_leaf_count)) {
+                best_reduced = std::move(candidate);
+                best_components = static_cast<int>(best_reduced.size());
+                prune_limit = std::min(prune_limit, best_components);
+                maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
+                run_greedy_merge_portfolio(
+                    reduced,
+                    best_reduced,
+                    best_components,
+                    elite_pool,
+                    elite_limit,
+                    deadline,
+                    false
+                );
+                prune_limit = std::min(prune_limit, best_components);
             }
         }
     }
@@ -6094,6 +6263,66 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                     auto expanded = expand_reduced_components(best_reduced, reduced.expansion);
                     auto out = forest_from_partition(expanded, n, original_t1);
 
+                    if (!out.empty() && static_cast<int>(out.size()) < best_components) {
+                        best_out = std::move(out);
+                        best_components = static_cast<int>(best_out.size());
+                        publish_best_solution(best_out);
+                    }
+                }
+            }
+        }
+    }
+
+    int exact_mid_incumbent = std::min(best_components, best_reduced_components);
+    if (!g_terminate &&
+        exact_mid_incumbent > 1 &&
+        best_reduced_components < reduced_n &&
+        Clock::now() + std::chrono::milliseconds(50) < soft_deadline) {
+        auto exact_mid = maybe_solve_exact_kernel(
+            dt1_base,
+            dt2_base,
+            reduced_n,
+            exact_mid_incumbent,
+            soft_deadline,
+            "main_mid"
+        );
+
+        if (exact_mid.solved && !exact_mid.comps.empty()) {
+            auto candidate = exact_mid.comps;
+            normalize_partition(candidate);
+
+            if (partition_is_valid_agreement_forest(
+                    reduced.t1,
+                    reduced.t2,
+                    candidate,
+                    reduced.reduced_leaf_count)) {
+
+                int cand_components = static_cast<int>(candidate.size());
+                if (cand_components < best_reduced_components) {
+                    best_reduced = candidate;
+                    best_reduced_components = cand_components;
+                    maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
+
+                    if (run_greedy_merge_portfolio(
+                            reduced,
+                            best_reduced,
+                            best_reduced_components,
+                            elite_pool,
+                            elite_limit,
+                            soft_deadline,
+                            false) &&
+                        partition_is_valid_agreement_forest(
+                            reduced.t1,
+                            reduced.t2,
+                            best_reduced,
+                            reduced.reduced_leaf_count)) {
+                        best_reduced_components = static_cast<int>(best_reduced.size());
+                    }
+                }
+
+                if (best_reduced_components < best_components) {
+                    auto expanded = expand_reduced_components(best_reduced, reduced.expansion);
+                    auto out = forest_from_partition(expanded, n, original_t1);
                     if (!out.empty() && static_cast<int>(out.size()) < best_components) {
                         best_out = std::move(out);
                         best_components = static_cast<int>(best_out.size());
