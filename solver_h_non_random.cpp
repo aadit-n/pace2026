@@ -3040,6 +3040,50 @@ void normalize_partition(std::vector<std::vector<int>>& comps) {
     });
 }
 
+bool map_original_partition_to_reduced(
+    const std::vector<std::vector<int>>& original_comps,
+    const std::vector<std::vector<int>>& expansion,
+    int original_n,
+    std::vector<std::vector<int>>& reduced_comps
+) {
+    if (original_comps.empty() || original_n <= 0) return false;
+
+    std::vector<int> comp_of_leaf(static_cast<size_t>(original_n + 1), -1);
+    int seen = 0;
+    for (size_t cid = 0; cid < original_comps.size(); ++cid) {
+        for (int x : original_comps[cid]) {
+            if (x < 1 || x > original_n) return false;
+            int& slot = comp_of_leaf[static_cast<size_t>(x)];
+            if (slot != -1) return false;
+            slot = static_cast<int>(cid);
+            ++seen;
+        }
+    }
+    if (seen != original_n) return false;
+
+    std::vector<std::vector<int>> mapped(original_comps.size());
+    for (size_t lbl = 1; lbl < expansion.size(); ++lbl) {
+        if (expansion[lbl].empty()) continue;
+        int cid = -1;
+        for (int x : expansion[lbl]) {
+            if (x < 1 || x > original_n) return false;
+            int owner = comp_of_leaf[static_cast<size_t>(x)];
+            if (owner < 0) return false;
+            if (cid < 0) {
+                cid = owner;
+            } else if (cid != owner) {
+                return false;
+            }
+        }
+        mapped[static_cast<size_t>(cid)].push_back(static_cast<int>(lbl));
+    }
+
+    normalize_partition(mapped);
+    if (mapped.empty()) return false;
+    reduced_comps = std::move(mapped);
+    return true;
+}
+
 std::string restricted_key_simple_dfs(
     const SimpleTree& st,
     int u,
@@ -5503,7 +5547,6 @@ std::vector<std::vector<int>> solve_direct_reduced(
         maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
     }
     // ResolveSet-style 2-approx-inspired candidate.
-    // Test patch #1: one conservative mode only.
     if (!g_terminate && Clock::now() + std::chrono::milliseconds(30) < deadline) {
         auto now = Clock::now();
         auto ms_left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
@@ -6229,6 +6272,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
 
     auto best_out = singleton_forest(n);
     int best_components = static_cast<int>(best_out.size());
+    std::vector<std::vector<int>> decomp_seed_original;
 
     const TreeData& original_t1 = trees[0];
     std::vector<std::vector<int>> identity_expansion(static_cast<size_t>(n + 1));
@@ -6254,6 +6298,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
         normalize_partition(decomp_comps);
 
         if (partition_is_valid_agreement_forest(parsed[0], parsed[1], decomp_comps, n)) {
+            decomp_seed_original = decomp_comps;
             auto decomp_out = forest_from_partition(decomp_comps, n, original_t1);
             if (!decomp_out.empty() && static_cast<int>(decomp_out.size()) < best_components) {
                 best_out = decomp_out;
@@ -6271,6 +6316,27 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     int reduced_n = reduced.reduced_leaf_count;
     std::vector<std::vector<int>> best_reduced = reduced_singleton_components(reduced_n);
     int best_reduced_components = static_cast<int>(best_reduced.size());
+    bool have_mapped_decomp_seed = false;
+
+    if (!decomp_seed_original.empty()) {
+        std::vector<std::vector<int>> mapped_decomp;
+        if (map_original_partition_to_reduced(
+                decomp_seed_original,
+                reduced.expansion,
+                n,
+                mapped_decomp) &&
+            static_cast<int>(mapped_decomp.size()) < best_reduced_components &&
+            partition_is_valid_agreement_forest(
+                reduced.t1,
+                reduced.t2,
+                mapped_decomp,
+                reduced.reduced_leaf_count)) {
+            best_reduced = std::move(mapped_decomp);
+            best_reduced_components = static_cast<int>(best_reduced.size());
+            have_mapped_decomp_seed = true;
+        }
+    }
+
     int exact0_incumbent = std::min(best_components, best_reduced_components);
 
     auto exact0 = maybe_solve_exact_kernel(
@@ -6294,6 +6360,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
 
             best_reduced = candidate;
             best_reduced_components = static_cast<int>(candidate.size());
+            have_mapped_decomp_seed = false;
 
             auto expanded = expand_reduced_components(candidate, reduced.expansion);
             auto out = forest_from_partition(expanded, n, original_t1);
@@ -6307,6 +6374,57 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     }
     std::vector<EliteSolution> elite_pool;
     int elite_limit = elite_pool_limit_for_size(reduced_n);
+    if (!best_reduced.empty() &&
+        static_cast<int>(best_reduced.size()) < reduced_n &&
+        (!have_mapped_decomp_seed || reduced_n <= 4000)) {
+        maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
+    }
+
+    if (have_mapped_decomp_seed &&
+        best_reduced_components < reduced_n &&
+        reduced_n <= 1000 &&
+        !g_terminate &&
+        Clock::now() + std::chrono::milliseconds(60) < soft_deadline) {
+
+        bool repaired_or_merged = false;
+        if (run_exact_repair_portfolio(
+                reduced,
+                best_reduced,
+                best_reduced_components,
+                elite_pool,
+                soft_deadline,
+                false)) {
+            repaired_or_merged = true;
+        }
+
+        if (run_greedy_merge_portfolio(
+                reduced,
+                best_reduced,
+                best_reduced_components,
+                elite_pool,
+                elite_limit,
+                soft_deadline,
+                false)) {
+            repaired_or_merged = true;
+        }
+
+        if (repaired_or_merged &&
+            best_reduced_components < best_components &&
+            partition_is_valid_agreement_forest(
+                reduced.t1,
+                reduced.t2,
+                best_reduced,
+                reduced.reduced_leaf_count)) {
+
+            auto expanded = expand_reduced_components(best_reduced, reduced.expansion);
+            auto out = forest_from_partition(expanded, n, original_t1);
+            if (!out.empty() && static_cast<int>(out.size()) < best_components) {
+                best_out = std::move(out);
+                best_components = static_cast<int>(best_out.size());
+                publish_best_solution(best_out);
+            }
+        }
+    }
 
     // Deterministic duality-inspired candidate after reductions.
     // This can become an early incumbent and is also fed to the elite pool
@@ -6339,6 +6457,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
             if (dual_components < best_reduced_components) {
                 best_reduced = dual2.comps;
                 best_reduced_components = dual_components;
+                have_mapped_decomp_seed = false;
             }
 
             if (dual_components < best_components) {
@@ -6354,6 +6473,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
 
             // Try cheap merge immediately after accepting/recording the seed.
             if (best_reduced_components < reduced_n &&
+                (!have_mapped_decomp_seed || reduced_n <= 4000) &&
                 run_greedy_merge_portfolio(
                     reduced,
                     best_reduced,
@@ -6382,7 +6502,6 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     }
 
     // ResolveSet-style 2-approx-inspired candidate.
-    // Test patch #1: one conservative mode only.
     if (!g_terminate && Clock::now() + std::chrono::milliseconds(40) < soft_deadline) {
         auto now = Clock::now();
         auto ms_left = std::chrono::duration_cast<std::chrono::milliseconds>(soft_deadline - now).count();
@@ -6426,6 +6545,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                 if (cand_components < best_reduced_components) {
                     best_reduced = candidate;
                     best_reduced_components = cand_components;
+                    have_mapped_decomp_seed = false;
                 }
 
                 if (cand_components < best_components) {
@@ -6472,6 +6592,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     if (!g_terminate &&
         exact_mid_incumbent > 1 &&
         best_reduced_components < reduced_n &&
+        (!have_mapped_decomp_seed || reduced_n <= 4000) &&
         Clock::now() + std::chrono::milliseconds(50) < soft_deadline) {
         auto exact_mid = maybe_solve_exact_kernel(
             dt1_base,
@@ -6496,6 +6617,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                 if (cand_components < best_reduced_components) {
                     best_reduced = candidate;
                     best_reduced_components = cand_components;
+                    have_mapped_decomp_seed = false;
                     maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
 
                     if (run_greedy_merge_portfolio(
@@ -6531,7 +6653,8 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     auto configs = deterministic_configs_for_size(reduced_n);
 
     if (!best_reduced.empty() &&
-        static_cast<int>(best_reduced.size()) < reduced_n) {
+        static_cast<int>(best_reduced.size()) < reduced_n &&
+        (!have_mapped_decomp_seed || reduced_n <= 4000)) {
         maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
     }
 
@@ -6613,6 +6736,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
             if (ensure_candidate_valid()) {
                 best_reduced = candidate_reduced;
                 best_reduced_components = cand_components;
+                have_mapped_decomp_seed = false;
                 accepted = true;
             } else {
                 emit_deterministic_profile("main", cfg, reduced_n, res.complete, cand_components, false, false, cfg_ms);
@@ -6641,6 +6765,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                 best_components = static_cast<int>(out.size());
                 best_reduced = std::move(candidate_reduced);
                 best_reduced_components = static_cast<int>(best_reduced.size());
+                have_mapped_decomp_seed = false;
                 accepted = true;
                 improved = true;
 
@@ -6691,6 +6816,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     }
     if (!g_terminate &&
         best_reduced_components < reduced_n &&
+        (!have_mapped_decomp_seed || reduced_n <= 4000) &&
         Clock::now() + std::chrono::milliseconds(200) < soft_deadline) {
 
         run_final_polishing_portfolio(
