@@ -27,3 +27,4 @@ split or decompose exact.pdf
 /spr_neighbors
 /TBRDist
 tools/bench_compare.py
+tools/compare_stride_summaries.py

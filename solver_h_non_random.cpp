@@ -3121,27 +3121,6 @@ bool map_original_partition_to_reduced(
     return true;
 }
 
-std::string restricted_key_simple_dfs(
-    const SimpleTree& st,
-    int u,
-    const std::vector<char>& in_comp
-) {
-    if (st.children[static_cast<size_t>(u)].empty()) {
-        int lbl = st.leaf_label[static_cast<size_t>(u)];
-        return (lbl > 0 && lbl < static_cast<int>(in_comp.size()) && in_comp[static_cast<size_t>(lbl)])
-            ? ("L" + std::to_string(lbl))
-            : std::string();
-    }
-
-    std::string a = restricted_key_simple_dfs(st, st.children[static_cast<size_t>(u)][0], in_comp);
-    std::string b = restricted_key_simple_dfs(st, st.children[static_cast<size_t>(u)][1], in_comp);
-
-    if (a.empty()) return b;
-    if (b.empty()) return a;
-    if (a > b) std::swap(a, b);
-    return "(" + a + "," + b + ")";
-}
-
 int mark_component_edges_dfs(
     const SimpleTree& st,
     int u,
@@ -3185,6 +3164,29 @@ int mark_component_edges_dfs(
     return total;
 }
 
+// NEW: Fast hash-based restricted topology check (replaces string-based version)
+uint64_t restricted_hash_simple_dfs(
+    const SimpleTree& st,
+    int u,
+    const std::vector<char>& in_comp
+) {
+    if (st.children[static_cast<size_t>(u)].empty()) {
+        int lbl = st.leaf_label[static_cast<size_t>(u)];
+        if (lbl > 0 && lbl < static_cast<int>(in_comp.size()) && in_comp[static_cast<size_t>(lbl)]) {
+            return mix64(static_cast<uint64_t>(lbl) + 0x9e3779b97f4a7c15ULL);
+        }
+        return 0;  // Empty = not in component
+    }
+
+    uint64_t a = restricted_hash_simple_dfs(st, st.children[static_cast<size_t>(u)][0], in_comp);
+    uint64_t b = restricted_hash_simple_dfs(st, st.children[static_cast<size_t>(u)][1], in_comp);
+
+    if (a == 0) return b;
+    if (b == 0) return a;
+    if (a > b) std::swap(a, b);
+    return mix64(a ^ (b + 0x9e3779b97f4a7c15ULL + (a << 6) + (a >> 2)));
+}
+
 bool partition_is_valid_agreement_forest(
     const SimpleTree& t1,
     const SimpleTree& t2,
@@ -3219,10 +3221,10 @@ bool partition_is_valid_agreement_forest(
             in_comp[static_cast<size_t>(x)] = 1;
         }
 
-        std::string k1 = restricted_key_simple_dfs(t1, t1.root, in_comp);
-        std::string k2 = restricted_key_simple_dfs(t2, t2.root, in_comp);
+        uint64_t h1 = restricted_hash_simple_dfs(t1, t1.root, in_comp);
+        uint64_t h2 = restricted_hash_simple_dfs(t2, t2.root, in_comp);
 
-        if (k1.empty() || k2.empty() || k1 != k2) {
+        if (h1 == 0 || h2 == 0 || h1 != h2) {
             return false;
         }
 
