@@ -470,6 +470,43 @@ bool reduction_profile_enabled() {
     return enabled != 0;
 }
 
+bool pace_profile_enabled() {
+    static int enabled = []() {
+        const char* env = std::getenv("PACE_PROFILE");
+        return (env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
+    }();
+    return enabled != 0;
+}
+
+long long elapsed_ms_since(Clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
+}
+
+void emit_pace_profile(
+    const char* pass,
+    int original_n,
+    int reduced_n,
+    int score_before,
+    int score_after,
+    long long elapsed_ms,
+    const char* reason = ""
+) {
+    if (!pace_profile_enabled()) return;
+    std::cerr
+        << "PACE_PROFILE"
+        << " pass=" << pass
+        << " original_n=" << original_n
+        << " reduced_n=" << reduced_n
+        << " before=" << score_before
+        << " after=" << score_after
+        << " improved=" << (score_after >= 0 && score_before >= 0 && score_after < score_before ? 1 : 0)
+        << " ms=" << elapsed_ms;
+    if (reason && reason[0] != '\0') {
+        std::cerr << " reason=" << reason;
+    }
+    std::cerr << '\n';
+}
+
 void emit_reduction_profile(const ReductionBuildStats& stats) {
     if (!reduction_profile_enabled()) return;
     auto emit_rule = [&](const ReductionRuleStats& rule) {
@@ -6285,7 +6322,12 @@ std::vector<std::string> solve(const PaceInstance& inst) {
             std::max<long long>(1, static_cast<long long>(timeout_sec * 1000.0 * 0.35))
         )
     );
+    bool decomp_attempted = false;
+    auto decomp_profile_start = Clock::now();
+    int decomp_score_before = best_components;
+    const char* decomp_reason = "skipped_gate";
     if (!g_terminate && Clock::now() + std::chrono::milliseconds(20) < decomp_deadline) {
+        decomp_attempted = true;
         auto decomp_comps = solve_decomposed_candidate(
             parsed[0],
             parsed[1],
@@ -6298,17 +6340,40 @@ std::vector<std::string> solve(const PaceInstance& inst) {
         normalize_partition(decomp_comps);
 
         if (partition_is_valid_agreement_forest(parsed[0], parsed[1], decomp_comps, n)) {
+            decomp_reason = "valid_no_improve";
             decomp_seed_original = decomp_comps;
             auto decomp_out = forest_from_partition(decomp_comps, n, original_t1);
             if (!decomp_out.empty() && static_cast<int>(decomp_out.size()) < best_components) {
                 best_out = decomp_out;
                 best_components = static_cast<int>(best_out.size());
                 publish_best_solution(best_out);
+                decomp_reason = "improved";
             }
+        } else {
+            decomp_reason = "invalid";
         }
     }
+    emit_pace_profile(
+        "cluster_decomposition_seed",
+        n,
+        -1,
+        decomp_score_before,
+        best_components,
+        decomp_attempted ? elapsed_ms_since(decomp_profile_start) : 0,
+        decomp_reason
+    );
 
+    auto reduction_profile_start = Clock::now();
     ReducedInstance reduced = build_reduced_instance(parsed[0], parsed[1], n);
+    emit_pace_profile(
+        "initial_reductions",
+        n,
+        reduced.reduced_leaf_count,
+        best_components,
+        best_components,
+        elapsed_ms_since(reduction_profile_start),
+        reduced.reduced_leaf_count <= 0 ? "invalid_reduced" : "ok"
+    );
     if (reduced.reduced_leaf_count <= 0) return best_out;
 
     DynamicTree dt1_base = build_dynamic_tree(reduced.t1);
@@ -6318,6 +6383,9 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     int best_reduced_components = static_cast<int>(best_reduced.size());
     bool have_mapped_decomp_seed = false;
 
+    auto map_profile_start = Clock::now();
+    int map_score_before = best_reduced_components;
+    const char* map_reason = decomp_seed_original.empty() ? "skipped_no_decomp_seed" : "not_mapped";
     if (!decomp_seed_original.empty()) {
         std::vector<std::vector<int>> mapped_decomp;
         if (map_original_partition_to_reduced(
@@ -6334,11 +6402,26 @@ std::vector<std::string> solve(const PaceInstance& inst) {
             best_reduced = std::move(mapped_decomp);
             best_reduced_components = static_cast<int>(best_reduced.size());
             have_mapped_decomp_seed = true;
+            map_reason = "mapped";
+        } else {
+            map_reason = "rejected";
         }
     }
+    emit_pace_profile(
+        "map_original_partition_to_reduced",
+        n,
+        reduced_n,
+        map_score_before,
+        best_reduced_components,
+        elapsed_ms_since(map_profile_start),
+        map_reason
+    );
 
     int exact0_incumbent = std::min(best_components, best_reduced_components);
 
+    auto exact0_profile_start = Clock::now();
+    int exact0_score_before = std::min(best_components, best_reduced_components);
+    const char* exact0_reason = "no_solution";
     auto exact0 = maybe_solve_exact_kernel(
         dt1_base,
         dt2_base,
@@ -6349,6 +6432,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     );
 
     if (exact0.solved && !exact0.comps.empty()) {
+        exact0_reason = "solved";
         auto candidate = exact0.comps;
         normalize_partition(candidate);
 
@@ -6370,22 +6454,50 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                 best_components = static_cast<int>(best_out.size());
                 publish_best_solution(best_out);
             }
+        } else {
+            exact0_reason = "invalid";
         }
+    } else if (exact0.solved) {
+        exact0_reason = "empty";
     }
+    emit_pace_profile(
+        "exact_kernel",
+        n,
+        reduced_n,
+        exact0_score_before,
+        std::min(best_components, best_reduced_components),
+        elapsed_ms_since(exact0_profile_start),
+        exact0_reason
+    );
     std::vector<EliteSolution> elite_pool;
     int elite_limit = elite_pool_limit_for_size(reduced_n);
+    auto elite_profile_start = Clock::now();
+    int elite_score_before = std::min(best_components, best_reduced_components);
     if (!best_reduced.empty() &&
         static_cast<int>(best_reduced.size()) < reduced_n &&
         (!have_mapped_decomp_seed || reduced_n <= 4000)) {
         maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
     }
+    emit_pace_profile(
+        "elite_update",
+        n,
+        reduced_n,
+        elite_score_before,
+        std::min(best_components, best_reduced_components),
+        elapsed_ms_since(elite_profile_start),
+        have_mapped_decomp_seed && reduced_n > 4000 ? "skipped_large_decomp_seed" : "initial_seed"
+    );
 
+    auto immediate_profile_start = Clock::now();
+    int immediate_score_before = std::min(best_components, best_reduced_components);
+    const char* immediate_reason = "skipped_gate";
     if (have_mapped_decomp_seed &&
         best_reduced_components < reduced_n &&
         reduced_n <= 1000 &&
         !g_terminate &&
         Clock::now() + std::chrono::milliseconds(60) < soft_deadline) {
 
+        immediate_reason = "ran_no_improve";
         bool repaired_or_merged = false;
         if (run_exact_repair_portfolio(
                 reduced,
@@ -6422,14 +6534,27 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                 best_out = std::move(out);
                 best_components = static_cast<int>(best_out.size());
                 publish_best_solution(best_out);
+                immediate_reason = "improved";
             }
         }
     }
+    emit_pace_profile(
+        "immediate_repair",
+        n,
+        reduced_n,
+        immediate_score_before,
+        std::min(best_components, best_reduced_components),
+        elapsed_ms_since(immediate_profile_start),
+        immediate_reason
+    );
 
     // Deterministic duality-inspired candidate after reductions.
     // This can become an early incumbent and is also fed to the elite pool
     // even if it is only near-best.
     {
+        auto greedy_profile_start = Clock::now();
+        int greedy_score_before = std::min(best_components, best_reduced_components);
+        const char* greedy_reason = "no_candidate";
         auto dual2 = run_duality_seed_candidate(
             reduced,
             dt1_base,
@@ -6442,6 +6567,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
         );
 
         if (dual2.valid && !dual2.comps.empty()) {
+            greedy_reason = "valid_no_improve";
             int dual_components = static_cast<int>(dual2.comps.size());
 
             int elite_reference = std::min(best_components, best_reduced_components);
@@ -6468,6 +6594,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                     best_out = std::move(out);
                     best_components = static_cast<int>(best_out.size());
                     publish_best_solution(best_out);
+                    greedy_reason = "improved";
                 }
             }
 
@@ -6496,13 +6623,31 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                     best_out = std::move(out);
                     best_components = static_cast<int>(best_out.size());
                     publish_best_solution(best_out);
+                    greedy_reason = "merge_improved";
                 }
             }
+        } else if (dual2.valid) {
+            greedy_reason = "empty";
+        } else {
+            greedy_reason = "invalid";
         }
+        emit_pace_profile(
+            "greedy_seed",
+            n,
+            reduced_n,
+            greedy_score_before,
+            std::min(best_components, best_reduced_components),
+            elapsed_ms_since(greedy_profile_start),
+            greedy_reason
+        );
     }
 
     // ResolveSet-style 2-approx-inspired candidate.
+    auto resolve_profile_start = Clock::now();
+    int resolve_score_before = std::min(best_components, best_reduced_components);
+    const char* resolve_reason = "skipped_gate";
     if (!g_terminate && Clock::now() + std::chrono::milliseconds(40) < soft_deadline) {
+        resolve_reason = "no_candidate";
         auto now = Clock::now();
         auto ms_left = std::chrono::duration_cast<std::chrono::milliseconds>(soft_deadline - now).count();
         auto resolve_deadline = std::min(
@@ -6523,6 +6668,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
         );
 
         if (!resolve_res.comps.empty()) {
+            resolve_reason = "candidate_rejected";
             auto candidate = resolve_res.comps;
             normalize_partition(candidate);
 
@@ -6535,6 +6681,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                     candidate,
                     reduced.reduced_leaf_count)) {
 
+                resolve_reason = "valid_no_improve";
                 maybe_add_elite_solution(
                     elite_pool,
                     candidate,
@@ -6546,6 +6693,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                     best_reduced = candidate;
                     best_reduced_components = cand_components;
                     have_mapped_decomp_seed = false;
+                    resolve_reason = "reduced_improved";
                 }
 
                 if (cand_components < best_components) {
@@ -6556,6 +6704,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                         best_out = std::move(out);
                         best_components = static_cast<int>(best_out.size());
                         publish_best_solution(best_out);
+                        resolve_reason = "improved";
                     }
                 }
 
@@ -6582,18 +6731,32 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                         best_out = std::move(out);
                         best_components = static_cast<int>(best_out.size());
                         publish_best_solution(best_out);
+                        resolve_reason = "merge_improved";
                     }
                 }
             }
         }
     }
+    emit_pace_profile(
+        "resolveset_seed",
+        n,
+        reduced_n,
+        resolve_score_before,
+        std::min(best_components, best_reduced_components),
+        elapsed_ms_since(resolve_profile_start),
+        resolve_reason
+    );
 
     int exact_mid_incumbent = std::min(best_components, best_reduced_components);
+    auto exact_mid_profile_start = Clock::now();
+    int exact_mid_score_before = std::min(best_components, best_reduced_components);
+    const char* exact_mid_reason = "skipped_gate";
     if (!g_terminate &&
         exact_mid_incumbent > 1 &&
         best_reduced_components < reduced_n &&
         (!have_mapped_decomp_seed || reduced_n <= 4000) &&
         Clock::now() + std::chrono::milliseconds(50) < soft_deadline) {
+        exact_mid_reason = "no_solution";
         auto exact_mid = maybe_solve_exact_kernel(
             dt1_base,
             dt2_base,
@@ -6604,6 +6767,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
         );
 
         if (exact_mid.solved && !exact_mid.comps.empty()) {
+            exact_mid_reason = "solved_no_improve";
             auto candidate = exact_mid.comps;
             normalize_partition(candidate);
 
@@ -6619,6 +6783,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                     best_reduced_components = cand_components;
                     have_mapped_decomp_seed = false;
                     maybe_add_elite_solution(elite_pool, best_reduced, reduced_n, elite_limit);
+                    exact_mid_reason = "reduced_improved";
 
                     if (run_greedy_merge_portfolio(
                             reduced,
@@ -6644,11 +6809,23 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                         best_out = std::move(out);
                         best_components = static_cast<int>(best_out.size());
                         publish_best_solution(best_out);
+                        exact_mid_reason = "improved";
                     }
                 }
             }
+        } else if (exact_mid.solved) {
+            exact_mid_reason = "empty";
         }
     }
+    emit_pace_profile(
+        "exact_kernel_mid",
+        n,
+        reduced_n,
+        exact_mid_score_before,
+        std::min(best_components, best_reduced_components),
+        elapsed_ms_since(exact_mid_profile_start),
+        exact_mid_reason
+    );
 
     auto configs = deterministic_configs_for_size(reduced_n);
 
@@ -6661,10 +6838,15 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     DeterministicRestartDeduper restart_deduper;
     restart_deduper.reserve(configs.size() + elite_pool.size() + 4);
 
+    auto greedy_portfolio_profile_start = Clock::now();
+    int greedy_portfolio_score_before = std::min(best_components, best_reduced_components);
+    int greedy_runs = 0;
+    int greedy_improvements = 0;
     for (const auto& cfg : configs) {
         if (g_terminate || Clock::now() + std::chrono::milliseconds(10) >= soft_deadline) {
             break;
         }
+        ++greedy_runs;
 
         const std::vector<int>* elite_comp_map = nullptr;
         double elite_bonus = 0.0;
@@ -6768,6 +6950,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                 have_mapped_decomp_seed = false;
                 accepted = true;
                 improved = true;
+                ++greedy_improvements;
 
                 bool repaired_or_merged = false;
 
@@ -6814,11 +6997,25 @@ std::vector<std::string> solve(const PaceInstance& inst) {
         }
         emit_deterministic_profile("main", cfg, reduced_n, res.complete, cand_components, accepted, improved, cfg_ms);
     }
+    emit_pace_profile(
+        "greedy_portfolio",
+        n,
+        reduced_n,
+        greedy_portfolio_score_before,
+        std::min(best_components, best_reduced_components),
+        elapsed_ms_since(greedy_portfolio_profile_start),
+        greedy_runs == 0 ? "skipped_gate" : (greedy_improvements > 0 ? "improved" : "no_improve")
+    );
+
+    auto final_polish_profile_start = Clock::now();
+    int final_polish_score_before = std::min(best_components, best_reduced_components);
+    const char* final_polish_reason = "skipped_gate";
     if (!g_terminate &&
         best_reduced_components < reduced_n &&
         (!have_mapped_decomp_seed || reduced_n <= 4000) &&
         Clock::now() + std::chrono::milliseconds(200) < soft_deadline) {
 
+        final_polish_reason = "ran_no_improve";
         run_final_polishing_portfolio(
             reduced,
             dt1_base,
@@ -6845,9 +7042,28 @@ std::vector<std::string> solve(const PaceInstance& inst) {
                 best_out = std::move(out);
                 best_components = static_cast<int>(best_out.size());
                 publish_best_solution(best_out);
+                final_polish_reason = "improved";
             }
         }
     }
+    emit_pace_profile(
+        "merge_polish",
+        n,
+        reduced_n,
+        final_polish_score_before,
+        std::min(best_components, best_reduced_components),
+        elapsed_ms_since(final_polish_profile_start),
+        final_polish_reason
+    );
+    emit_pace_profile(
+        "final_publish",
+        n,
+        reduced_n,
+        best_components,
+        best_components,
+        elapsed_ms_since(start),
+        g_terminate ? "terminated" : "complete"
+    );
     return best_out;
 }
 
