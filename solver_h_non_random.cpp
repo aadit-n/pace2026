@@ -623,7 +623,7 @@ bool reduce_common_rooted_chains_once(
     std::vector<std::vector<int>>& expansion,
     int& next_label
 ) {
-    constexpr int kMinReducibleChainLength = 3;
+    constexpr int kMinReducibleChainLength = 2;
     std::vector<SimpleChainInfo> chain1(t1.children.size());
     std::vector<SimpleChainInfo> chain2(t2.children.size());
     compute_simple_chain_dfs(t1, t1.root, chain1);
@@ -1674,16 +1674,14 @@ struct EliteSolution {
     std::vector<int> comp_of_leaf;
 };
 
-bool is_medium_instance_size(int n) {
-    return n >= 80 && n <= 350;
-}
+bool is_medium_instance_size(int n) { return n >= 80 && n <= 500; }
 
 bool is_large_instance_size(int n) {
     return n > 350;
 }
 
 int elite_pool_limit_for_size(int n) {
-    return is_medium_instance_size(n) ? 8 : 4;
+    return is_medium_instance_size(n) ? 12 : 4;
 }
 
 uint64_t elite_partition_hash(const std::vector<int>& comp_of_leaf) {
@@ -1978,13 +1976,13 @@ double score_cherry_candidate_normalized(const CherryCandidate& cand, int total_
     double norm_conflict   = cand.conflict_mass * inv;
     double norm_comp_size  = cand.component_size * inv;
 
-    // Base score â common cherries are enormously valuable
-    double score = (cand.common ? 12.0 : 0.0)
-                + (cand.same_component ? 0.0 : 5.0)
-                - 20.0 * norm_dist
-                - 25.0 * norm_pendants
+    // Base score Ã¢ÂÂ common cherries are enormously valuable
+    double score = (cand.common ? 15.0 : 0.0)
+                + (cand.same_component ? -2.0 : 0.0)
+                - 15.0 * norm_dist
+                - 20.0 * norm_pendants
                 - 12.0 * norm_conflict
-                + 3.0 * static_cast<double>(cand.immediate_gain)
+                + 5.0 * static_cast<double>(cand.immediate_gain)
                 - 2.0 * norm_comp_size;
     return score;
 }   
@@ -2150,10 +2148,10 @@ double evaluate_reduced_state(
     }
 
     return
-        -20.0 * static_cast<double>(comp_count) +
-         0.75 * static_cast<double>(cherry_count) -
-         1.75 * static_cast<double>(sampled_pendants) -
-         0.02 * static_cast<double>(sampled_conflict_mass);
+        -22.0 * static_cast<double>(comp_count) +
+         1.0 * static_cast<double>(cherry_count) -
+         1.5 * static_cast<double>(sampled_pendants) -
+         0.015 * static_cast<double>(sampled_conflict_mass);
 }
 
 std::vector<int> choose_cut_plan(
@@ -5218,9 +5216,9 @@ std::vector<std::vector<int>> deterministic_lds_scripts(int n) {
     scripts.push_back({});
 
     int max_rank = n <= 600 ? 3 : 2;
-    int max_depth = n <= 300 ? 6 : (n <= 600 ? 5 : 4);
-    int max_cost = n <= 300 ? 9 : (n <= 600 ? 7 : 5);
-    size_t cap = n <= 300 ? 96 : (n <= 600 ? 64 : 32);
+    int max_depth = n <= 300 ? 6 : (n <= 600 ? 6 : 4);   // was 5 for 300-600
+    int max_cost  = n <= 300 ? 9 : (n <= 600 ? 9 : 5);   // was 7 for 300-600
+    size_t cap    = n <= 300 ? 96 : (n <= 600 ? 96 : 32); // was 64 for 300-600
 
     std::vector<int> cur;
     for (int cost = 1; cost <= max_cost && scripts.size() < cap; ++cost) {
