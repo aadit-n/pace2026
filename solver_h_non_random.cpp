@@ -1976,7 +1976,7 @@ double score_cherry_candidate_normalized(const CherryCandidate& cand, int total_
     double norm_conflict   = cand.conflict_mass * inv;
     double norm_comp_size  = cand.component_size * inv;
 
-    // Base score Ã¢ÂÂ common cherries are enormously valuable
+    // Base score ÃÂ¢ÃÂÃÂ common cherries are enormously valuable
     double score = (cand.common ? 15.0 : 0.0)
                 + (cand.same_component ? -2.0 : 0.0)
                 - 15.0 * norm_dist
