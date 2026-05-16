@@ -6659,10 +6659,19 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     DeterministicRestartDeduper restart_deduper;
     restart_deduper.reserve(configs.size() + elite_pool.size() + 4);
 
+    int main_det_run_limit = std::numeric_limits<int>::max();
+    if (reduced_n > 1000) {
+        main_det_run_limit = have_mapped_decomp_seed
+            ? 0
+            : (reduced_n > 4000 ? 2 : 4);
+    }
+    int main_det_runs = 0;
+
     for (const auto& cfg : configs) {
         if (g_terminate || Clock::now() + std::chrono::milliseconds(10) >= soft_deadline) {
             break;
         }
+        if (main_det_runs >= main_det_run_limit) break;
 
         const std::vector<int>* elite_comp_map = nullptr;
         double elite_bonus = 0.0;
@@ -6693,6 +6702,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
         long long cfg_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - cfg_start
         ).count();
+        ++main_det_runs;
 
         if (res.comps.empty()) {
             emit_deterministic_profile("main", cfg, reduced_n, res.complete, -1, false, false, cfg_ms);
