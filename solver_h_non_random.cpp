@@ -4348,6 +4348,14 @@ bool dual2_profile_enabled() {
     return enabled != 0;
 }
 
+bool dual2_force_enabled() {
+    static int enabled = []() {
+        const char* env = std::getenv("STRIDE_DUAL2_FORCE");
+        return (env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
+    }();
+    return enabled != 0;
+}
+
 void emit_dual2_profile(
     const char* phase,
     int reduced_n,
@@ -6427,7 +6435,17 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     // Deterministic duality-inspired candidate after reductions.
     // This can become an early incumbent and is also fed to the elite pool
     // even if it is only near-best.
-    {
+    bool run_top_level_dual2 = true;
+    if (reduced_n > 4000 && have_mapped_decomp_seed) {
+        bool enough_time_after_decomp =
+            Clock::now() + std::chrono::milliseconds(8000) < soft_deadline;
+        run_top_level_dual2 =
+            enough_time_after_decomp ||
+            dual2_profile_enabled() ||
+            dual2_force_enabled();
+    }
+
+    if (run_top_level_dual2) {
         auto dual2 = run_duality_seed_candidate(
             reduced,
             dt1_base,
@@ -6659,19 +6677,10 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     DeterministicRestartDeduper restart_deduper;
     restart_deduper.reserve(configs.size() + elite_pool.size() + 4);
 
-    int main_det_run_limit = std::numeric_limits<int>::max();
-    if (reduced_n > 1000) {
-        main_det_run_limit = have_mapped_decomp_seed
-            ? 0
-            : (reduced_n > 4000 ? 2 : 4);
-    }
-    int main_det_runs = 0;
-
     for (const auto& cfg : configs) {
         if (g_terminate || Clock::now() + std::chrono::milliseconds(10) >= soft_deadline) {
             break;
         }
-        if (main_det_runs >= main_det_run_limit) break;
 
         const std::vector<int>* elite_comp_map = nullptr;
         double elite_bonus = 0.0;
@@ -6702,7 +6711,6 @@ std::vector<std::string> solve(const PaceInstance& inst) {
         long long cfg_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - cfg_start
         ).count();
-        ++main_det_runs;
 
         if (res.comps.empty()) {
             emit_deterministic_profile("main", cfg, reduced_n, res.complete, -1, false, false, cfg_ms);
