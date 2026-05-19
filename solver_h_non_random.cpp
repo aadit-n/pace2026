@@ -1976,7 +1976,7 @@ double score_cherry_candidate_normalized(const CherryCandidate& cand, int total_
     double norm_conflict   = cand.conflict_mass * inv;
     double norm_comp_size  = cand.component_size * inv;
 
-    // Base score ÃÂ¢ÃÂÃÂ common cherries are enormously valuable
+    // Base score Ã¢ÂÂ common cherries are enormously valuable
     double score = (cand.common ? 15.0 : 0.0)
                 + (cand.same_component ? -2.0 : 0.0)
                 - 15.0 * norm_dist
@@ -4348,14 +4348,6 @@ bool dual2_profile_enabled() {
     return enabled != 0;
 }
 
-bool dual2_force_enabled() {
-    static int enabled = []() {
-        const char* env = std::getenv("STRIDE_DUAL2_FORCE");
-        return (env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
-    }();
-    return enabled != 0;
-}
-
 void emit_dual2_profile(
     const char* phase,
     int reduced_n,
@@ -6435,17 +6427,7 @@ std::vector<std::string> solve(const PaceInstance& inst) {
     // Deterministic duality-inspired candidate after reductions.
     // This can become an early incumbent and is also fed to the elite pool
     // even if it is only near-best.
-    bool run_top_level_dual2 = true;
-    if (reduced_n > 4000 && have_mapped_decomp_seed) {
-        bool enough_time_after_decomp =
-            Clock::now() + std::chrono::milliseconds(8000) < soft_deadline;
-        run_top_level_dual2 =
-            enough_time_after_decomp ||
-            dual2_profile_enabled() ||
-            dual2_force_enabled();
-    }
-
-    if (run_top_level_dual2) {
+    {
         auto dual2 = run_duality_seed_candidate(
             reduced,
             dt1_base,
