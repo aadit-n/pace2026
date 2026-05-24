@@ -29,3 +29,4 @@ split or decompose exact.pdf
 tools/bench_compare.py
 tools/compare_stride_summaries.py
 /stride-profiles
+/things_to_check

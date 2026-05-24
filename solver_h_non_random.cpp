@@ -940,13 +940,14 @@ std::vector<std::vector<int>> filter_expansion(
 bool find_common_cluster(
     const SimpleTree& t1,
     const SimpleTree& t2,
-    std::vector<int>& cluster_labels
+    std::vector<int>& cluster_labels,
+    bool prefer_balanced = false
 ) {
     cluster_labels.clear();
     if (t1.children.empty() || t2.children.empty()) return false;
     int n = static_cast<int>(simple_tree_leaf_labels(t1).size());
     if (n < 4) return false;
-    int min_cluster = (n > 1000 ? 2 : 3);
+    int min_cluster = prefer_balanced ? 3 : (n > 1000 ? 2 : 3);
 
     std::vector<SimpleNodeInfo> info1(t1.children.size());
     std::vector<SimpleNodeInfo> info2(t2.children.size());
@@ -963,6 +964,7 @@ bool find_common_cluster(
     }
 
     double best_score = -1e100;
+    int best_balance = std::numeric_limits<int>::max();
     int best_size = -1;
     for (int u = 0; u < static_cast<int>(t1.children.size()); ++u) {
         const auto& leaves = info1[static_cast<size_t>(u)].leaves;
@@ -970,6 +972,15 @@ bool find_common_cluster(
         if (sz < min_cluster || sz > n - min_cluster) continue;
         std::string key = join_ints_key(leaves);
         if (!clusters2.count(key)) continue;
+        int balance = std::abs(n - 2 * sz);
+        if (prefer_balanced) {
+            if (balance < best_balance || (balance == best_balance && sz > best_size)) {
+                best_balance = balance;
+                best_size = sz;
+                cluster_labels = leaves;
+            }
+            continue;
+        }
         double score = static_cast<double>(std::min(sz, n - sz))
                     - 0.15 * static_cast<double>(std::abs(n - 2 * sz));
 
@@ -3082,6 +3093,46 @@ bool map_original_partition_to_reduced(
     return true;
 }
 
+bool map_partition_to_reduced_subset(
+    const std::vector<std::vector<int>>& original_comps,
+    const std::vector<std::vector<int>>& expansion,
+    std::vector<std::vector<int>>& reduced_comps
+) {
+    if (original_comps.empty()) return false;
+
+    std::unordered_map<int, int> comp_of_leaf;
+    comp_of_leaf.reserve(expansion.size() * 2);
+    for (size_t cid = 0; cid < original_comps.size(); ++cid) {
+        for (int x : original_comps[cid]) {
+            if (x <= 0) return false;
+            auto [it, inserted] = comp_of_leaf.emplace(x, static_cast<int>(cid));
+            if (!inserted) return false;
+        }
+    }
+
+    std::vector<std::vector<int>> mapped(original_comps.size());
+    for (size_t lbl = 1; lbl < expansion.size(); ++lbl) {
+        if (expansion[lbl].empty()) continue;
+        int cid = -1;
+        for (int x : expansion[lbl]) {
+            auto it = comp_of_leaf.find(x);
+            if (it == comp_of_leaf.end()) return false;
+            if (cid < 0) {
+                cid = it->second;
+            } else if (cid != it->second) {
+                return false;
+            }
+        }
+        if (cid < 0) return false;
+        mapped[static_cast<size_t>(cid)].push_back(static_cast<int>(lbl));
+    }
+
+    normalize_partition(mapped);
+    if (mapped.empty()) return false;
+    reduced_comps = std::move(mapped);
+    return true;
+}
+
 std::string restricted_key_simple_dfs(
     const SimpleTree& st,
     int u,
@@ -3451,6 +3502,184 @@ LocalExactSearchPlan plan_polish_exact_search(
     budget_ms = std::max<long long>(40, std::min<long long>(budget_ms, std::min<long long>(1400, share_cap)));
     plan.budget = std::chrono::milliseconds(budget_ms);
     return plan;
+}
+
+bool validate_expanded_partition_against_reduced(
+    const ReducedInstance& reduced,
+    const std::vector<std::vector<int>>& expanded_partition
+) {
+    std::vector<int> expected_union = all_expanded_leaves(reduced.expansion);
+    if (!partition_matches_union(expanded_partition, expected_union)) return false;
+
+    std::vector<std::vector<int>> reduced_partition;
+    if (!map_partition_to_reduced_subset(
+            expanded_partition,
+            reduced.expansion,
+            reduced_partition)) {
+        return false;
+    }
+
+    return partition_is_valid_agreement_forest(
+        reduced.t1,
+        reduced.t2,
+        reduced_partition,
+        reduced.reduced_leaf_count);
+}
+
+bool solve_exact_repair_subproblem(
+    const ReducedInstance& reduced,
+    int incumbent_components,
+    int repair_leaf_limit,
+    Clock::time_point deadline,
+    bool final_phase,
+    uint64_t seed_base,
+    std::vector<std::vector<int>>& solved_partition,
+    int depth = 0
+) {
+    solved_partition.clear();
+    if (incumbent_components <= 1) return false;
+    if (g_terminate || Clock::now() + std::chrono::milliseconds(5) >= deadline) return false;
+    if (reduced.reduced_leaf_count <= 0 || reduced.reduced_leaf_count > repair_leaf_limit) return false;
+
+    std::vector<int> union_labels = all_expanded_leaves(reduced.expansion);
+    if (union_labels.empty()) return false;
+
+    if (reduced.reduced_leaf_count <= 2) {
+        if (1 >= incumbent_components) return false;
+        solved_partition = {union_labels};
+        return validate_expanded_partition_against_reduced(reduced, solved_partition);
+    }
+
+    if (depth < 6 && reduced.reduced_leaf_count >= 6) {
+        std::vector<int> cluster_labels;
+        if (find_common_cluster(reduced.t1, reduced.t2, cluster_labels, true)) {
+            std::vector<char> in_cluster(reduced.expansion.size(), 0);
+            for (int x : cluster_labels) {
+                if (x >= 0 && x < static_cast<int>(in_cluster.size())) {
+                    in_cluster[static_cast<size_t>(x)] = 1;
+                }
+            }
+            std::vector<char> out_cluster = in_cluster;
+            for (size_t i = 1; i < out_cluster.size(); ++i) {
+                out_cluster[i] = static_cast<char>(!out_cluster[i]);
+            }
+
+            SimpleTree in_t1, in_t2, out_t1, out_t2;
+            if (restrict_simple_tree(reduced.t1, in_cluster, in_t1) &&
+                restrict_simple_tree(reduced.t2, in_cluster, in_t2) &&
+                restrict_simple_tree(reduced.t1, out_cluster, out_t1) &&
+                restrict_simple_tree(reduced.t2, out_cluster, out_t2)) {
+                ReducedInstance in_reduced = build_reduced_instance(
+                    in_t1,
+                    in_t2,
+                    filter_expansion(reduced.expansion, in_cluster));
+                ReducedInstance out_reduced = build_reduced_instance(
+                    out_t1,
+                    out_t2,
+                    filter_expansion(reduced.expansion, out_cluster));
+
+                if (out_reduced.reduced_leaf_count < in_reduced.reduced_leaf_count) {
+                    std::swap(in_reduced, out_reduced);
+                }
+
+                if (in_reduced.reduced_leaf_count > 0 && out_reduced.reduced_leaf_count > 0) {
+                    auto now = Clock::now();
+                    long long ms_left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - now).count();
+                    if (ms_left >= 15) {
+                        long long in_ms = std::max<long long>(
+                            10,
+                            ms_left * static_cast<long long>(in_reduced.reduced_leaf_count) /
+                                std::max(1, reduced.reduced_leaf_count));
+                        in_ms = std::min<long long>(in_ms, std::max<long long>(10, ms_left - 5));
+                        auto in_deadline = std::min(
+                            deadline,
+                            now + std::chrono::milliseconds(in_ms));
+
+                        std::vector<std::vector<int>> inside_partition;
+                        if (solve_exact_repair_subproblem(
+                                in_reduced,
+                                incumbent_components,
+                                repair_leaf_limit,
+                                in_deadline,
+                                final_phase,
+                                mix64(seed_base ^ 0x91e10da5c79e7b1dULL),
+                                inside_partition,
+                                depth + 1)) {
+                            int outside_limit = incumbent_components -
+                                static_cast<int>(inside_partition.size());
+                            if (outside_limit > 1) {
+                                std::vector<std::vector<int>> outside_partition;
+                                if (solve_exact_repair_subproblem(
+                                        out_reduced,
+                                        outside_limit,
+                                        repair_leaf_limit,
+                                        deadline,
+                                        final_phase,
+                                        mix64(seed_base ^ 0xbf58476d1ce4e5b9ULL),
+                                        outside_partition,
+                                        depth + 1)) {
+                                    inside_partition.insert(
+                                        inside_partition.end(),
+                                        outside_partition.begin(),
+                                        outside_partition.end());
+                                    normalize_partition(inside_partition);
+                                    if (static_cast<int>(inside_partition.size()) <
+                                            incumbent_components &&
+                                        validate_expanded_partition_against_reduced(
+                                            reduced,
+                                            inside_partition)) {
+                                        solved_partition = std::move(inside_partition);
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    auto now = Clock::now();
+    auto ms_left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+    if (ms_left < 15) return false;
+
+    LocalExactSearchPlan plan = plan_local_exact_search(
+        reduced.reduced_leaf_count,
+        incumbent_components,
+        final_phase,
+        ms_left
+    );
+    auto exact_deadline = std::min(deadline, now + plan.budget);
+
+    DynamicTree dt1_base = build_dynamic_tree(reduced.t1);
+    DynamicTree dt2_base = build_dynamic_tree(reduced.t2);
+    auto exact = maybe_solve_exact_kernel(
+        dt1_base,
+        dt2_base,
+        reduced.reduced_leaf_count,
+        incumbent_components,
+        exact_deadline,
+        depth == 0 ? "repair" : "repair_cluster",
+        plan.gap_cap,
+        plan.node_budget
+    );
+    if (!exact.solved || exact.comps.empty()) return false;
+    if (static_cast<int>(exact.comps.size()) >= incumbent_components) return false;
+    if (!partition_is_valid_agreement_forest(
+            reduced.t1,
+            reduced.t2,
+            exact.comps,
+            reduced.reduced_leaf_count)) {
+        return false;
+    }
+
+    auto expanded_partition = expand_reduced_components(exact.comps, reduced.expansion);
+    normalize_partition(expanded_partition);
+    if (!validate_expanded_partition_against_reduced(reduced, expanded_partition)) return false;
+    solved_partition = std::move(expanded_partition);
+    return true;
 }
 
 void annotate_repair_candidate_with_elite_signal(
@@ -4150,31 +4379,21 @@ bool apply_exact_repair_group(
         return true;
     }
 
-    auto now = Clock::now();
-    auto ms_left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-    LocalExactSearchPlan plan = plan_local_exact_search(
-        local_reduced.reduced_leaf_count,
-        static_cast<int>(group_indices.size()),
-        final_phase,
-        ms_left
-    );
-    auto exact_deadline = std::min(deadline, now + plan.budget);
-    DynamicTree dt1_base = build_dynamic_tree(local_reduced.t1);
-    DynamicTree dt2_base = build_dynamic_tree(local_reduced.t2);
-    auto exact = maybe_solve_exact_kernel(
-        dt1_base,
-        dt2_base,
-        local_reduced.reduced_leaf_count,
-        static_cast<int>(group_indices.size()),
-        exact_deadline,
-        "repair",
-        plan.gap_cap,
-        plan.node_budget
-    );
-    if (!exact.solved || exact.comps.empty()) return false;
+    std::vector<std::vector<int>> local_expanded;
+    if (!solve_exact_repair_subproblem(
+            local_reduced,
+            static_cast<int>(group_indices.size()),
+            repair_leaf_limit,
+            deadline,
+            final_phase,
+            mix64(0xa0761d6478bd642fULL ^
+                  static_cast<uint64_t>(union_labels.front()) ^
+                  (static_cast<uint64_t>(union_labels.back()) << 21) ^
+                  (static_cast<uint64_t>(group_indices.size()) << 42)),
+            local_expanded)) {
+        return false;
+    }
 
-    auto local_expanded = expand_reduced_components(exact.comps, local_reduced.expansion);
-    normalize_partition(local_expanded);
     if (static_cast<int>(local_expanded.size()) >= static_cast<int>(group_indices.size())) return false;
     if (!partition_matches_union(local_expanded, union_labels)) return false;
 
