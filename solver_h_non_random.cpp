@@ -3004,11 +3004,18 @@ ExactKernelResult maybe_solve_exact_kernel(
     auto phase_starts_with = [&](const char* prefix) {
         return phase != nullptr && std::strncmp(phase, prefix, std::strlen(prefix)) == 0;
     };
+    bool main_phase = phase_starts_with("main_");
     bool deep_phase =
         phase_starts_with("repair") ||
         phase_starts_with("polish") ||
-        phase_starts_with("main_");
+        main_phase;
     int active_leaves = std::max(1, root.active_leaves);
+    bool small_exact_state = active_leaves <= 64 || reduced_n <= 160;
+    bool medium_exact_state = active_leaves <= 128 || reduced_n <= 480;
+    bool exact_friendly_state =
+        reduced_n <= 800 ||
+        heuristic_components <= 28 ||
+        small_exact_state;
 
     int gap_cap = gap_cap_override;
     long long budget_ms = 0;
@@ -3016,58 +3023,79 @@ ExactKernelResult maybe_solve_exact_kernel(
 
     if (gap_cap <= 0) {
         if (active_leaves <= 24) {
-            if (gap > 16) {
+            if (gap > 18) {
                 emit_exact_profile(phase, stats);
                 return {};
             }
+            gap_cap = 18;
+            budget_ms = deep_phase ? 15000 : 11000;
+            node_budget = deep_phase ? 1800000 : 1300000;
+        } else if (active_leaves <= 40 &&
+                   gap <= 16 &&
+                   (heuristic_components <= 44 || exact_friendly_state)) {
             gap_cap = 16;
-            budget_ms = deep_phase ? 12000 : 9000;
-            node_budget = deep_phase ? 1400000 : 1100000;
-        } else if (active_leaves <= 40 && gap <= 14) {
+            budget_ms = deep_phase ? 11000 : 8000;
+            node_budget = deep_phase ? 1300000 : 900000;
+        } else if (active_leaves <= 64 &&
+                   gap <= 14 &&
+                   (heuristic_components <= 40 || exact_friendly_state)) {
             gap_cap = 14;
-            budget_ms = deep_phase ? 9000 : 6500;
-            node_budget = deep_phase ? 1000000 : 750000;
-        } else if (active_leaves <= 64 && gap <= 12 && heuristic_components <= 36) {
+            budget_ms = deep_phase ? 8000 : 5500;
+            node_budget = deep_phase ? 850000 : 550000;
+        } else if (active_leaves <= 96 &&
+                   gap <= 12 &&
+                   (heuristic_components <= 32 || exact_friendly_state)) {
             gap_cap = 12;
-            budget_ms = deep_phase ? 6500 : 4500;
-            node_budget = deep_phase ? 650000 : 450000;
-        } else if (active_leaves <= 96 && gap <= 10 && heuristic_components <= 28) {
+            budget_ms = deep_phase ? 6000 : 4000;
+            node_budget = deep_phase ? 560000 : 340000;
+        } else if (active_leaves <= 128 &&
+                   gap <= 10 &&
+                   (heuristic_components <= 26 || reduced_n <= 600)) {
             gap_cap = 10;
-            budget_ms = deep_phase ? 4800 : 3200;
-            node_budget = deep_phase ? 420000 : 280000;
+            budget_ms = deep_phase ? 4200 : 2600;
+            node_budget = deep_phase ? 360000 : 220000;
+        } else if (active_leaves <= 160 &&
+                   gap <= 8 &&
+                   reduced_n <= 400 &&
+                   heuristic_components <= 20) {
+            gap_cap = 8;
+            budget_ms = deep_phase ? 2800 : 1800;
+            node_budget = deep_phase ? 220000 : 140000;
         } else if (gap <= 2) {
             gap_cap = 2;
-            budget_ms = (reduced_n > 2000) ? 2600 : 3200;
-            node_budget = 340000;
+            budget_ms = (reduced_n > 2000) ? 3000 : 3800;
+            node_budget = 420000;
         } else if (gap <= 4) {
             gap_cap = 4;
-            budget_ms = (reduced_n > 1200) ? 1800 : 2400;
-            node_budget = 220000;
-        } else if (gap <= 6 && heuristic_components <= 28) {
+            budget_ms = (reduced_n > 1200) ? 2000 : 2600;
+            node_budget = 280000;
+        } else if (gap <= 6 && heuristic_components <= 32 && medium_exact_state) {
             gap_cap = 6;
-            budget_ms = 1600;
-            node_budget = 160000;
-        } else if (gap <= 8 && heuristic_components <= 24 && active_leaves <= 160) {
+            budget_ms = 2200;
+            node_budget = 200000;
+        } else if (gap <= 8 && heuristic_components <= 26 && active_leaves <= 180 && medium_exact_state) {
             gap_cap = 8;
-            budget_ms = 1200;
-            node_budget = 110000;
-        } else if (gap <= 10 && heuristic_components <= 18 && active_leaves <= 120) {
+            budget_ms = 1600;
+            node_budget = 140000;
+        } else if (gap <= 10 && heuristic_components <= 20 && active_leaves <= 144 && exact_friendly_state) {
             gap_cap = 10;
-            budget_ms = 900;
-            node_budget = 80000;
-        } else if (gap <= 12 && heuristic_components <= 12 && active_leaves <= 96) {
+            budget_ms = 1200;
+            node_budget = 100000;
+        } else if (gap <= 12 && heuristic_components <= 14 && active_leaves <= 112 && small_exact_state) {
             gap_cap = 12;
-            budget_ms = 700;
-            node_budget = 60000;
+            budget_ms = 900;
+            node_budget = 70000;
         } else {
             emit_exact_profile(phase, stats);
             return {};
         }
     } else if (node_budget == 0) {
-        if (active_leaves <= 24) node_budget = deep_phase ? 1200000 : 900000;
-        else if (active_leaves <= 40) node_budget = deep_phase ? 850000 : 650000;
-        else if (gap_cap <= 4) node_budget = 300000;
-        else if (gap_cap <= 6) node_budget = 180000;
+        if (active_leaves <= 24) node_budget = deep_phase ? 1600000 : 1200000;
+        else if (active_leaves <= 40) node_budget = deep_phase ? 1150000 : 800000;
+        else if (active_leaves <= 64) node_budget = deep_phase ? 700000 : 480000;
+        else if (gap_cap <= 4) node_budget = 360000;
+        else if (gap_cap <= 6) node_budget = 220000;
+        else if (gap_cap <= 8) node_budget = 150000;
         else node_budget = 100000;
     }
 
@@ -3082,12 +3110,17 @@ ExactKernelResult maybe_solve_exact_kernel(
         budget_ms = ms_left;
     }
     long long hard_cap = 3200;
-    if (active_leaves <= 24) hard_cap = deep_phase ? 15000 : 12000;
-    else if (active_leaves <= 40) hard_cap = deep_phase ? 10000 : 8000;
-    else if (active_leaves <= 64) hard_cap = deep_phase ? 7000 : 5500;
-    else if (active_leaves <= 96) hard_cap = deep_phase ? 5000 : 3800;
+    if (active_leaves <= 24) hard_cap = deep_phase ? 18000 : 14000;
+    else if (active_leaves <= 40) hard_cap = deep_phase ? 12000 : 9000;
+    else if (active_leaves <= 64) hard_cap = deep_phase ? 9000 : 6500;
+    else if (active_leaves <= 96) hard_cap = deep_phase ? 7000 : 5000;
+    else if (active_leaves <= 128) hard_cap = deep_phase ? 5200 : 3600;
+    else if (active_leaves <= 160) hard_cap = deep_phase ? 3400 : 2400;
     long long min_budget = deep_phase ? 80 : 60;
-    long long share_cap = std::max<long long>(min_budget, ms_left / (deep_phase ? 2 : 3));
+    long long share_cap = std::max<long long>(
+        min_budget,
+        ms_left / (main_phase ? 2 : (deep_phase ? 2 : 3))
+    );
     budget_ms = std::max<long long>(
         min_budget,
         std::min<long long>(budget_ms, std::min<long long>(hard_cap, share_cap)));
