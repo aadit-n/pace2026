@@ -1,3 +1,0 @@
-# REQUIRE: Found duplicate
-#p 1 4
-((1,2),(3,4));

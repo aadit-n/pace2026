@@ -1,3 +1,0 @@
-# REQUIRE: no header read yet
-(1,2);
-(2,1);

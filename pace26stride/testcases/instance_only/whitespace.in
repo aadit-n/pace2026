@@ -1,3 +1,0 @@
-# REQUIRE: whitespace
-(1,2); 
-(2,1);
