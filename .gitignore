@@ -1,33 +1,10 @@
 /instances
-/solver
-/solver_heuristic
+/pace26io
+/pace_solver
+/rspr-master
 /stride-downloads
 /stride-logs
-/.vscode
-/Makefile
-/tmp
-/solver_exact
-/.codex
-/solver_h_non_random
-/MAF2Approx
-computational complexity of rspr distance.pdf
-Computing Maximum Agreement Forests without.pdf
-.gitignore
-Fast FPT Algorithms for Computing Rooted.pdf
-duality based 2 approx.pdf
-Fixed-Parameter-Algorithms-for-Maximum-Agreement-Forests.pdf
-s10479-021-04352-1.pdf
-split or decompose exact.pdf
-/caseautomation
-/clusterreduction
-/Espalier
-/random_spr_walk
-/rmafkernel
-/rspr
-/spr_neighbors
-/TBRDist
-tools/bench_compare.py
-tools/compare_stride_summaries.py
-/stride-profiles
-/things_to_check
-/scripts
+solver_h_non_random.cpp
+new_bests.txt
+/profiling
+/latest_deep_solver_everything_analysis
