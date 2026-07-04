@@ -230,7 +230,7 @@ bool default_packing_focused_for_instance(
         return n >= 1000;
     }
 
-    return (n >= 2000 && n < 7000) || n >= 10000;
+    return n >= 2000;
 }
 
 using ActiveCherryPolicy = pace26::heuristics::ActiveCherryGreedyApprox::Policy;
@@ -1707,11 +1707,20 @@ agreement_packing_options(
 
     if (packing_focused) {
         const bool large_final_global = final_global && n >= 2500;
-        const double candidate_multiplier = large_final_global ? 1.55 : (extended_search ? 1.35 : 1.20);
-        const double time_multiplier = large_final_global ? 1.45 : (extended_search ? 1.30 : 1.15);
+        const bool huge_final_global = large_final_global && n >= 15000;
+        const double candidate_multiplier = large_final_global
+            ? (n >= 6000 && !huge_final_global ? 1.70 : 1.55)
+            : (extended_search ? 1.35 : 1.20);
+        const double time_multiplier = large_final_global
+            ? (n >= 6000 && !huge_final_global ? 1.55 : 1.45)
+            : (extended_search ? 1.30 : 1.15);
+        const std::size_t candidate_cap =
+            large_final_global && n >= 6000 && !huge_final_global
+                ? 700000
+                : 600000;
 
         opts.max_candidates = std::min<std::size_t>(
-            600000,
+            candidate_cap,
             static_cast<std::size_t>(
                 static_cast<double>(opts.max_candidates) * candidate_multiplier
             )
@@ -1816,8 +1825,9 @@ agreement_packing_options(
     if (reserved_tail && n >= 6000) {
         opts.separate_seed_generated_budgets = true;
         opts.max_seed_candidates = std::min<std::size_t>(
-            90000,
-            std::max<std::size_t>(24000, n * 5)
+            n >= 15000 ? 90000 : 120000,
+            std::max<std::size_t>(n >= 15000 ? 24000 : 30000,
+                                  n * (n >= 15000 ? 5 : 6))
         );
         opts.max_generated_candidates = opts.max_candidates;
         opts.max_generated_component_size = 16;
@@ -3504,18 +3514,28 @@ double final_global_repacking_reserve_seconds(
     bool packing_focused = false
 ) {
     double desired = 16.0;
-    if (n >= 6000) {
-        desired = 50.0;
+    if (n >= 15000) {
+        desired = 70.0;
+    } else if (n >= 14000) {
+        desired = 160.0;
+    } else if (n >= 10000) {
+        desired = 145.0;
+    } else if (n >= 6000) {
+        desired = 120.0;
+    } else if (n >= 5000) {
+        desired = 90.0;
     } else if (n >= 2500) {
-        desired = 42.0;
+        desired = 48.0;
     } else if (n >= 600) {
         desired = 32.0;
     }
 
     const double reserve_floor = packing_focused ? 16.0 : 12.0;
-    const double remaining_fraction = packing_focused ? 0.60 : 0.45;
+    const double remaining_fraction = n >= 6000
+        ? (packing_focused ? 0.72 : 0.64)
+        : (packing_focused ? 0.60 : 0.45);
     if (packing_focused) {
-        desired *= 1.35;
+        desired *= n >= 6000 ? 1.0 : 1.35;
     }
 
     return std::min(
@@ -3996,7 +4016,9 @@ void run_reduced_global_candidate_portfolio(
             ? (packing_focused ? 16.0 : kExtendedReserveSeconds)
             : kBaselineReserveSeconds;
     const double desired_budget = extended_search
-        ? (packing_focused ? (n > 4000 ? 8.0 : 6.0) : (n > 4000 ? 16.0 : 10.0))
+        ? (packing_focused
+              ? (n > 10000 ? 14.0 : (n > 5000 ? 11.0 : 7.0))
+              : (n > 4000 ? 16.0 : 10.0))
         : (n > 4000 ? 6.0 : 4.0);
 
     constexpr std::size_t kCandidateCount =
@@ -6294,6 +6316,9 @@ int main(int argc, char** argv) {
             SolverConfig extended_config = make_extended_config(extended_base_config);
             extended_config.enable_singleton_rescue = original_leaf_count <= 220;
             const bool use_large_final_global_repacking = original_leaf_count >= 2500;
+            if (original_leaf_count >= 2500 && original_leaf_count < 5000) {
+                extended_config.local_improve_max_leaves = 5000;
+            }
             if (!use_large_final_global_repacking) {
                 extended_config.extended_quality_recovery = true;
             }
@@ -6309,12 +6334,18 @@ int main(int argc, char** argv) {
 
             std::vector<CoreForest> extended_global_packing_seeds;
             std::vector<CoreForest> final_global_packing_seeds;
+            const std::size_t final_global_seed_cap =
+                original_leaf_count >= 15000
+                    ? 8
+                    : (original_leaf_count >= 12000
+                    ? 20
+                    : (original_leaf_count >= 6000 ? 16 : 8));
             const bool use_small_exactification_tail = original_leaf_count <= 500;
             if (use_large_final_global_repacking || use_small_exactification_tail) {
                 remember_diverse_packing_seed(
                     final_global_packing_seeds,
                     baseline_archive_forest,
-                    8
+                    final_global_seed_cap
                 );
             }
             if (!extended_timer.should_stop(25.0)) {
@@ -6346,7 +6377,11 @@ int main(int argc, char** argv) {
 
             if (use_large_final_global_repacking || use_small_exactification_tail) {
                 for (const CoreForest& seed : extended_global_packing_seeds) {
-                    remember_diverse_packing_seed(final_global_packing_seeds, seed, 8);
+                    remember_diverse_packing_seed(
+                        final_global_packing_seeds,
+                        seed,
+                        final_global_seed_cap
+                    );
                 }
             }
 
@@ -6369,7 +6404,11 @@ int main(int argc, char** argv) {
                 );
                 if (crossover_accepted &&
                     (use_large_final_global_repacking || use_small_exactification_tail)) {
-                    remember_diverse_packing_seed(final_global_packing_seeds, incumbent, 8);
+                    remember_diverse_packing_seed(
+                        final_global_packing_seeds,
+                        incumbent,
+                        final_global_seed_cap
+                    );
                 }
             }
 
@@ -6439,7 +6478,11 @@ int main(int argc, char** argv) {
                         &cluster_profile_memo
                     );
 
-                    remember_diverse_packing_seed(final_global_packing_seeds, extended_candidate, 8);
+                    remember_diverse_packing_seed(
+                        final_global_packing_seeds,
+                        extended_candidate,
+                        final_global_seed_cap
+                    );
                     if (consider_candidate(
                             incumbent,
                             std::move(extended_candidate),
@@ -6504,7 +6547,11 @@ int main(int argc, char** argv) {
                     original_leaf_count >= 6000 ? 24 : 32
                 );
                 if (crossover_accepted) {
-                    remember_diverse_packing_seed(final_global_packing_seeds, incumbent, 8);
+                    remember_diverse_packing_seed(
+                        final_global_packing_seeds,
+                        incumbent,
+                        final_global_seed_cap
+                    );
                 }
             }
 
@@ -6512,6 +6559,8 @@ int main(int argc, char** argv) {
             auto run_late_cluster_open_retry = [&]() {
                 if (late_cluster_open_retry_done ||
                     original_leaf_count <= 150 ||
+                    (original_leaf_count >= 6000 &&
+                     original_leaf_count < 15000) ||
                     extended_timer.elapsed_seconds() <
                         extended_config.cluster_open_profile_min_elapsed_seconds ||
                     extended_timer.should_stop(20.0)) {
@@ -6871,7 +6920,9 @@ int main(int argc, char** argv) {
                 std::vector<AgreementPackingMode> tail_modes;
                 if (original_leaf_count >= 6000) {
                     tail_modes = {
-                        AgreementPackingMode::ReservedTail5
+                        AgreementPackingMode::ReservedTail5,
+                        AgreementPackingMode::ReservedTail10,
+                        AgreementPackingMode::ReservedTail15
                     };
                 } else {
                     tail_modes = {
@@ -6879,53 +6930,63 @@ int main(int argc, char** argv) {
                     };
                 }
 
-                constexpr std::size_t tail_cycle = 0;
-                for (AgreementPackingMode tail_mode : tail_modes) {
-                    const std::string phase =
-                        std::string("main.final_reserved_bucket_repacking_") +
-                        agreement_packing_mode_name(tail_mode) +
-                        "_cycle_" +
-                        std::to_string(tail_cycle);
+                std::size_t tail_cycle = 0;
+                bool cycle_improved = true;
+                while (cycle_improved && !extended_timer.should_stop(6.0)) {
+                    cycle_improved = false;
+                    for (AgreementPackingMode tail_mode : tail_modes) {
+                        const std::string phase =
+                            std::string("main.final_reserved_bucket_repacking_") +
+                            agreement_packing_mode_name(tail_mode) +
+                            "_cycle_" +
+                            std::to_string(tail_cycle);
 
-                    if (extended_timer.should_stop(8.0)) {
-                        g_profile.event_raw(
-                            "phase_skipped",
-                            &extended_timer,
-                            {
-                                {"phase", json_quote(phase)},
-                                {"n", std::to_string(original_leaf_count)},
-                                {"reason", json_quote("timer_guard")}
-                            }
-                        );
-                        break;
-                    }
+                        if (extended_timer.should_stop(8.0)) {
+                            g_profile.event_raw(
+                                "phase_skipped",
+                                &extended_timer,
+                                {
+                                    {"phase", json_quote(phase)},
+                                    {"n", std::to_string(original_leaf_count)},
+                                    {"reason", json_quote("timer_guard")}
+                                }
+                            );
+                            break;
+                        }
 
-                    std::vector<CoreForest> tail_seeds = reserved_tail_packing_seeds;
-                    remember_diverse_packing_seed(tail_seeds, incumbent, 8);
-                    const bool accepted = run_agreement_component_packing(
-                        incumbent,
-                        original_core_tree,
-                        original_core_tree2,
-                        std::move(tail_seeds),
-                        extended_timer,
-                        true,
-                        phase,
-                        [&](const CoreForest& candidate) {
-                            publish_if_global_best(candidate);
-                        },
-                        tail_mode,
-                        extended_config.packing_focused,
-                        false,
-                        {},
-                        component_archive_ptr
-                    );
-                    if (accepted) {
+                        std::vector<CoreForest> tail_seeds = reserved_tail_packing_seeds;
                         remember_diverse_packing_seed(
-                            reserved_tail_packing_seeds,
+                            tail_seeds,
                             incumbent,
-                            8
+                            final_global_seed_cap
                         );
+                        const bool accepted = run_agreement_component_packing(
+                            incumbent,
+                            original_core_tree,
+                            original_core_tree2,
+                            std::move(tail_seeds),
+                            extended_timer,
+                            true,
+                            phase,
+                            [&](const CoreForest& candidate) {
+                                publish_if_global_best(candidate);
+                            },
+                            tail_mode,
+                            extended_config.packing_focused,
+                            false,
+                            {},
+                            component_archive_ptr
+                        );
+                        if (accepted) {
+                            cycle_improved = true;
+                            remember_diverse_packing_seed(
+                                reserved_tail_packing_seeds,
+                                incumbent,
+                                final_global_seed_cap
+                            );
+                        }
                     }
+                    ++tail_cycle;
                 }
             }
 
