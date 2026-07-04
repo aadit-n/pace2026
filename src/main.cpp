@@ -174,6 +174,12 @@ struct SolverConfig {
     bool extended_quality_recovery = false;
     bool packing_focused = false;
     bool enable_singleton_rescue = false;
+    bool enable_cluster_open_profile = true;
+    double cluster_open_profile_min_elapsed_seconds = kBaselineStageLimitSeconds + 1.0;
+    std::size_t cluster_open_profile_max_leaves = 900;
+    std::size_t cluster_open_profile_large_max_leaves = 2800;
+    std::size_t cluster_open_profile_side_max_leaves = 420;
+    int cluster_open_profile_max_depth = 5;
 
     std::size_t direct_cheap_output_min_leaves = 4000;
 
@@ -194,6 +200,10 @@ SolverConfig make_extended_config(const SolverConfig& baseline) {
     extended.local_improve_max_leaves = 2500;
     extended.extended_quality_recovery = false;
     extended.direct_cheap_output_min_leaves = kHugeLimit;
+    extended.cluster_open_profile_max_leaves = 1400;
+    extended.cluster_open_profile_large_max_leaves = 4500;
+    extended.cluster_open_profile_side_max_leaves = 650;
+    extended.cluster_open_profile_max_depth = 8;
     if (extended.packing_focused) {
         extended.two_approx_max_leaves = 0;
         extended.exact_max_leaves = 0;
@@ -685,96 +695,123 @@ private:
     }
 };
 
-int restricted_agreement_signature(
-    const Tree& tree,
-    const std::vector<char>& selected_node,
-    AgreementSignatureInterner& interner
-) {
-    std::vector<int> signature(static_cast<std::size_t>(tree.node_count()), 0);
+struct AgreementValidationWorkspace {
+    std::vector<int> nodes;
+    std::vector<int> parent_index;
+    std::vector<int> stack;
+    std::vector<int> signature;
+};
 
-    for (int u : tree.postorder) {
+int restricted_agreement_signature_virtual(
+    const Tree& tree,
+    const std::vector<std::uint32_t>& labels,
+    AgreementSignatureInterner& interner,
+    AgreementValidationWorkspace& workspace
+) {
+    if (labels.empty()) {
+        return 0;
+    }
+
+    if (labels.size() == 1) {
+        return interner.leaf(labels.front());
+    }
+
+    std::vector<int>& nodes = workspace.nodes;
+    nodes.clear();
+    nodes.reserve(labels.size() * 2);
+
+    for (std::uint32_t label : labels) {
+        nodes.push_back(tree.node_of_label(label));
+    }
+
+    std::sort(
+        nodes.begin(),
+        nodes.end(),
+        [&](int a, int b) {
+            return tree.tin[static_cast<std::size_t>(a)] <
+                   tree.tin[static_cast<std::size_t>(b)];
+        }
+    );
+    nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+
+    const std::size_t leaf_node_count = nodes.size();
+    for (std::size_t i = 1; i < leaf_node_count; ++i) {
+        nodes.push_back(tree.lca(nodes[i - 1], nodes[i]));
+    }
+
+    std::sort(
+        nodes.begin(),
+        nodes.end(),
+        [&](int a, int b) {
+            return tree.tin[static_cast<std::size_t>(a)] <
+                   tree.tin[static_cast<std::size_t>(b)];
+        }
+    );
+    nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+
+    const std::size_t k = nodes.size();
+    std::vector<int>& parent_index = workspace.parent_index;
+    parent_index.assign(k, -1);
+    std::vector<int>& stack = workspace.stack;
+    stack.clear();
+    stack.reserve(k);
+
+    for (std::size_t i = 0; i < k; ++i) {
+        const int u = nodes[i];
+        while (!stack.empty() &&
+                   !tree.is_ancestor(nodes[static_cast<std::size_t>(stack.back())], u)) {
+            stack.pop_back();
+        }
+        if (!stack.empty()) {
+            parent_index[i] = stack.back();
+        }
+        stack.push_back(static_cast<int>(i));
+    }
+
+    std::vector<int>& signature = workspace.signature;
+    signature.assign(k, 0);
+    for (std::size_t rev = k; rev > 0; --rev) {
+        const std::size_t i = rev - 1;
+        const int u = nodes[i];
         const auto& node = tree.nodes[static_cast<std::size_t>(u)];
 
+        int sig = signature[i];
         if (node.is_leaf()) {
-            if (selected_node[static_cast<std::size_t>(u)] != 0) {
-                signature[static_cast<std::size_t>(u)] = interner.leaf(node.label);
-            }
-            continue;
+            sig = interner.leaf(node.label);
         }
 
-        const int left_sig = signature[static_cast<std::size_t>(node.left)];
-        const int right_sig = signature[static_cast<std::size_t>(node.right)];
-
-        if (left_sig > 0 && right_sig > 0) {
-            signature[static_cast<std::size_t>(u)] =
-                interner.internal(left_sig, right_sig);
-        } else if (left_sig > 0) {
-            signature[static_cast<std::size_t>(u)] = left_sig;
-        } else {
-            signature[static_cast<std::size_t>(u)] = right_sig;
+        signature[i] = sig;
+        if (sig > 0 && parent_index[i] >= 0) {
+            int& parent_sig =
+                signature[static_cast<std::size_t>(parent_index[i])];
+            if (parent_sig <= 0) {
+                parent_sig = sig;
+            } else {
+                parent_sig = interner.internal(parent_sig, sig);
+            }
         }
     }
 
-    return signature[static_cast<std::size_t>(tree.root)];
+    return signature.empty() ? 0 : signature.front();
 }
 
 bool component_has_same_restricted_topology(
     const CoreComponent& component,
     const Tree& t1,
-    const Tree& t2
+    const Tree& t2,
+    AgreementValidationWorkspace& workspace
 ) {
     if (component.size() <= 2) {
         return true;
     }
 
-    std::vector<char> selected1(static_cast<std::size_t>(t1.node_count()), 0);
-    std::vector<char> selected2(static_cast<std::size_t>(t2.node_count()), 0);
-
-    for (std::uint32_t label : component.labels) {
-        selected1[static_cast<std::size_t>(t1.node_of_label(label))] = 1;
-        selected2[static_cast<std::size_t>(t2.node_of_label(label))] = 1;
-    }
-
     AgreementSignatureInterner interner;
-    const int sig1 = restricted_agreement_signature(t1, selected1, interner);
-    const int sig2 = restricted_agreement_signature(t2, selected2, interner);
+    const int sig1 =
+        restricted_agreement_signature_virtual(t1, component.labels, interner, workspace);
+    const int sig2 =
+        restricted_agreement_signature_virtual(t2, component.labels, interner, workspace);
 
     return sig1 > 0 && sig1 == sig2;
-}
-
-std::vector<int> agreement_induced_edges(
-    const Tree& tree,
-    const std::vector<std::uint32_t>& labels
-) {
-    std::vector<int> edges;
-
-    if (labels.size() <= 1) {
-        return edges;
-    }
-
-    int root = tree.node_of_label(labels.front());
-
-    for (std::size_t i = 1; i < labels.size(); ++i) {
-        root = tree.lca(root, tree.node_of_label(labels[i]));
-    }
-
-    for (std::uint32_t label : labels) {
-        int u = tree.node_of_label(label);
-
-        while (u != root) {
-            edges.push_back(u);
-            u = tree.parent[static_cast<std::size_t>(u)];
-
-            if (u < 0) {
-                throw std::runtime_error("invalid parent path in agreement validator");
-            }
-        }
-    }
-
-    std::sort(edges.begin(), edges.end());
-    edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
-
-    return edges;
 }
 
 bool components_are_edge_disjoint(
@@ -782,17 +819,46 @@ bool components_are_edge_disjoint(
     const Tree& tree
 ) {
     std::vector<int> edge_owner(static_cast<std::size_t>(tree.node_count()), -1);
+    std::vector<int> seen_in_component(static_cast<std::size_t>(tree.node_count()), 0);
+    int stamp = 0;
 
     for (std::size_t i = 0; i < forest.components.size(); ++i) {
-        const std::vector<int> edges =
-            agreement_induced_edges(tree, forest.components[i].labels);
+        const auto& labels = forest.components[i].labels;
+        if (labels.size() <= 1) {
+            continue;
+        }
 
-        for (int edge : edges) {
-            int& owner = edge_owner[static_cast<std::size_t>(edge)];
-            if (owner != -1) {
-                return false;
+        int root = tree.node_of_label(labels.front());
+        for (std::size_t j = 1; j < labels.size(); ++j) {
+            root = tree.lca(root, tree.node_of_label(labels[j]));
+        }
+
+        ++stamp;
+        if (stamp == std::numeric_limits<int>::max()) {
+            std::fill(seen_in_component.begin(), seen_in_component.end(), 0);
+            stamp = 1;
+        }
+
+        for (std::uint32_t label : labels) {
+            int u = tree.node_of_label(label);
+
+            while (u != root) {
+                int& seen = seen_in_component[static_cast<std::size_t>(u)];
+                if (seen != stamp) {
+                    seen = stamp;
+
+                    int& owner = edge_owner[static_cast<std::size_t>(u)];
+                    if (owner != -1) {
+                        return false;
+                    }
+                    owner = static_cast<int>(i);
+                }
+
+                u = tree.parent[static_cast<std::size_t>(u)];
+                if (u < 0) {
+                    throw std::runtime_error("invalid parent path in agreement validator");
+                }
             }
-            owner = static_cast<int>(i);
         }
     }
 
@@ -800,7 +866,7 @@ bool components_are_edge_disjoint(
 }
 
 bool is_valid_agreement_forest(
-    CoreForest forest,
+    const CoreForest& forest,
     const Tree& t1,
     const Tree& t2
 ) {
@@ -809,11 +875,20 @@ bool is_valid_agreement_forest(
     }
 
     try {
-        forest.normalize();
+        for (const CoreComponent& component : forest.components) {
+            if (component.empty()) {
+                return false;
+            }
+        }
         forest.validate_partition_of(t1.leaf_labels);
 
+        AgreementValidationWorkspace validation_workspace;
         for (const CoreComponent& component : forest.components) {
-            if (!component_has_same_restricted_topology(component, t1, t2)) {
+            if (!component_has_same_restricted_topology(
+                    component,
+                    t1,
+                    t2,
+                    validation_workspace)) {
                 return false;
             }
         }
@@ -1126,6 +1201,343 @@ std::optional<CoreForest> try_cheap_cluster_bridge(
     }
 
     return std::nullopt;
+}
+
+struct StateSolution {
+    CoreForest forest;
+    int lb = 0;
+    int ub = std::numeric_limits<int>::max();
+    bool certified = false;
+    int distinguished_component = -1;
+    bool available = false;
+};
+
+struct ClusterProfile {
+    StateSolution closed;
+    StateSolution open;
+};
+
+struct ClusterProfileMemo {
+    std::unordered_map<std::string, StateSolution> open_state_by_key;
+    std::unordered_map<
+        std::string,
+        pace26::reductions::ClusterSplitTemplate
+    > split_template_by_key;
+};
+
+int component_count_int(const CoreForest& forest) {
+    return static_cast<int>(
+        std::min<std::size_t>(
+            forest.component_count(),
+            static_cast<std::size_t>(std::numeric_limits<int>::max())
+        )
+    );
+}
+
+StateSolution make_state_solution(
+    CoreForest forest,
+    bool certified = false,
+    int distinguished_component = -1
+) {
+    forest.normalize();
+    StateSolution state;
+    state.forest = std::move(forest);
+    state.ub = component_count_int(state.forest);
+    state.lb = certified ? state.ub : 0;
+    state.certified = certified;
+    state.distinguished_component = distinguished_component;
+    state.available = true;
+    return state;
+}
+
+bool state_better_than(
+    const StateSolution& candidate,
+    const StateSolution& incumbent
+) {
+    if (!candidate.available) {
+        return false;
+    }
+    if (!incumbent.available) {
+        return true;
+    }
+    if (candidate.ub != incumbent.ub) {
+        return candidate.ub < incumbent.ub;
+    }
+    return tie_score(candidate.forest) > tie_score(incumbent.forest);
+}
+
+std::string cluster_hierarchy_key(
+    const NewickTree& nt1,
+    const NewickTree& nt2
+) {
+    std::string key;
+    key.reserve(96);
+    key += "pair:";
+    key += std::to_string(nt1.root);
+    key.push_back(':');
+    key += std::to_string(nt1.nodes.size());
+    key.push_back(':');
+    key += profile_hex64(hash_newick_tree_for_profile(nt1));
+    key.push_back('|');
+    key += std::to_string(nt2.root);
+    key.push_back(':');
+    key += std::to_string(nt2.nodes.size());
+    key.push_back(':');
+    key += profile_hex64(hash_newick_tree_for_profile(nt2));
+    return key;
+}
+
+std::string cluster_open_profile_key(
+    const NewickTree& nt1,
+    const NewickTree& nt2,
+    const pace26::reductions::ClusterSplit& split,
+    const SolverConfig& config
+) {
+    std::string key;
+    key.reserve(192);
+    key += "open:";
+    key += config.extended_search ? "ext" : "base";
+    key.push_back(':');
+    key += std::to_string(config.cluster_min_leaves);
+    key.push_back(':');
+    key += std::to_string(config.max_cluster_depth);
+    key.push_back(':');
+    key += std::to_string(config.exact_max_leaves);
+    key.push_back(':');
+    key += std::to_string(config.tiny_exact_whole_max_leaves);
+    key.push_back(':');
+    key += std::to_string(config.tiny_exact_cluster_max_leaves);
+    key.push_back(':');
+    key += config.packing_focused ? "pf" : "std";
+    key.push_back(':');
+    key += std::to_string(split.record.x_up_label);
+    key.push_back(':');
+    key += std::to_string(split.record.x_down_label);
+    key.push_back('|');
+    key += cluster_hierarchy_key(nt1, nt2);
+    return key;
+}
+
+struct ClusterSplitLookup {
+    pace26::reductions::ClusterSplit split;
+    bool hierarchy_cache_hit = false;
+    bool stale_cache_entry = false;
+};
+
+ClusterSplitLookup find_cluster_split_with_hierarchy_cache(
+    const NewickTree& nt1,
+    const NewickTree& nt2,
+    std::uint32_t& next_placeholder,
+    ClusterProfileMemo* cluster_profile_memo
+) {
+    ClusterSplitLookup lookup;
+
+    if (cluster_profile_memo == nullptr) {
+        lookup.split = pace26::reductions::ClusterDecomposition::split_once(
+            nt1,
+            nt2,
+            next_placeholder
+        );
+        return lookup;
+    }
+
+    const std::string key = cluster_hierarchy_key(nt1, nt2);
+    auto cached = cluster_profile_memo->split_template_by_key.find(key);
+    if (cached != cluster_profile_memo->split_template_by_key.end()) {
+        if (pace26::reductions::ClusterDecomposition::template_matches(
+                nt1,
+                nt2,
+                cached->second)) {
+            lookup.hierarchy_cache_hit = true;
+            lookup.split = pace26::reductions::ClusterDecomposition::materialize_split(
+                nt1,
+                nt2,
+                cached->second,
+                next_placeholder
+            );
+            return lookup;
+        }
+
+        lookup.stale_cache_entry = true;
+        cluster_profile_memo->split_template_by_key.erase(cached);
+    }
+
+    pace26::reductions::ClusterSplitTemplate templ =
+        pace26::reductions::ClusterDecomposition::find_best_common_cluster_template(
+            nt1,
+            nt2
+        );
+    if (templ.found) {
+        cluster_profile_memo->split_template_by_key.emplace(key, templ);
+    }
+    lookup.split = pace26::reductions::ClusterDecomposition::materialize_split(
+        nt1,
+        nt2,
+        templ,
+        next_placeholder
+    );
+    return lookup;
+}
+
+bool should_attempt_cluster_open_profile(
+    std::size_t leaves,
+    std::size_t bottom_leaves,
+    std::size_t top_leaves,
+    const SolverConfig& config,
+    const Timer& timer,
+    int depth
+) {
+    if (!config.enable_cluster_open_profile ||
+        depth > config.cluster_open_profile_max_depth ||
+        timer.should_stop(4.0)) {
+        return false;
+    }
+
+    if (leaves <= 150) {
+        return true;
+    }
+
+    // Marker recursion is correctness-useful but too expensive for the
+    // 30-second anytime prefix. Keep the old tiny-cluster behavior above, and
+    // defer larger OPEN states until the baseline answer has already had time
+    // to publish.
+    if (timer.elapsed_seconds() < config.cluster_open_profile_min_elapsed_seconds) {
+        return false;
+    }
+
+    if (leaves <= config.cluster_open_profile_max_leaves) {
+        return true;
+    }
+
+    const std::size_t smaller_side = std::min(bottom_leaves, top_leaves);
+    if (leaves <= config.cluster_open_profile_large_max_leaves &&
+        smaller_side <= config.cluster_open_profile_side_max_leaves &&
+        !timer.should_stop(config.extended_search ? 12.0 : 7.0)) {
+        return true;
+    }
+
+    return false;
+}
+
+class ComponentForestArchive;
+
+CoreForest solve_instance(
+    NewickTree nt1,
+    NewickTree nt2,
+    const SolverConfig& config,
+    Timer& timer,
+    Random& rng,
+    int depth,
+    const ForestPublishCallback& publish_progress,
+    ComponentForestArchive* archive,
+    ClusterProfileMemo* cluster_profile_memo
+);
+
+std::optional<StateSolution> solve_cluster_open_state(
+    const NewickTree& nt1,
+    const NewickTree& nt2,
+    const pace26::reductions::ClusterSplit& split,
+    const SolverConfig& child_config,
+    Timer& timer,
+    const Random& parent_rng,
+    int depth,
+    ClusterProfileMemo* cluster_profile_memo
+) {
+    if (timer.should_stop(4.0)) {
+        return std::nullopt;
+    }
+
+    std::string key;
+    if (cluster_profile_memo != nullptr) {
+        key = cluster_open_profile_key(nt1, nt2, split, child_config);
+        auto found = cluster_profile_memo->open_state_by_key.find(key);
+        if (found != cluster_profile_memo->open_state_by_key.end()) {
+            return found->second;
+        }
+    }
+
+    const double phase_start = timer.elapsed_seconds();
+    bool valid = false;
+    bool threw = false;
+    StateSolution state;
+
+    try {
+        const std::uint64_t open_seed =
+            profile_mix64(parent_rng.seed()) ^
+            profile_mix64(hash_newick_tree_for_profile(nt1)) ^
+            profile_mix64(hash_newick_tree_for_profile(nt2)) ^
+            profile_mix64(static_cast<std::uint64_t>(split.record.x_up_label) << 32) ^
+            profile_mix64(split.record.x_down_label);
+        Random open_rng(open_seed);
+
+        pace26::reductions::ClusterOpenTrees open_trees =
+            pace26::reductions::ClusterDecomposition::materialize_open_trees(
+                nt1,
+                nt2,
+                split.record
+            );
+
+        CoreForest bottom_with = solve_instance(
+            std::move(open_trees.bottom1_with_marker),
+            std::move(open_trees.bottom2_with_marker),
+            child_config,
+            timer,
+            open_rng,
+            depth + 1,
+            ForestPublishCallback{},
+            nullptr,
+            cluster_profile_memo
+        );
+        CoreForest top_with = solve_instance(
+            std::move(open_trees.top1_with_placeholder),
+            std::move(open_trees.top2_with_placeholder),
+            child_config,
+            timer,
+            open_rng,
+            depth + 1,
+            ForestPublishCallback{},
+            nullptr,
+            cluster_profile_memo
+        );
+
+        CoreForest bridged = reconstruct_cluster_bridge(
+            std::move(top_with),
+            std::move(bottom_with),
+            split.record.x_up_label,
+            split.record.x_down_label
+        );
+
+        Tree reduced_t1 = Tree::from_newick(nt1);
+        Tree reduced_t2 = Tree::from_newick(nt2);
+        valid = is_valid_agreement_forest(bridged, reduced_t1, reduced_t2);
+        if (valid) {
+            state = make_state_solution(std::move(bridged), false, -1);
+            if (cluster_profile_memo != nullptr) {
+                cluster_profile_memo->open_state_by_key.emplace(key, state);
+            }
+        }
+    } catch (const std::exception&) {
+        threw = true;
+    }
+
+    g_profile.event_raw(
+        "cluster_open_profile",
+        &timer,
+        {
+            {"depth", std::to_string(depth)},
+            {"leaves", std::to_string(count_leaves(nt1))},
+            {"valid", valid ? "true" : "false"},
+            {"available", state.available ? "true" : "false"},
+            {"components", std::to_string(state.available ? state.ub : -1)},
+            {"duration_seconds", std::to_string(timer.elapsed_seconds() - phase_start)},
+            {"exception", threw ? "true" : "false"}
+        }
+    );
+
+    if (!state.available) {
+        return std::nullopt;
+    }
+    return state;
 }
 
 enum class AgreementPackingMode {
@@ -3548,7 +3960,8 @@ void run_reduced_global_candidate_portfolio(
     const std::string& profile_context,
     std::vector<CoreForest>* packing_seeds = nullptr,
     bool packing_focused = false,
-    ComponentForestArchive* archive = nullptr
+    ComponentForestArchive* archive = nullptr,
+    const std::function<void(const CoreForest&)>& seed_ready = {}
 ) {
     const std::size_t n = count_leaves(nt1);
     if (n < 5000 || timer.should_stop(2.0)) {
@@ -3638,6 +4051,9 @@ void run_reduced_global_candidate_portfolio(
                 }
                 if (archive != nullptr) {
                     archive->remember_forest(*candidate);
+                }
+                if (seed_ready) {
+                    seed_ready(*candidate);
                 }
                 accepted = accept_candidate(std::move(*candidate));
             }
@@ -4246,7 +4662,8 @@ CoreForest solve_instance(
     Random& rng,
     int depth,
     const ForestPublishCallback& publish_progress = {},
-    ComponentForestArchive* archive = nullptr
+    ComponentForestArchive* archive = nullptr,
+    ClusterProfileMemo* cluster_profile_memo = nullptr
 ) {
     const bool archive_top_level_solution =
         archive != nullptr && depth == 0;
@@ -4338,15 +4755,24 @@ CoreForest solve_instance(
     } else if (!timer.should_stop(1.5) &&
         depth < config.max_cluster_depth) {
         try {
-            auto split = pace26::reductions::ClusterDecomposition::split_once(
+            const double cluster_lookup_start = timer.elapsed_seconds();
+            ClusterSplitLookup split_lookup = find_cluster_split_with_hierarchy_cache(
                 nt1,
                 nt2,
-                next_placeholder
+                next_placeholder,
+                cluster_profile_memo
             );
+            auto& split = split_lookup.split;
 
             if (split.found) {
-                const std::size_t bottom_sz = count_leaves(split.bottom1);
-                const std::size_t top_sz = count_leaves(split.top1_without_cluster);
+                const std::size_t bottom_sz =
+                    split.bottom_leaf_count != 0
+                        ? split.bottom_leaf_count
+                        : count_leaves(split.bottom1);
+                const std::size_t top_sz =
+                    split.top_without_cluster_leaf_count != 0
+                        ? split.top_without_cluster_leaf_count
+                        : count_leaves(split.top1_without_cluster);
                 const bool should_split = 
                     leaves >= config.cluster_min_leaves ||
                     bottom_sz <= config.exact_max_leaves ||
@@ -4359,9 +4785,15 @@ CoreForest solve_instance(
                         {
                             {"depth", std::to_string(depth)},
                             {"leaves", std::to_string(leaves)},
-                            {"bottom_leaves", std::to_string(count_leaves(split.bottom1_with_marker))},
-                            {"top_leaves", std::to_string(count_leaves(split.top1_with_placeholder))},
-                            {"found", "true"}
+                            {"bottom_leaves", std::to_string(bottom_sz)},
+                            {"top_leaves", std::to_string(top_sz)},
+                            {"bottom_open_leaves", std::to_string(bottom_sz + 1)},
+                            {"top_open_leaves", std::to_string(top_sz + 1)},
+                            {"found", "true"},
+                            {"hierarchy_cache_hit", split_lookup.hierarchy_cache_hit ? "true" : "false"},
+                            {"stale_hierarchy_cache_entry", split_lookup.stale_cache_entry ? "true" : "false"},
+                            {"lookup_duration_seconds", std::to_string(timer.elapsed_seconds() - cluster_lookup_start)},
+                            {"open_trees_materialized", split.open_trees_materialized ? "true" : "false"}
                         }
                     );
 
@@ -4370,20 +4802,26 @@ CoreForest solve_instance(
 
                     // Solve Case 1: Cut the edge above the cluster (without marker/placeholder)
                     CoreForest bottom_without = solve_instance(
-                        split.bottom1,
-                        split.bottom2,
+                        std::move(split.bottom1),
+                        std::move(split.bottom2),
                         child_config,
                         timer,
                         rng,
-                        depth + 1
+                        depth + 1,
+                        ForestPublishCallback{},
+                        nullptr,
+                        cluster_profile_memo
                     );
                     CoreForest top_without = solve_instance(
-                        split.top1_without_cluster,
-                        split.top2_without_cluster,
+                        std::move(split.top1_without_cluster),
+                        std::move(split.top2_without_cluster),
                         child_config,
                         timer,
                         rng,
-                        depth + 1
+                        depth + 1,
+                        ForestPublishCallback{},
+                        nullptr,
+                        cluster_profile_memo
                     );
                     CoreForest solved_reduced_without = CoreForest::unite(top_without, bottom_without);
 
@@ -4414,49 +4852,74 @@ CoreForest solve_instance(
                         );
                     }
 
-                    // We only evaluate Case 2 and compare if the subproblem is small (leaves <= 150)
-                    if (leaves <= 150) {
-                        CoreForest bottom_with = solve_instance(
-                            split.bottom1_with_marker,
-                            split.bottom2_with_marker,
-                            child_config,
-                            timer,
-                            rng,
-                            depth + 1
-                        );
-                        CoreForest top_with = solve_instance(
-                            split.top1_with_placeholder,
-                            split.top2_with_placeholder,
-                            child_config,
-                            timer,
-                            rng,
-                            depth + 1
-                        );
-                        CoreForest solved_reduced_with = reconstruct_cluster_bridge(top_with, bottom_with, split.record.x_up_label, split.record.x_down_label);
+                    ClusterProfile profile;
+                    profile.closed = make_state_solution(std::move(solved_reduced_without));
 
-                        bool marker_valid = false;
-                        try {
-                            Tree reduced_t1 = Tree::from_newick(nt1);
-                            Tree reduced_t2 = Tree::from_newick(nt2);
-                            marker_valid = is_valid_agreement_forest(
-                                solved_reduced_with,
-                                reduced_t1,
-                                reduced_t2
+                    const bool attempt_open = should_attempt_cluster_open_profile(
+                        leaves,
+                        bottom_sz,
+                        top_sz,
+                        child_config,
+                        timer,
+                        depth
+                    );
+                    if (attempt_open) {
+                        std::optional<StateSolution> open_state =
+                            solve_cluster_open_state(
+                                nt1,
+                                nt2,
+                                split,
+                                child_config,
+                                timer,
+                                rng,
+                                depth,
+                                cluster_profile_memo
                             );
-                        } catch (const std::exception&) {
-                            marker_valid = false;
-                        }
-
-                        if (marker_valid &&
-                            (solved_reduced_with.component_count() < solved_reduced_without.component_count() ||
-                             (solved_reduced_with.component_count() == solved_reduced_without.component_count() &&
-                              tie_score(solved_reduced_with) > tie_score(solved_reduced_without)))) {
-                            solved_reduced = std::move(solved_reduced_with);
-                        } else {
-                            solved_reduced = std::move(solved_reduced_without);
+                        if (open_state.has_value()) {
+                            profile.open = std::move(*open_state);
                         }
                     } else {
-                        solved_reduced = std::move(solved_reduced_without);
+                        g_profile.event_raw(
+                            "cluster_open_profile_skipped",
+                            &timer,
+                            {
+                                {"depth", std::to_string(depth)},
+                                {"leaves", std::to_string(leaves)},
+                                {"bottom_leaves", std::to_string(bottom_sz)},
+                                {"top_leaves", std::to_string(top_sz)},
+                                {"reason", json_quote(
+                                    !child_config.enable_cluster_open_profile
+                                        ? "disabled"
+                                        : (depth > child_config.cluster_open_profile_max_depth
+                                            ? "depth_limit"
+                                            : (timer.should_stop(4.0)
+                                                ? "timer_guard"
+                                                : "size_limit"))
+                                )}
+                            }
+                        );
+                    }
+
+                    const bool selected_open = state_better_than(profile.open, profile.closed);
+                    g_profile.event_raw(
+                        "cluster_profile_decision",
+                        &timer,
+                        {
+                            {"depth", std::to_string(depth)},
+                            {"leaves", std::to_string(leaves)},
+                            {"bottom_leaves", std::to_string(bottom_sz)},
+                            {"top_leaves", std::to_string(top_sz)},
+                            {"closed_components", std::to_string(profile.closed.available ? profile.closed.ub : -1)},
+                            {"open_available", profile.open.available ? "true" : "false"},
+                            {"open_components", std::to_string(profile.open.available ? profile.open.ub : -1)},
+                            {"selected", json_quote(selected_open ? "open" : "closed")}
+                        }
+                    );
+
+                    if (selected_open) {
+                        solved_reduced = std::move(profile.open.forest);
+                    } else {
+                        solved_reduced = std::move(profile.closed.forest);
                     }
                 } else {
                     solved_reduced = solve_without_cluster_recursion(
@@ -4475,7 +4938,10 @@ CoreForest solve_instance(
                     {
                         {"depth", std::to_string(depth)},
                         {"leaves", std::to_string(leaves)},
-                        {"found", "false"}
+                        {"found", "false"},
+                        {"hierarchy_cache_hit", split_lookup.hierarchy_cache_hit ? "true" : "false"},
+                        {"stale_hierarchy_cache_entry", split_lookup.stale_cache_entry ? "true" : "false"},
+                        {"lookup_duration_seconds", std::to_string(timer.elapsed_seconds() - cluster_lookup_start)}
                     }
                 );
                 solved_reduced = solve_without_cluster_recursion(
@@ -4508,8 +4974,12 @@ CoreForest solve_instance(
         );
     }
 
+    pace26::reductions::ReductionExpansionReport reduction_expansion_report;
     RedForest expanded_reduction_forest =
-        stack.expand(to_reduction_forest(solved_reduced));
+        stack.expand(
+            to_reduction_forest(solved_reduced),
+            &reduction_expansion_report
+        );
 
     CoreForest expanded = to_core_forest(expanded_reduction_forest);
     expanded.normalize();
@@ -4531,7 +5001,14 @@ CoreForest solve_instance(
         {
             {"depth", std::to_string(depth)},
             {"reduced_leaves", std::to_string(leaves)},
-            {"components", std::to_string(expanded.component_count())}
+            {"components", std::to_string(expanded.component_count())},
+            {"reduction_certification_preserving", reduction_expansion_report.certification_preserving ? "true" : "false"},
+            {"reduction_common_subtree_expansions", std::to_string(reduction_expansion_report.common_subtree_expansions)},
+            {"reduction_chain_expansions", std::to_string(reduction_expansion_report.chain_expansions)},
+            {"reduction_chain_suffix_labels_reattached", std::to_string(reduction_expansion_report.chain_suffix_labels_reattached)},
+            {"reduction_chain_suffix_singleton_fallbacks", std::to_string(reduction_expansion_report.chain_suffix_singleton_fallbacks)},
+            {"reduction_chain_suffix_singleton_labels", std::to_string(reduction_expansion_report.chain_suffix_singleton_labels)},
+            {"reduction_three_two_chain_expansions", std::to_string(reduction_expansion_report.three_two_chain_expansions)}
         }
     );
 
@@ -5454,6 +5931,7 @@ int main(int argc, char** argv) {
         ComponentForestArchive component_archive;
         ComponentForestArchive* component_archive_ptr =
             enable_component_archive ? &component_archive : nullptr;
+        ClusterProfileMemo cluster_profile_memo;
         if (component_archive_ptr != nullptr) {
             component_archive_ptr->remember_forest(incumbent);
         }
@@ -5632,7 +6110,8 @@ int main(int argc, char** argv) {
                     rng,
                     0,
                     {},
-                    component_archive_ptr
+                    component_archive_ptr,
+                    &cluster_profile_memo
                 );
 
                 const bool accepted = consider_candidate(
@@ -5715,7 +6194,37 @@ int main(int argc, char** argv) {
                 "main.baseline_reduced_global",
                 &baseline_global_packing_seeds,
                 baseline_config.packing_focused,
-                component_archive_ptr
+                component_archive_ptr,
+                [&](const CoreForest& seed) {
+                    if (!baseline_direct ||
+                        original_leaf_count < 6000 ||
+                        baseline_timer.should_stop(2.0)) {
+                        return;
+                    }
+
+                    std::vector<CoreForest> immediate_seed;
+                    immediate_seed.push_back(seed);
+                    const bool accepted = run_forest_crossover_portfolio(
+                        incumbent,
+                        original_core_tree,
+                        original_core_tree2,
+                        immediate_seed,
+                        baseline_timer,
+                        "main.baseline_reduced_global_immediate_crossover",
+                        [&](const CoreForest& candidate) {
+                            publish_if_global_best(candidate);
+                        },
+                        1,
+                        1,
+                        component_archive_ptr,
+                        false,
+                        0
+                    );
+                    if (accepted) {
+                        publish_if_global_best(incumbent);
+                    }
+                    sync_incumbent_from_published();
+                }
             );
         }
 
@@ -5913,17 +6422,21 @@ int main(int argc, char** argv) {
                 }
             );
 
-            auto run_extended_solve = [&](Timer& solve_timer) {
+            auto run_extended_solve_with_config = [&](
+                Timer& solve_timer,
+                const SolverConfig& solve_config
+            ) {
                 try {
                     CoreForest extended_candidate = solve_instance(
                         instance.trees[0],
                         instance.trees[1],
-                        extended_config,
+                        solve_config,
                         solve_timer,
                         rng,
                         0,
                         {},
-                        component_archive_ptr
+                        component_archive_ptr,
+                        &cluster_profile_memo
                     );
 
                     remember_diverse_packing_seed(final_global_packing_seeds, extended_candidate, 8);
@@ -5938,6 +6451,10 @@ int main(int argc, char** argv) {
                     // The 30-second baseline remains the valid incumbent.
                 }
                 sync_incumbent_from_published();
+            };
+
+            auto run_extended_solve = [&](Timer& solve_timer) {
+                run_extended_solve_with_config(solve_timer, extended_config);
             };
 
             if (reserve_final_global) {
@@ -5991,6 +6508,32 @@ int main(int argc, char** argv) {
                 }
             }
 
+            bool late_cluster_open_retry_done = false;
+            auto run_late_cluster_open_retry = [&]() {
+                if (late_cluster_open_retry_done ||
+                    original_leaf_count <= 150 ||
+                    extended_timer.elapsed_seconds() <
+                        extended_config.cluster_open_profile_min_elapsed_seconds ||
+                    extended_timer.should_stop(20.0)) {
+                    return;
+                }
+
+                late_cluster_open_retry_done = true;
+                SolverConfig late_open_config = extended_config;
+                late_open_config.cluster_open_profile_min_elapsed_seconds = 0.0;
+                g_profile.event_raw(
+                    "late_cluster_open_retry_start",
+                    &extended_timer,
+                    {
+                        {"n", std::to_string(original_leaf_count)},
+                        {"components", std::to_string(incumbent.component_count())}
+                    }
+                );
+                run_extended_solve_with_config(extended_timer, late_open_config);
+            };
+
+            run_late_cluster_open_retry();
+
             std::vector<CoreForest> reserved_tail_packing_seeds;
             if (original_leaf_count >= 2500) {
                 reserved_tail_packing_seeds = final_global_packing_seeds;
@@ -6029,6 +6572,8 @@ int main(int argc, char** argv) {
                     }
                 );
             }
+
+            run_late_cluster_open_retry();
 
             if (use_small_exactification_tail && !extended_timer.should_stop(8.0)) {
                 const std::size_t alternate_state_limit =

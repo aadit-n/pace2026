@@ -185,6 +185,7 @@ private:
             signature_stack.reserve(static_cast<std::size_t>(t1.leaf_count()));
             leaf_nodes1.reserve(static_cast<std::size_t>(t1.leaf_count()));
             leaf_nodes2.reserve(static_cast<std::size_t>(t1.leaf_count()));
+            edge_seen.assign(scratch_nodes, 0);
             initialise_components(std::move(input_forest));
         }
 
@@ -636,6 +637,8 @@ private:
         mutable std::vector<int> signature_stack;
         mutable std::vector<int> leaf_nodes1;
         mutable std::vector<int> leaf_nodes2;
+        mutable std::vector<int> edge_seen;
+        mutable int edge_seen_stamp = 0;
 
         void initialise_components(LabelForest forest) {
             edge_owner1.assign(static_cast<std::size_t>(t1.node_count()), -1);
@@ -831,11 +834,21 @@ private:
                 root = tree.lca(root, tree.node_of_label(labels[i]));
             }
 
+            ++edge_seen_stamp;
+            if (edge_seen_stamp == std::numeric_limits<int>::max()) {
+                std::fill(edge_seen.begin(), edge_seen.end(), 0);
+                edge_seen_stamp = 1;
+            }
+
             for (std::uint32_t label : labels) {
                 int u = tree.node_of_label(label);
 
                 while (u != root) {
-                    edges.push_back(u);
+                    int& seen = edge_seen[static_cast<std::size_t>(u)];
+                    if (seen != edge_seen_stamp) {
+                        seen = edge_seen_stamp;
+                        edges.push_back(u);
+                    }
                     u = tree.parent[static_cast<std::size_t>(u)];
 
                     if (u < 0) {
@@ -843,9 +856,6 @@ private:
                     }
                 }
             }
-
-            std::sort(edges.begin(), edges.end());
-            edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
 
             return edges;
         }

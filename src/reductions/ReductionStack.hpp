@@ -58,6 +58,17 @@ struct ReductionEntry {
     > record;
 };
 
+struct ReductionExpansionReport {
+    bool certification_preserving = true;
+
+    std::size_t common_subtree_expansions = 0;
+    std::size_t chain_expansions = 0;
+    std::size_t chain_suffix_labels_reattached = 0;
+    std::size_t chain_suffix_singleton_fallbacks = 0;
+    std::size_t chain_suffix_singleton_labels = 0;
+    std::size_t three_two_chain_expansions = 0;
+};
+
 class ReductionStack {
 private:
     std::vector<ReductionEntry> entries_;
@@ -175,8 +186,13 @@ private:
 
     static void undo_common_subtree(
         LabelForest& forest,
-        const CommonSubtreeRecord& record
+        const CommonSubtreeRecord& record,
+        ReductionExpansionReport* report
     ) {
+        if (report != nullptr) {
+            ++report->common_subtree_expansions;
+        }
+
         const auto component_index =
             find_component_containing(forest, record.placeholder_label);
 
@@ -198,8 +214,13 @@ private:
 
     static void undo_chain(
         LabelForest& forest,
-        const ChainReductionRecord& record
+        const ChainReductionRecord& record,
+        ReductionExpansionReport* report
     ) {
+        if (report != nullptr) {
+            ++report->chain_expansions;
+        }
+
         /*
          * Rule:
          *   full_chain  = x1, x2, x3, x4, ...
@@ -210,8 +231,11 @@ private:
          * suffix back to that same component.
          *
          * If the solver split x1,x2,x3 across components, we restore the deleted
-         * suffix as singleton components. This is always feasible, although not
-         * always score-optimal.
+         * suffix as singleton components. This is always feasible. It is not a
+         * proof-preserving expansion, because this stack only stores label blocks
+         * and does not have the original trees needed to validate any stronger
+         * enumerated placement. Exact certificates must therefore stop at this
+         * fallback unless a caller proves a stronger chain expansion externally.
          */
         const auto common_component =
             component_containing_all(forest, record.kept_prefix);
@@ -221,8 +245,16 @@ private:
                 forest.components[*common_component],
                 record.removed_suffix
             );
+            if (report != nullptr) {
+                report->chain_suffix_labels_reattached += record.removed_suffix.size();
+            }
         } else {
             add_singletons_if_absent(forest, record.removed_suffix);
+            if (report != nullptr) {
+                report->certification_preserving = false;
+                ++report->chain_suffix_singleton_fallbacks;
+                report->chain_suffix_singleton_labels += record.removed_suffix.size();
+            }
         }
 
         normalize(forest);
@@ -230,8 +262,13 @@ private:
 
     static void undo_three_two_chain(
         LabelForest& forest,
-        const ThreeTwoChainReductionRecord& record
+        const ThreeTwoChainReductionRecord& record,
+        ReductionExpansionReport* report
     ) {
+        if (report != nullptr) {
+            ++report->three_two_chain_expansions;
+        }
+
         /*
          * 3-2-chain reduction deletes one taxon.
          *
@@ -320,7 +357,14 @@ public:
      *
      * Reductions must be undone in reverse order.
      */
-    LabelForest expand(LabelForest forest) const {
+    LabelForest expand(
+        LabelForest forest,
+        ReductionExpansionReport* report = nullptr
+    ) const {
+        if (report != nullptr) {
+            *report = ReductionExpansionReport{};
+        }
+
         normalize(forest);
         validate_no_duplicate_labels(forest);
 
@@ -331,21 +375,24 @@ public:
                 case ReductionEntryKind::CommonSubtree:
                     undo_common_subtree(
                         forest,
-                        std::get<CommonSubtreeRecord>(entry.record)
+                        std::get<CommonSubtreeRecord>(entry.record),
+                        report
                     );
                     break;
 
                 case ReductionEntryKind::Chain:
                     undo_chain(
                         forest,
-                        std::get<ChainReductionRecord>(entry.record)
+                        std::get<ChainReductionRecord>(entry.record),
+                        report
                     );
                     break;
 
                 case ReductionEntryKind::ThreeTwoChain:
                     undo_three_two_chain(
                         forest,
-                        std::get<ThreeTwoChainReductionRecord>(entry.record)
+                        std::get<ThreeTwoChainReductionRecord>(entry.record),
+                        report
                     );
                     break;
 

@@ -38,6 +38,10 @@ struct ClusterSplit {
 
     ClusterDecompositionRecord record;
 
+    std::uint32_t bottom_leaf_count = 0;
+    std::uint32_t top_without_cluster_leaf_count = 0;
+    bool open_trees_materialized = false;
+
     // Bottom pair: induced cluster trees.
     NewickTree bottom1;
     NewickTree bottom2;
@@ -53,6 +57,22 @@ struct ClusterSplit {
     // Top pair with the cluster removed entirely.
     NewickTree top1_without_cluster;
     NewickTree top2_without_cluster;
+};
+
+struct ClusterSplitTemplate {
+    bool found = false;
+
+    int root1 = -1;
+    int root2 = -1;
+    std::uint32_t size = 0;
+    std::vector<std::uint32_t> cluster_labels;
+};
+
+struct ClusterOpenTrees {
+    NewickTree bottom1_with_marker;
+    NewickTree bottom2_with_marker;
+    NewickTree top1_with_placeholder;
+    NewickTree top2_with_placeholder;
 };
 
 class ClusterDecomposition {
@@ -533,6 +553,10 @@ private:
         return count;
     }
 
+    static bool valid_node_index(const NewickTree& tree, int node) {
+        return node >= 0 && node < static_cast<int>(tree.nodes.size());
+    }
+
     static Candidate find_best_common_cluster(
         const NewickTree& t1,
         const NewickTree& t2,
@@ -614,15 +638,15 @@ private:
 
 public:
     /*
-     * Finds one balanced common cluster and builds all useful tree-pair variants.
+     * Indexed common-cluster view for a tree pair.
      *
-     * This does NOT solve the subinstances.
-     * It only prepares the decomposition.
+     * The template stores only node roots and the exact leaf set. It can be
+     * cached across repeated solves of the same reduced pair, then materialized
+     * with fresh marker labels when a recursive split is actually taken.
      */
-    static ClusterSplit split_once(
+    static ClusterSplitTemplate find_best_common_cluster_template(
         const NewickTree& t1,
-        const NewickTree& t2,
-        std::uint32_t& next_placeholder_label
+        const NewickTree& t2
     ) {
         validate_tree(t1, "tree1");
         validate_tree(t2, "tree2");
@@ -632,11 +656,86 @@ public:
 
         const Candidate best = find_best_common_cluster(t1, t2, idx1, idx2);
 
+        ClusterSplitTemplate result;
+        if (best.node1 < 0 || best.node2 < 0) {
+            return result;
+        }
+
+        result.found = true;
+        result.root1 = best.node1;
+        result.root2 = best.node2;
+        result.size = best.size;
+        result.cluster_labels = collect_leaves(t1, best.node1);
+        return result;
+    }
+
+    static bool template_matches(
+        const NewickTree& t1,
+        const NewickTree& t2,
+        const ClusterSplitTemplate& templ
+    ) {
+        if (!templ.found) {
+            return true;
+        }
+
+        if (!valid_node_index(t1, templ.root1) ||
+            !valid_node_index(t2, templ.root2)) {
+            return false;
+        }
+
+        std::vector<std::uint32_t> labels1 = collect_leaves(t1, templ.root1);
+        if (labels1 != templ.cluster_labels) {
+            return false;
+        }
+
+        std::vector<std::uint32_t> labels2 = collect_leaves(t2, templ.root2);
+        return labels2 == templ.cluster_labels;
+    }
+
+    static ClusterOpenTrees materialize_open_trees(
+        const NewickTree& t1,
+        const NewickTree& t2,
+        const ClusterDecompositionRecord& record
+    ) {
+        if (!valid_node_index(t1, record.root1) ||
+            !valid_node_index(t2, record.root2)) {
+            throw ClusterDecompositionError("invalid cluster roots while materializing open trees");
+        }
+
+        std::uint32_t next_internal_id =
+            std::max(max_node_or_label_id(t1), max_node_or_label_id(t2));
+
+        next_internal_id = std::max(next_internal_id, record.x_up_label);
+        next_internal_id = std::max(next_internal_id, record.x_down_label);
+        next_internal_id = checked_increment(next_internal_id, "internal id overflow before building open cluster trees");
+
+        ClusterOpenTrees trees;
+        trees.bottom1_with_marker =
+            make_bottom_tree_with_marker(t1, record.root1, record.x_down_label, next_internal_id);
+        trees.bottom2_with_marker =
+            make_bottom_tree_with_marker(t2, record.root2, record.x_down_label, next_internal_id);
+        trees.top1_with_placeholder =
+            make_top_tree_with_placeholder(t1, record.root1, record.x_up_label, next_internal_id);
+        trees.top2_with_placeholder =
+            make_top_tree_with_placeholder(t2, record.root2, record.x_up_label, next_internal_id);
+        return trees;
+    }
+
+    static ClusterSplit materialize_split(
+        const NewickTree& t1,
+        const NewickTree& t2,
+        const ClusterSplitTemplate& templ,
+        std::uint32_t& next_placeholder_label,
+        bool include_open_trees = false
+    ) {
         ClusterSplit split;
 
-        if (best.node1 < 0 || best.node2 < 0) {
-            split.found = false;
+        if (!templ.found) {
             return split;
+        }
+
+        if (!template_matches(t1, t2, templ)) {
+            throw ClusterDecompositionError("cached cluster template does not match tree pair");
         }
 
         const std::uint32_t x_up = next_placeholder_label;
@@ -645,36 +744,68 @@ public:
         const std::uint32_t x_down = next_placeholder_label;
         next_placeholder_label = checked_increment(next_placeholder_label, "placeholder id overflow");
 
-        const std::vector<std::uint32_t> cluster_labels = collect_leaves(t1, best.node1);
-
         split.found = true;
-        split.record.root1 = best.node1;
-        split.record.root2 = best.node2;
-        split.record.cluster_labels = cluster_labels;
+        split.record.root1 = templ.root1;
+        split.record.root2 = templ.root2;
+        split.record.cluster_labels = templ.cluster_labels;
         split.record.x_up_label = x_up;
         split.record.x_down_label = x_down;
+        split.bottom_leaf_count = templ.size;
+
+        const std::uint32_t n = count_leaves(t1);
+        split.top_without_cluster_leaf_count =
+            n >= templ.size ? n - templ.size : 0;
 
         std::uint32_t next_internal_id =
             std::max(max_node_or_label_id(t1), max_node_or_label_id(t2));
 
         next_internal_id = std::max(next_internal_id, x_up);
         next_internal_id = std::max(next_internal_id, x_down);
-
         next_internal_id = checked_increment(next_internal_id, "internal id overflow before building cluster split");
 
-        split.bottom1 = make_bottom_tree(t1, best.node1, next_internal_id);
-        split.bottom2 = make_bottom_tree(t2, best.node2, next_internal_id);
+        split.bottom1 = make_bottom_tree(t1, templ.root1, next_internal_id);
+        split.bottom2 = make_bottom_tree(t2, templ.root2, next_internal_id);
 
-        split.bottom1_with_marker = make_bottom_tree_with_marker(t1, best.node1, x_down, next_internal_id);
-        split.bottom2_with_marker = make_bottom_tree_with_marker(t2, best.node2, x_down, next_internal_id);
+        split.top1_without_cluster =
+            make_top_tree_without_cluster(t1, templ.cluster_labels, next_internal_id);
+        split.top2_without_cluster =
+            make_top_tree_without_cluster(t2, templ.cluster_labels, next_internal_id);
 
-        split.top1_with_placeholder = make_top_tree_with_placeholder(t1, best.node1, x_up, next_internal_id);
-        split.top2_with_placeholder = make_top_tree_with_placeholder(t2, best.node2, x_up, next_internal_id);
-
-        split.top1_without_cluster = make_top_tree_without_cluster(t1, cluster_labels, next_internal_id);
-        split.top2_without_cluster = make_top_tree_without_cluster(t2, cluster_labels, next_internal_id);
+        if (include_open_trees) {
+            ClusterOpenTrees open = materialize_open_trees(t1, t2, split.record);
+            split.bottom1_with_marker = std::move(open.bottom1_with_marker);
+            split.bottom2_with_marker = std::move(open.bottom2_with_marker);
+            split.top1_with_placeholder = std::move(open.top1_with_placeholder);
+            split.top2_with_placeholder = std::move(open.top2_with_placeholder);
+            split.open_trees_materialized = true;
+        }
 
         return split;
+    }
+
+    /*
+     * Finds one balanced common cluster and builds the closed tree-pair variants.
+     * Marker/placeholder OPEN variants are lazy by default and can be requested
+     * with include_open_trees.
+     *
+     * This does NOT solve the subinstances.
+     * It only prepares the decomposition.
+     */
+    static ClusterSplit split_once(
+        const NewickTree& t1,
+        const NewickTree& t2,
+        std::uint32_t& next_placeholder_label,
+        bool include_open_trees = false
+    ) {
+        ClusterSplitTemplate templ =
+            find_best_common_cluster_template(t1, t2);
+        return materialize_split(
+            t1,
+            t2,
+            templ,
+            next_placeholder_label,
+            include_open_trees
+        );
     }
 };
 
