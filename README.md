@@ -1,6 +1,6 @@
 # PACE 2026 Heuristic MAF Solver
 
-Solver for the PACE 2026 heuristicntrack problem on rooted maximum agreement forests.
+Solver for the PACE 2026 heuristic track problem on rooted maximum agreement forests.
 
 ## Build
 Build from the repository root:
