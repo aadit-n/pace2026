@@ -4463,6 +4463,611 @@ bool run_singleton_ejection_repacking(
     );
 }
 
+std::vector<int> induced_component_edges(
+    const Tree& tree,
+    const std::vector<std::uint32_t>& labels
+) {
+    std::vector<int> edges;
+    if (labels.size() <= 1) {
+        return edges;
+    }
+
+    int root = tree.node_of_label(labels.front());
+    for (std::size_t i = 1; i < labels.size(); ++i) {
+        root = tree.lca(root, tree.node_of_label(labels[i]));
+    }
+
+    for (std::uint32_t label : labels) {
+        int u = tree.node_of_label(label);
+        while (u != root) {
+            edges.push_back(u);
+            u = tree.parent[static_cast<std::size_t>(u)];
+            if (u < 0) {
+                throw std::runtime_error("invalid parent path while computing component edges");
+            }
+        }
+    }
+
+    std::sort(edges.begin(), edges.end());
+    edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+    return edges;
+}
+
+struct ComponentCollapseOptions {
+    std::size_t max_candidates = 0;
+    std::size_t max_attempts = 0;
+    std::size_t max_rounds = 0;
+    std::size_t max_components_per_union = 0;
+    std::size_t max_union_labels = 0;
+    std::size_t max_item_labels = 0;
+    std::size_t partners_per_singleton = 0;
+    std::size_t neighbor_window = 0;
+};
+
+ComponentCollapseOptions component_collapse_options(
+    std::size_t n,
+    bool extended_search
+) {
+    ComponentCollapseOptions opts;
+    if (n <= 220) {
+        opts.max_candidates = extended_search ? 14000 : 9000;
+        opts.max_attempts = extended_search ? 7000 : 4200;
+        opts.max_rounds = extended_search ? 5 : 3;
+        opts.max_components_per_union = 5;
+        opts.max_union_labels = 220;
+        opts.max_item_labels = 180;
+        opts.partners_per_singleton = extended_search ? 90 : 64;
+        opts.neighbor_window = 14;
+    } else if (n <= 700) {
+        opts.max_candidates = extended_search ? 16000 : 10000;
+        opts.max_attempts = extended_search ? 7600 : 4500;
+        opts.max_rounds = extended_search ? 4 : 2;
+        opts.max_components_per_union = 4;
+        opts.max_union_labels = 280;
+        opts.max_item_labels = 170;
+        opts.partners_per_singleton = extended_search ? 56 : 40;
+        opts.neighbor_window = 11;
+    } else if (n <= 2500) {
+        opts.max_candidates = extended_search ? 18000 : 12000;
+        opts.max_attempts = extended_search ? 8000 : 4800;
+        opts.max_rounds = extended_search ? 3 : 1;
+        opts.max_components_per_union = 4;
+        opts.max_union_labels = 420;
+        opts.max_item_labels = 180;
+        opts.partners_per_singleton = extended_search ? 36 : 24;
+        opts.neighbor_window = 9;
+    } else if (n <= 5000) {
+        opts.max_candidates = 14000;
+        opts.max_attempts = 5200;
+        opts.max_rounds = 2;
+        opts.max_components_per_union = 3;
+        opts.max_union_labels = 520;
+        opts.max_item_labels = 220;
+        opts.partners_per_singleton = 20;
+        opts.neighbor_window = 7;
+    }
+    return opts;
+}
+
+struct ComponentCollapseCandidate {
+    std::vector<std::size_t> component_indices;
+    std::vector<std::uint32_t> labels;
+    long long score = 0;
+    std::size_t singleton_components = 0;
+};
+
+std::vector<ComponentCollapseCandidate> generate_component_collapse_candidates(
+    const CoreForest& normalized,
+    const Tree& t1,
+    const Tree& t2,
+    const ComponentCollapseOptions& opts,
+    Timer& timer,
+    double guard_seconds
+) {
+    struct Item {
+        std::size_t component_index = 0;
+        const std::vector<std::uint32_t>* labels = nullptr;
+        int root1 = -1;
+        int root2 = -1;
+        int tin1 = 0;
+        int tin2 = 0;
+        std::size_t size = 0;
+        bool singleton = false;
+    };
+
+    std::vector<Item> items;
+    items.reserve(normalized.components.size());
+    for (std::size_t i = 0; i < normalized.components.size(); ++i) {
+        const CoreComponent& component = normalized.components[i];
+        if (component.empty() || component.labels.size() > opts.max_item_labels) {
+            continue;
+        }
+        Item item;
+        item.component_index = i;
+        item.labels = &component.labels;
+        item.size = component.labels.size();
+        item.singleton = item.size == 1;
+        item.root1 = component_root_in_tree(t1, component.labels);
+        item.root2 = component_root_in_tree(t2, component.labels);
+        item.tin1 = t1.tin[static_cast<std::size_t>(item.root1)];
+        item.tin2 = t2.tin[static_cast<std::size_t>(item.root2)];
+        items.push_back(item);
+    }
+    if (items.size() < 2) {
+        return {};
+    }
+
+    std::vector<ComponentCollapseCandidate> result;
+    result.reserve(opts.max_candidates);
+    std::unordered_set<std::vector<std::uint32_t>, LabelSetHash> seen;
+    seen.reserve(opts.max_candidates * 2 + 1);
+
+    auto add_indices = [&](std::vector<std::size_t> indices) {
+        if (result.size() >= opts.max_candidates) {
+            return;
+        }
+        std::sort(indices.begin(), indices.end());
+        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+        if (indices.size() < 2 || indices.size() > opts.max_components_per_union) {
+            return;
+        }
+
+        std::vector<std::uint32_t> labels;
+        std::size_t singleton_count = 0;
+        std::size_t label_count = 0;
+        for (std::size_t item_index : indices) {
+            const Item& item = items[item_index];
+            label_count += item.size;
+            if (label_count > opts.max_union_labels) {
+                return;
+            }
+            singleton_count += item.singleton ? 1 : 0;
+        }
+        labels.reserve(label_count);
+        for (std::size_t item_index : indices) {
+            labels.insert(
+                labels.end(),
+                items[item_index].labels->begin(),
+                items[item_index].labels->end()
+            );
+        }
+        std::sort(labels.begin(), labels.end());
+        labels.erase(std::unique(labels.begin(), labels.end()), labels.end());
+        if (labels.size() < 2 || labels.size() > opts.max_union_labels) {
+            return;
+        }
+        if (!seen.insert(labels).second) {
+            return;
+        }
+
+        ComponentCollapseCandidate candidate;
+        candidate.labels = std::move(labels);
+        candidate.component_indices.reserve(indices.size());
+        for (std::size_t item_index : indices) {
+            candidate.component_indices.push_back(items[item_index].component_index);
+        }
+        std::sort(
+            candidate.component_indices.begin(),
+            candidate.component_indices.end()
+        );
+        candidate.singleton_components = singleton_count;
+        candidate.score =
+            static_cast<long long>(candidate.component_indices.size() - 1) * 1000000LL +
+            static_cast<long long>(singleton_count) * 32000LL +
+            static_cast<long long>(std::min<std::size_t>(candidate.labels.size(), 512)) * 37LL -
+            static_cast<long long>(candidate.labels.size() > 128
+                ? candidate.labels.size() - 128
+                : 0) * 9LL;
+        result.push_back(std::move(candidate));
+    };
+
+    auto pair_closeness = [&](const Item& a, const Item& b) {
+        const int lca1 = t1.lca(a.root1, b.root1);
+        const int lca2 = t2.lca(a.root2, b.root2);
+        return t1.depth[static_cast<std::size_t>(lca1)] +
+               t2.depth[static_cast<std::size_t>(lca2)];
+    };
+
+    std::vector<std::size_t> singleton_items;
+    singleton_items.reserve(items.size());
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (items[i].singleton) {
+            singleton_items.push_back(i);
+        }
+    }
+
+    for (std::size_t s_index : singleton_items) {
+        if (result.size() >= opts.max_candidates || timer.should_stop(guard_seconds)) {
+            break;
+        }
+        const Item& singleton = items[s_index];
+        std::vector<std::pair<long long, std::size_t>> ranked;
+        ranked.reserve(items.size());
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            if (i == s_index ||
+                singleton.size + items[i].size > opts.max_union_labels) {
+                continue;
+            }
+            const long long score =
+                static_cast<long long>(pair_closeness(singleton, items[i])) * 220LL +
+                static_cast<long long>(items[i].singleton ? 260 : 0) +
+                static_cast<long long>(std::min<std::size_t>(items[i].size, 64)) * 11LL -
+                static_cast<long long>(items[i].size > 160 ? items[i].size - 160 : 0) * 5LL;
+            ranked.push_back({score, i});
+        }
+        std::stable_sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+            if (a.first != b.first) {
+                return a.first > b.first;
+            }
+            return a.second < b.second;
+        });
+        if (ranked.size() > opts.partners_per_singleton) {
+            ranked.resize(opts.partners_per_singleton);
+        }
+
+        std::vector<std::size_t> nearby_singletons;
+        nearby_singletons.reserve(8);
+        for (const auto& entry : ranked) {
+            if (items[entry.second].singleton) {
+                nearby_singletons.push_back(entry.second);
+                if (nearby_singletons.size() >= 8) {
+                    break;
+                }
+            }
+        }
+
+        for (std::size_t rank = 0;
+             rank < ranked.size() &&
+             result.size() < opts.max_candidates &&
+             !timer.should_stop(guard_seconds);
+             ++rank) {
+            const std::size_t partner_index = ranked[rank].second;
+            add_indices({s_index, partner_index});
+
+            if (opts.max_components_per_union >= 3) {
+                std::size_t added_singleton_triples = 0;
+                for (std::size_t z_index : nearby_singletons) {
+                    if (z_index == partner_index ||
+                        items[s_index].size + items[partner_index].size +
+                            items[z_index].size > opts.max_union_labels) {
+                        continue;
+                    }
+                    add_indices({s_index, partner_index, z_index});
+                    if (++added_singleton_triples >= 3 ||
+                        result.size() >= opts.max_candidates) {
+                        break;
+                    }
+                }
+            }
+
+            if (opts.max_components_per_union >= 3 &&
+                rank + 1 < ranked.size()) {
+                const std::size_t second_partner = ranked[rank + 1].second;
+                if (second_partner != partner_index &&
+                    items[s_index].size + items[partner_index].size +
+                        items[second_partner].size <= opts.max_union_labels) {
+                    add_indices({s_index, partner_index, second_partner});
+                }
+            }
+        }
+    }
+
+    auto process_order = [&](std::vector<std::size_t> order) {
+        for (std::size_t start = 0;
+             start < order.size() &&
+             result.size() < opts.max_candidates &&
+             !timer.should_stop(guard_seconds);
+             ++start) {
+            std::vector<std::size_t> window;
+            window.reserve(opts.max_components_per_union);
+            std::size_t labels = 0;
+            const std::size_t end =
+                std::min(order.size(), start + opts.neighbor_window + 1);
+            for (std::size_t pos = start;
+                 pos < end &&
+                 window.size() < opts.max_components_per_union;
+                 ++pos) {
+                const std::size_t item_index = order[pos];
+                labels += items[item_index].size;
+                if (labels > opts.max_union_labels) {
+                    break;
+                }
+                window.push_back(item_index);
+                if (window.size() >= 2) {
+                    add_indices(window);
+                }
+            }
+        }
+    };
+
+    std::vector<std::size_t> order1(items.size());
+    std::vector<std::size_t> order2(items.size());
+    std::iota(order1.begin(), order1.end(), 0);
+    std::iota(order2.begin(), order2.end(), 0);
+    std::sort(order1.begin(), order1.end(), [&](std::size_t ai, std::size_t bi) {
+        const Item& a = items[ai];
+        const Item& b = items[bi];
+        if (a.tin1 != b.tin1) return a.tin1 < b.tin1;
+        if (a.tin2 != b.tin2) return a.tin2 < b.tin2;
+        return a.component_index < b.component_index;
+    });
+    std::sort(order2.begin(), order2.end(), [&](std::size_t ai, std::size_t bi) {
+        const Item& a = items[ai];
+        const Item& b = items[bi];
+        if (a.tin2 != b.tin2) return a.tin2 < b.tin2;
+        if (a.tin1 != b.tin1) return a.tin1 < b.tin1;
+        return a.component_index < b.component_index;
+    });
+    process_order(std::move(order1));
+    if (result.size() < opts.max_candidates && !timer.should_stop(guard_seconds)) {
+        process_order(std::move(order2));
+    }
+
+    std::stable_sort(
+        result.begin(),
+        result.end(),
+        [](const ComponentCollapseCandidate& a, const ComponentCollapseCandidate& b) {
+            if (a.score != b.score) {
+                return a.score > b.score;
+            }
+            if (a.singleton_components != b.singleton_components) {
+                return a.singleton_components > b.singleton_components;
+            }
+            if (a.labels.size() != b.labels.size()) {
+                return a.labels.size() > b.labels.size();
+            }
+            return a.labels < b.labels;
+        }
+    );
+    return result;
+}
+
+bool run_component_collapse_exactifier(
+    CoreForest& best,
+    const Tree& t1,
+    const Tree& t2,
+    Timer& timer,
+    bool extended_search,
+    const std::string& profile_phase,
+    const std::function<void(const CoreForest&)>& publish_progress = {},
+    ComponentForestArchive* archive = nullptr,
+    double guard_seconds = 2.0
+) {
+    const std::size_t n = static_cast<std::size_t>(t1.leaf_count());
+    ComponentCollapseOptions opts = component_collapse_options(n, extended_search);
+    if (opts.max_candidates == 0 || timer.should_stop(guard_seconds)) {
+        g_profile.event_raw(
+            "phase_skipped",
+            &timer,
+            {
+                {"phase", json_quote(profile_phase)},
+                {"n", std::to_string(n)},
+                {"reason", json_quote(opts.max_candidates == 0 ? "size_limit" : "timer_guard")}
+            }
+        );
+        return false;
+    }
+
+    const double phase_start = timer.elapsed_seconds();
+    const std::size_t before = best.component_count();
+    std::size_t rounds = 0;
+    std::size_t generated_total = 0;
+    std::size_t attempted_total = 0;
+    std::size_t topology_rejects = 0;
+    std::size_t edge_rejects = 0;
+    std::size_t validation_rejects = 0;
+    std::size_t accepted_total = 0;
+    std::size_t restricted_packing_candidates = 0;
+    bool restricted_packing_accepted = false;
+
+    bool any_accepted = false;
+    AgreementValidationWorkspace topology_workspace;
+    std::vector<std::vector<std::uint32_t>> restricted_components;
+
+    while (rounds < opts.max_rounds && !timer.should_stop(guard_seconds)) {
+        ++rounds;
+        best.normalize();
+        if (best.components.size() < 2) {
+            break;
+        }
+
+        std::vector<int> edge_owner1(static_cast<std::size_t>(t1.node_count()), -1);
+        std::vector<int> edge_owner2(static_cast<std::size_t>(t2.node_count()), -1);
+        for (std::size_t component_index = 0;
+             component_index < best.components.size();
+             ++component_index) {
+            const CoreComponent& component = best.components[component_index];
+            if (component.labels.size() <= 1) {
+                continue;
+            }
+            for (int edge : induced_component_edges(t1, component.labels)) {
+                edge_owner1[static_cast<std::size_t>(edge)] =
+                    static_cast<int>(component_index);
+            }
+            for (int edge : induced_component_edges(t2, component.labels)) {
+                edge_owner2[static_cast<std::size_t>(edge)] =
+                    static_cast<int>(component_index);
+            }
+        }
+
+        std::vector<ComponentCollapseCandidate> candidates =
+            generate_component_collapse_candidates(
+                best,
+                t1,
+                t2,
+                opts,
+                timer,
+                guard_seconds
+            );
+        generated_total += candidates.size();
+        if (candidates.empty()) {
+            break;
+        }
+        if (restricted_components.empty() &&
+            ((extended_search && n <= 2500) || (!extended_search && n <= 700))) {
+            const std::size_t cap = std::min<std::size_t>(
+                candidates.size(),
+                extended_search ? 12000 : 6000
+            );
+            restricted_components.reserve(cap);
+            for (std::size_t i = 0; i < cap; ++i) {
+                restricted_components.push_back(candidates[i].labels);
+            }
+            restricted_packing_candidates = restricted_components.size();
+        }
+
+        std::vector<int> touched(
+            best.components.size(),
+            0
+        );
+        int stamp = 0;
+        bool improved_this_round = false;
+        const std::size_t attempt_limit =
+            std::min(opts.max_attempts, candidates.size());
+
+        for (std::size_t candidate_index = 0;
+             candidate_index < attempt_limit &&
+             !timer.should_stop(guard_seconds);
+             ++candidate_index) {
+            const ComponentCollapseCandidate& candidate = candidates[candidate_index];
+            ++attempted_total;
+            ++stamp;
+            if (stamp == std::numeric_limits<int>::max()) {
+                std::fill(touched.begin(), touched.end(), 0);
+                stamp = 1;
+            }
+            for (std::size_t component_index : candidate.component_indices) {
+                if (component_index < touched.size()) {
+                    touched[component_index] = stamp;
+                }
+            }
+
+            CoreComponent merged(candidate.labels);
+            if (!component_has_same_restricted_topology(
+                    merged,
+                    t1,
+                    t2,
+                    topology_workspace)) {
+                ++topology_rejects;
+                continue;
+            }
+
+            bool edge_conflict = false;
+            for (int edge : induced_component_edges(t1, merged.labels)) {
+                const int owner = edge_owner1[static_cast<std::size_t>(edge)];
+                if (owner >= 0 &&
+                    (static_cast<std::size_t>(owner) >= touched.size() ||
+                     touched[static_cast<std::size_t>(owner)] != stamp)) {
+                    edge_conflict = true;
+                    break;
+                }
+            }
+            if (!edge_conflict) {
+                for (int edge : induced_component_edges(t2, merged.labels)) {
+                    const int owner = edge_owner2[static_cast<std::size_t>(edge)];
+                    if (owner >= 0 &&
+                        (static_cast<std::size_t>(owner) >= touched.size() ||
+                         touched[static_cast<std::size_t>(owner)] != stamp)) {
+                        edge_conflict = true;
+                        break;
+                    }
+                }
+            }
+            if (edge_conflict) {
+                ++edge_rejects;
+                continue;
+            }
+
+            CoreForest collapsed;
+            collapsed.components.reserve(
+                best.components.size() - candidate.component_indices.size() + 1
+            );
+            for (std::size_t i = 0; i < best.components.size(); ++i) {
+                if (touched[i] != stamp) {
+                    collapsed.components.push_back(best.components[i]);
+                }
+            }
+            collapsed.add_component(std::move(merged));
+            collapsed.normalize();
+
+            if (collapsed.component_count() >= best.component_count() ||
+                !is_valid_agreement_forest(collapsed, t1, t2)) {
+                ++validation_rejects;
+                continue;
+            }
+
+            best = std::move(collapsed);
+            any_accepted = true;
+            improved_this_round = true;
+            ++accepted_total;
+            if (archive != nullptr) {
+                archive->remember_forest(best);
+            }
+            if (publish_progress) {
+                publish_progress(best);
+            }
+            break;
+        }
+
+        if (!improved_this_round) {
+            break;
+        }
+    }
+
+    if (!any_accepted &&
+        !restricted_components.empty() &&
+        !timer.should_stop(guard_seconds + 0.75)) {
+        std::vector<CoreForest> seeds;
+        remember_diverse_packing_seed(seeds, best, 8);
+        restricted_packing_accepted = run_agreement_component_packing(
+            best,
+            t1,
+            t2,
+            std::move(seeds),
+            timer,
+            extended_search,
+            profile_phase + ".restricted_packing",
+            publish_progress,
+            extended_search
+                ? AgreementPackingMode::FinalGlobal
+                : AgreementPackingMode::Normal,
+            false,
+            true,
+            std::move(restricted_components),
+            archive
+        );
+        if (restricted_packing_accepted) {
+            any_accepted = true;
+        }
+    }
+
+    if (g_profile.enabled()) {
+        g_profile.phase_result(
+            profile_phase,
+            timer,
+            phase_start,
+            n,
+            before,
+            best.component_count(),
+            any_accepted,
+            {
+                {"extended", extended_search ? "true" : "false"},
+                {"rounds", std::to_string(rounds)},
+                {"generated_candidates", std::to_string(generated_total)},
+                {"attempted_candidates", std::to_string(attempted_total)},
+                {"topology_rejects", std::to_string(topology_rejects)},
+                {"edge_rejects", std::to_string(edge_rejects)},
+                {"validation_rejects", std::to_string(validation_rejects)},
+                {"accepted_merges", std::to_string(accepted_total)},
+                {"restricted_packing_candidates", std::to_string(restricted_packing_candidates)},
+                {"restricted_packing_accepted", restricted_packing_accepted ? "true" : "false"}
+            }
+        );
+    }
+
+    return any_accepted;
+}
+
 bool run_forest_crossover_portfolio(
     CoreForest& best,
     const Tree& t1,
@@ -5201,13 +5806,15 @@ void apply_reductions_exhaustively(
 
 enum class ReducedGlobalCandidateKind {
     ResolveSet,
-    DualitySeed
+    DualitySeed,
+    BalancedSeed
 };
 
 const char* reduced_global_candidate_name(ReducedGlobalCandidateKind kind) {
     switch (kind) {
         case ReducedGlobalCandidateKind::ResolveSet: return "resolve_set";
         case ReducedGlobalCandidateKind::DualitySeed: return "duality_seed";
+        case ReducedGlobalCandidateKind::BalancedSeed: return "balanced_seed";
     }
 
     return "unknown";
@@ -5220,6 +5827,12 @@ std::size_t reduced_global_candidate_sample_cap(
     if (kind == ReducedGlobalCandidateKind::DualitySeed) {
         if (n > 4000) return 192;
         if (n > 1000) return 256;
+        return 0;
+    }
+    if (kind == ReducedGlobalCandidateKind::BalancedSeed) {
+        if (n > 4000) return 160;
+        if (n > 1000) return 224;
+        if (n > 600) return 320;
         return 0;
     }
 
@@ -5236,7 +5849,9 @@ std::optional<CoreForest> run_reduced_global_candidate(
     Timer& global_timer,
     ReducedGlobalCandidateKind kind,
     bool swapped,
-    double local_budget_seconds
+    double local_budget_seconds,
+    std::uint64_t salt_xor = 0,
+    int max_steps_multiplier = 4
 ) {
     if (local_budget_seconds <= 0.75 || global_timer.should_stop(1.0)) {
         return std::nullopt;
@@ -5276,18 +5891,25 @@ std::optional<CoreForest> run_reduced_global_candidate(
         static_cast<std::size_t>(reduced_t1.leaf_count());
 
     pace26::heuristics::ActiveCherryGreedyApprox::Options opts;
-    opts.policy = kind == ReducedGlobalCandidateKind::ResolveSet
-        ? ActiveCherryPolicy::ResolveFinalCut
-        : ActiveCherryPolicy::DualityConservative;
-    opts.max_steps_multiplier = 4;
+    opts.policy = ActiveCherryPolicy::ResolveFinalCut;
+    if (kind == ReducedGlobalCandidateKind::DualitySeed) {
+        opts.policy = ActiveCherryPolicy::DualityConservative;
+    } else if (kind == ReducedGlobalCandidateKind::BalancedSeed) {
+        opts.policy = ActiveCherryPolicy::Balanced;
+    }
+    opts.max_steps_multiplier = max_steps_multiplier;
     opts.candidate_sample_cap =
         reduced_global_candidate_sample_cap(kind, reduced_n);
     opts.guard_seconds = 0.20;
     opts.local_time_limit_seconds =
         std::max(0.0, candidate_timer.remaining_seconds() - 0.25);
-    opts.sample_salt = kind == ReducedGlobalCandidateKind::ResolveSet
-        ? mix_portfolio_salt(0xa8b31f4c72d95e11ULL)
-        : mix_portfolio_salt(0x2a6f9d7c1b3e5a91ULL);
+    std::uint64_t base_salt = 0xa8b31f4c72d95e11ULL;
+    if (kind == ReducedGlobalCandidateKind::DualitySeed) {
+        base_salt = 0x2a6f9d7c1b3e5a91ULL;
+    } else if (kind == ReducedGlobalCandidateKind::BalancedSeed) {
+        base_salt = 0x7f4a7c159e3779b9ULL;
+    }
+    opts.sample_salt = mix_portfolio_salt(base_salt ^ salt_xor);
     if (swapped) {
         opts.sample_salt = mix_portfolio_salt(
             opts.sample_salt ^ 0x6d0f27bb35a91e43ULL
@@ -5469,6 +6091,269 @@ void run_reduced_global_candidate_portfolio(
             }
         );
     }
+}
+
+bool run_reduced_global_booster(
+    CoreForest& best,
+    const NewickTree& nt1,
+    const NewickTree& nt2,
+    const Tree& t1,
+    const Tree& t2,
+    const SolverConfig& config,
+    Timer& timer,
+    const std::string& profile_context,
+    const std::function<void(const CoreForest&)>& publish_progress = {},
+    ComponentForestArchive* archive = nullptr
+) {
+    const std::size_t n = count_leaves(nt1);
+    if (n < 1000 || timer.should_stop(n >= 6000 ? 18.0 : 10.0)) {
+        g_profile.event_raw(
+            "phase_skipped",
+            &timer,
+            {
+                {"phase", json_quote(profile_context)},
+                {"n", std::to_string(n)},
+                {"reason", json_quote(n < 1000 ? "size_limit" : "timer_guard")}
+            }
+        );
+        return false;
+    }
+
+    struct BoosterSpec {
+        ReducedGlobalCandidateKind kind;
+        bool swapped = false;
+        std::uint64_t salt = 0;
+        int steps = 4;
+        double budget_scale = 1.0;
+    };
+
+    const BoosterSpec specs[] = {
+        {ReducedGlobalCandidateKind::ResolveSet, false, 0x91e10da5c79f4a21ULL, 5, 1.08},
+        {ReducedGlobalCandidateKind::DualitySeed, false, 0x52dce7296b3a11f5ULL, 5, 1.00},
+        {ReducedGlobalCandidateKind::ResolveSet, true,  0x3b8f09d4a61c27e5ULL, 5, 1.08},
+        {ReducedGlobalCandidateKind::BalancedSeed, false, 0xb1075ac39e2d6f48ULL, 4, 0.90},
+        {ReducedGlobalCandidateKind::DualitySeed, true,  0xde4f823b7196c50aULL, 5, 0.96},
+        {ReducedGlobalCandidateKind::BalancedSeed, true,  0x7c19e3779b9a0f23ULL, 4, 0.88}
+    };
+
+    const std::size_t max_specs =
+        n >= 6000 ? 6 : (n >= 2500 ? 5 : 4);
+    const double base_budget =
+        n >= 12000 ? 9.0 :
+        (n >= 6000 ? 7.0 :
+        (n >= 2500 ? 5.0 : 3.5));
+    const double reserve_seconds = n >= 6000 ? 14.0 : 7.0;
+    const std::size_t seed_cap =
+        n >= 10000 ? 10 : (n >= 6000 ? 12 : 14);
+
+    const double summary_start = timer.elapsed_seconds();
+    const std::size_t summary_before = best.component_count();
+    std::vector<CoreForest> booster_seeds;
+    std::size_t produced = 0;
+    std::size_t valid = 0;
+    std::size_t retained = 0;
+    std::size_t direct_accepted = 0;
+    std::size_t crossover_accepted = 0;
+    std::size_t skipped = 0;
+    bool any_accepted = false;
+
+    for (std::size_t i = 0;
+         i < max_specs && i < sizeof(specs) / sizeof(specs[0]);
+         ++i) {
+        const BoosterSpec& spec = specs[i];
+        const double available = timer.remaining_seconds() - reserve_seconds;
+        const std::size_t remaining_specs = max_specs - i;
+        const double fair_share =
+            available / static_cast<double>(std::max<std::size_t>(1, remaining_specs));
+        const double local_budget =
+            std::min(base_budget * spec.budget_scale, fair_share);
+        if (local_budget < 1.5 || timer.should_stop(reserve_seconds + 1.0)) {
+            ++skipped;
+            g_profile.event_raw(
+                "reduced_global_booster_skip",
+                &timer,
+                {
+                    {"context", json_quote(profile_context)},
+                    {"candidate", json_quote(reduced_global_candidate_name(spec.kind))},
+                    {"swapped", spec.swapped ? "true" : "false"},
+                    {"local_budget_seconds", std::to_string(local_budget)}
+                }
+            );
+            continue;
+        }
+
+        const double phase_start = timer.elapsed_seconds();
+        const std::size_t before = best.component_count();
+        bool candidate_valid = false;
+        bool seed_retained = false;
+        bool accepted = false;
+        bool crossed = false;
+        bool threw = false;
+        std::size_t candidate_components = 0;
+
+        try {
+            std::optional<CoreForest> candidate = run_reduced_global_candidate(
+                nt1,
+                nt2,
+                config,
+                timer,
+                spec.kind,
+                spec.swapped,
+                local_budget,
+                spec.salt,
+                spec.steps
+            );
+            if (candidate.has_value()) {
+                ++produced;
+                candidate->normalize();
+                candidate_components = candidate->component_count();
+                candidate_valid = is_valid_agreement_forest(*candidate, t1, t2);
+                if (candidate_valid) {
+                    ++valid;
+                    CoreForest seed = *candidate;
+                    seed_retained = remember_diverse_packing_seed(
+                        booster_seeds,
+                        seed,
+                        seed_cap
+                    );
+                    if (seed_retained) {
+                        ++retained;
+                    }
+                    if (archive != nullptr) {
+                        archive->remember_forest(seed);
+                    }
+
+                    accepted = consider_candidate(best, std::move(*candidate), t1, t2);
+                    if (accepted) {
+                        ++direct_accepted;
+                        any_accepted = true;
+                        if (archive != nullptr) {
+                            archive->remember_forest(best);
+                        }
+                        if (publish_progress) {
+                            publish_progress(best);
+                        }
+                    }
+
+                    if (!timer.should_stop(n >= 6000 ? 6.0 : 3.0)) {
+                        std::vector<CoreForest> immediate_seed;
+                        immediate_seed.push_back(std::move(seed));
+                        crossed = run_forest_crossover_portfolio(
+                            best,
+                            t1,
+                            t2,
+                            immediate_seed,
+                            timer,
+                            profile_context + ".immediate_crossover",
+                            publish_progress,
+                            1,
+                            1,
+                            archive,
+                            false,
+                            0
+                        );
+                        if (crossed) {
+                            ++crossover_accepted;
+                            any_accepted = true;
+                            if (archive != nullptr) {
+                                archive->remember_forest(best);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (const std::exception&) {
+            threw = true;
+        }
+
+        g_profile.phase_result(
+            profile_context + ".candidate",
+            timer,
+            phase_start,
+            n,
+            before,
+            best.component_count(),
+            accepted || crossed,
+            {
+                {"candidate", json_quote(reduced_global_candidate_name(spec.kind))},
+                {"swapped", spec.swapped ? "true" : "false"},
+                {"local_budget_seconds", std::to_string(local_budget)},
+                {"steps", std::to_string(spec.steps)},
+                {"candidate_components", std::to_string(candidate_components)},
+                {"candidate_valid", candidate_valid ? "true" : "false"},
+                {"seed_retained", seed_retained ? "true" : "false"},
+                {"direct_accepted", accepted ? "true" : "false"},
+                {"crossover_accepted", crossed ? "true" : "false"},
+                {"exception", threw ? "true" : "false"}
+            }
+        );
+    }
+
+    if (!booster_seeds.empty() && !timer.should_stop(n >= 6000 ? 10.0 : 5.0)) {
+        const bool crossed = run_forest_crossover_portfolio(
+            best,
+            t1,
+            t2,
+            booster_seeds,
+            timer,
+            profile_context + ".seed_crossover",
+            publish_progress,
+            seed_cap,
+            n >= 2500 ? 2 : 1,
+            archive,
+            n < 6000,
+            n < 6000 ? 12 : 0
+        );
+        if (crossed) {
+            any_accepted = true;
+            ++crossover_accepted;
+            if (archive != nullptr) {
+                archive->remember_forest(best);
+            }
+        }
+    }
+
+    if (!booster_seeds.empty() && !timer.should_stop(n >= 6000 ? 18.0 : 9.0)) {
+        remember_diverse_packing_seed(booster_seeds, best, seed_cap);
+        const bool packed = run_agreement_component_packing(
+            best,
+            t1,
+            t2,
+            std::move(booster_seeds),
+            timer,
+            true,
+            profile_context + ".repacking",
+            publish_progress,
+            n >= 2500 ? AgreementPackingMode::FinalGlobal : AgreementPackingMode::Normal,
+            true,
+            false,
+            {},
+            archive
+        );
+        if (packed) {
+            any_accepted = true;
+        }
+    }
+
+    g_profile.phase_result(
+        profile_context + ".summary",
+        timer,
+        summary_start,
+        n,
+        summary_before,
+        best.component_count(),
+        any_accepted,
+        {
+            {"produced", std::to_string(produced)},
+            {"valid", std::to_string(valid)},
+            {"retained", std::to_string(retained)},
+            {"direct_accepted", std::to_string(direct_accepted)},
+            {"crossover_accepted", std::to_string(crossover_accepted)},
+            {"skipped", std::to_string(skipped)}
+        }
+    );
+
+    return any_accepted;
 }
 
 void publish_progress_safely(
@@ -6773,6 +7658,23 @@ int main(int argc, char** argv) {
             );
         }
 
+        if (original_leaf_count <= 2500 &&
+            !baseline_timer.should_stop(original_leaf_count <= 700 ? 1.5 : 2.5)) {
+            run_component_collapse_exactifier(
+                incumbent,
+                original_core_tree,
+                original_core_tree2,
+                baseline_timer,
+                false,
+                "main.baseline_component_collapse_exactifier",
+                [&](const CoreForest& candidate) {
+                    publish_if_global_best(candidate);
+                },
+                component_archive_ptr,
+                original_leaf_count <= 700 ? 1.5 : 2.5
+            );
+        }
+
         const bool baseline_singleton_ejection_allowed =
             original_leaf_count < 2500 ||
             (original_leaf_count < 6000 &&
@@ -6972,6 +7874,32 @@ int main(int argc, char** argv) {
                 );
             }
 
+            if (original_leaf_count >= 1000 && !extended_timer.should_stop(
+                    original_leaf_count >= 6000 ? 24.0 : 12.0)) {
+                const bool booster_accepted = run_reduced_global_booster(
+                    incumbent,
+                    instance.trees[0],
+                    instance.trees[1],
+                    original_core_tree,
+                    original_core_tree2,
+                    extended_config,
+                    extended_timer,
+                    "main.extended_reduced_global_booster",
+                    [&](const CoreForest& candidate) {
+                        publish_if_global_best(candidate);
+                    },
+                    component_archive_ptr
+                );
+                if (booster_accepted &&
+                    (use_large_final_global_repacking || use_small_exactification_tail)) {
+                    remember_diverse_packing_seed(
+                        final_global_packing_seeds,
+                        incumbent,
+                        final_global_seed_cap
+                    );
+                }
+            }
+
             const double final_global_reserve =
                 use_large_final_global_repacking
                     ? final_global_repacking_reserve_seconds(
@@ -7087,6 +8015,31 @@ int main(int argc, char** argv) {
                     0
                 );
                 if (crossover_accepted) {
+                    remember_diverse_packing_seed(
+                        final_global_packing_seeds,
+                        incumbent,
+                        final_global_seed_cap
+                    );
+                }
+            }
+
+            if (original_leaf_count <= 5000 &&
+                !extended_timer.should_stop(original_leaf_count <= 700 ? 3.0 : 6.0)) {
+                const bool collapse_accepted = run_component_collapse_exactifier(
+                    incumbent,
+                    original_core_tree,
+                    original_core_tree2,
+                    extended_timer,
+                    true,
+                    "main.extended_component_collapse_exactifier",
+                    [&](const CoreForest& candidate) {
+                        publish_if_global_best(candidate);
+                    },
+                    component_archive_ptr,
+                    original_leaf_count <= 700 ? 3.0 : 6.0
+                );
+                if (collapse_accepted &&
+                    (use_large_final_global_repacking || use_small_exactification_tail)) {
                     remember_diverse_packing_seed(
                         final_global_packing_seeds,
                         incumbent,
