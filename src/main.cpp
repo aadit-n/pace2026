@@ -12,14 +12,11 @@
 
 #include "heuristics/FastCherryApprox.hpp"
 #include "heuristics/CherryPairApprox.hpp"
-#include "heuristics/TwoApprox.hpp"
 #include "heuristics/LocalImprove.hpp"
-#include "heuristics/RandomRestart.hpp"
 #include "heuristics/ActiveCherryGreedyApprox.hpp"
 #include "heuristics/AgreementComponentPacking.hpp"
 #include "heuristics/ForestCrossover.hpp"
 
-#include "exact/InProcessExactMaf.hpp"
 #include "exact/TinyExactOracle.hpp"
 
 #include <algorithm>
@@ -148,8 +145,6 @@ constexpr double kDefaultExternalTimeLimitSeconds = 300.0;
 constexpr double kBaselineStageLimitSeconds = 30.0;
 constexpr double kOutputReserveSeconds = 5.0;
 constexpr std::size_t kHugeLimit = std::numeric_limits<std::size_t>::max() / 4;
-constexpr bool kEnableExactWindowRepair = false;
-
 struct SolverConfig {
     double time_limit_seconds = kDefaultExternalTimeLimitSeconds;
     std::uint64_t seed = 123456789ULL;
@@ -161,15 +156,12 @@ struct SolverConfig {
     int max_cluster_depth = 24;
     bool enable_cluster_bridge_recovery = false;
 
-    std::size_t two_approx_max_leaves = 0;
-    std::size_t exact_max_leaves = 90;
-    bool enable_legacy_exact = false;
+    std::size_t cluster_small_side_split_max_leaves = 90;
     std::size_t tiny_exact_whole_max_leaves = 10;
     std::size_t tiny_exact_cluster_max_leaves = 12;
 
     std::size_t three_two_max_leaves = kHugeLimit;
     std::size_t chain_max_leaves = kHugeLimit;
-    std::size_t random_restart_max_leaves = 0;
     std::size_t local_improve_max_leaves = 1500;
     bool extended_quality_recovery = false;
     bool packing_focused = false;
@@ -193,10 +185,8 @@ SolverConfig make_extended_config(const SolverConfig& baseline) {
     SolverConfig extended = baseline;
     extended.extended_search = true;
     extended.cluster_min_leaves = 700;
-    extended.two_approx_max_leaves = 0;
-    extended.exact_max_leaves = 120;
+    extended.cluster_small_side_split_max_leaves = 120;
     extended.three_two_max_leaves = kHugeLimit;
-    extended.random_restart_max_leaves = 0;
     extended.local_improve_max_leaves = 2500;
     extended.extended_quality_recovery = false;
     extended.direct_cheap_output_min_leaves = kHugeLimit;
@@ -204,22 +194,7 @@ SolverConfig make_extended_config(const SolverConfig& baseline) {
     extended.cluster_open_profile_large_max_leaves = 4500;
     extended.cluster_open_profile_side_max_leaves = 650;
     extended.cluster_open_profile_max_depth = 8;
-    if (extended.packing_focused) {
-        extended.two_approx_max_leaves = 0;
-        extended.exact_max_leaves = 0;
-        extended.random_restart_max_leaves = 0;
-    }
     return extended;
-}
-
-void apply_packing_focused_config(SolverConfig& config) {
-    if (!config.packing_focused) {
-        return;
-    }
-
-    config.two_approx_max_leaves = 0;
-    config.exact_max_leaves = 0;
-    config.random_restart_max_leaves = 0;
 }
 
 bool default_packing_focused_for_instance(
@@ -482,10 +457,8 @@ public:
                     {"num_leaves", std::to_string(instance.num_leaves)},
                     {"time_limit_seconds", std::to_string(config.time_limit_seconds)},
                     {"direct_min", std::to_string(config.direct_cheap_output_min_leaves)},
-                    {"two_max", std::to_string(config.two_approx_max_leaves)},
-                    {"rr_max", std::to_string(config.random_restart_max_leaves)},
                     {"li_max", std::to_string(config.local_improve_max_leaves)},
-                    {"exact_max", std::to_string(config.exact_max_leaves)},
+                    {"cluster_small_side_split_max", std::to_string(config.cluster_small_side_split_max_leaves)},
                     {"tiny_exact_whole_max", std::to_string(config.tiny_exact_whole_max_leaves)},
                     {"tiny_exact_cluster_max", std::to_string(config.tiny_exact_cluster_max_leaves)},
                     {"packing_focused", config.packing_focused ? "true" : "false"}
@@ -1300,7 +1273,7 @@ std::string cluster_open_profile_key(
     key.push_back(':');
     key += std::to_string(config.max_cluster_depth);
     key.push_back(':');
-    key += std::to_string(config.exact_max_leaves);
+    key += std::to_string(config.cluster_small_side_split_max_leaves);
     key.push_back(':');
     key += std::to_string(config.tiny_exact_whole_max_leaves);
     key.push_back(':');
@@ -5522,34 +5495,6 @@ CoreForest solve_without_cluster_recursion(
         publish_progress_safely(publish_progress, best);
     };
 
-    if (config.enable_legacy_exact &&
-        n <= config.exact_max_leaves &&
-        !timer.should_stop(1.0)) {
-        try {
-            pace26::exact::InProcessExactMaf::Options opts;
-            opts.enabled = true;
-            opts.max_leaves = config.exact_max_leaves;
-            opts.local_time_limit_seconds = std::min(60.0, std::max(5.0, timer.remaining_seconds() * 0.50));
-            opts.global_guard_seconds = 1.0;
-
-            pace26::exact::InProcessExactMaf exact(opts);
-            std::optional<CoreForest> exact_forest = exact.solve(t1, t2, &timer, &best);
-            if (exact_forest.has_value() &&
-                is_valid_agreement_forest(*exact_forest, t1, t2)) {
-                if (archive != nullptr) {
-                    archive->remember_forest(*exact_forest);
-                }
-                best = std::move(*exact_forest);
-                best.normalize();
-                best.validate_partition_of(t1.leaf_labels);
-                publish_best();
-                return best;
-            }
-        } catch (const std::exception&) {
-            // Fall back to heuristics.
-        }
-    }
-
     std::vector<CoreForest> packing_seeds;
     std::optional<CoreForest> independent_small_packing_candidate;
     {
@@ -5719,53 +5664,6 @@ CoreForest solve_without_cluster_recursion(
         return best;
     }
 
-    if (!timer.should_stop(8.0) && n <= config.two_approx_max_leaves) {
-        const double phase_start = timer.elapsed_seconds();
-        const std::size_t before = best.component_count();
-        bool accepted = false;
-        bool threw = false;
-        try {
-            pace26::heuristics::TwoApprox::Options opts;
-            opts.max_full_leaves = config.two_approx_max_leaves;
-            opts.local_time_limit_seconds =
-                std::min(10.0, std::max(1.0, timer.remaining_seconds() * 0.10));
-            opts.run_fast_cherry_fallback = true;
-            opts.run_safe_greedy_merge = true;
-
-            pace26::heuristics::TwoApprox two(opts);
-            CoreForest candidate = two.solve(t1, t2, &timer, &rng);
-            if (archive != nullptr) {
-                archive->remember_if_valid(candidate, t1, t2);
-            }
-            accepted = consider_candidate(best, std::move(candidate), t1, t2);
-            if (accepted) {
-                publish_best();
-            }
-        } catch (const std::exception&) {
-            threw = true;
-        }
-        g_profile.phase_result(
-            "solve.two_approx",
-            timer,
-            phase_start,
-            n,
-            before,
-            best.component_count(),
-            accepted,
-            {{"exception", threw ? "true" : "false"}}
-        );
-    } else {
-        g_profile.event_raw(
-            "phase_skipped",
-            &timer,
-            {
-                {"phase", json_quote("solve.two_approx")},
-                {"n", std::to_string(n)},
-                {"reason", json_quote(n > config.two_approx_max_leaves ? "size_limit" : "timer_guard")}
-            }
-        );
-    }
-
     if (!timer.should_stop(6.0) && n <= config.local_improve_max_leaves) {
         const double phase_start = timer.elapsed_seconds();
         const std::size_t before = best.component_count();
@@ -5822,104 +5720,6 @@ CoreForest solve_without_cluster_recursion(
         );
     }
 
-    if (!timer.should_stop(8.0) && n <= config.random_restart_max_leaves) {
-        const double phase_start = timer.elapsed_seconds();
-        const std::size_t before = best.component_count();
-        bool accepted = false;
-        bool threw = false;
-        pace26::heuristics::RandomRestart::Stats rr_stats;
-        try {
-            pace26::heuristics::RandomRestart::Options opts;
-            const bool extended_rr = config.extended_search;
-            const bool quality_recovery_rr =
-                extended_rr && config.extended_quality_recovery;
-
-            opts.max_restarts = quality_recovery_rr
-                ? (n <= 1000 ? 100 : 20)
-                : (extended_rr ? (n <= 350 ? 28 : 10) : (n <= 1000 ? 100 : 20));
-            opts.min_restarts = extended_rr && !quality_recovery_rr ? 0 : 1;
-            opts.guard_seconds = extended_rr && !quality_recovery_rr ? 2.5 : 4.0;
-
-            opts.two_approx_max_leaves = config.two_approx_max_leaves;
-            opts.singleton_start_max_leaves = extended_rr && !quality_recovery_rr ? 700 : 1000;
-
-            opts.two_options.max_full_leaves = config.two_approx_max_leaves;
-            opts.two_options.local_time_limit_seconds =
-                std::min(5.0, std::max(1.0, timer.remaining_seconds() * 0.05));
-
-            if (extended_rr && !quality_recovery_rr) {
-                opts.improve_options.max_rounds = n <= 350 ? 3 : 2;
-                opts.improve_options.max_candidates_per_singleton = n <= 350 ? 96 : 48;
-                opts.improve_options.max_pair_tests_per_round = n <= 350 ? 6000 : 2000;
-                opts.improve_options.guard_seconds = 2.5;
-            } else {
-                opts.improve_options.max_rounds = (n <= 1000 ? 6 : 3);
-                opts.improve_options.max_candidates_per_singleton = (n <= 1000 ? 256 : 64);
-                opts.improve_options.max_pair_tests_per_round = (n <= 1000 ? 20000 : 3000);
-                opts.improve_options.guard_seconds = 4.0;
-            }
-            if (g_profile.enabled()) {
-                opts.stats = &rr_stats;
-            }
-
-            pace26::heuristics::RandomRestart rr(opts);
-            CoreForest candidate = rr.solve(t1, t2, &timer, &rng, &best);
-            if (archive != nullptr) {
-                archive->remember_if_valid(candidate, t1, t2);
-            }
-            accepted = consider_candidate(best, std::move(candidate), t1, t2);
-            if (accepted) {
-                publish_best();
-            }
-        } catch (const std::exception&) {
-            threw = true;
-        }
-        if (g_profile.enabled()) {
-            g_profile.phase_result(
-                "solve.random_restart",
-                timer,
-                phase_start,
-                n,
-                before,
-                best.component_count(),
-                accepted,
-                {
-                    {"exception", threw ? "true" : "false"},
-                    {"rr_initial_components", std::to_string(rr_stats.initial_components)},
-                    {"rr_final_components", std::to_string(rr_stats.final_components)},
-                    {"rr_best_updates", std::to_string(rr_stats.best_updates)},
-                    {"rr_fast_attempted", rr_stats.fast_attempted ? "true" : "false"},
-                    {"rr_fast_improved", rr_stats.fast_improved ? "true" : "false"},
-                    {"rr_two_attempted", rr_stats.two_attempted ? "true" : "false"},
-                    {"rr_two_improved", rr_stats.two_improved ? "true" : "false"},
-                    {"rr_singleton_attempted", rr_stats.singleton_attempted ? "true" : "false"},
-                    {"rr_singleton_improved", rr_stats.singleton_improved ? "true" : "false"},
-                    {"rr_restarts_attempted", std::to_string(rr_stats.restarts_attempted)},
-                    {"rr_restarts_completed", std::to_string(rr_stats.restarts_completed)},
-                    {"rr_restart_improvements", std::to_string(rr_stats.restart_improvements)},
-                    {"rr_restart_exceptions", std::to_string(rr_stats.restart_exceptions)},
-                    {"rr_mode0", std::to_string(rr_stats.restart_mode_counts[0])},
-                    {"rr_mode1", std::to_string(rr_stats.restart_mode_counts[1])},
-                    {"rr_mode2", std::to_string(rr_stats.restart_mode_counts[2])},
-                    {"rr_mode3", std::to_string(rr_stats.restart_mode_counts[3])},
-                    {"rr_mode4", std::to_string(rr_stats.restart_mode_counts[4])},
-                    {"rr_mode5", std::to_string(rr_stats.restart_mode_counts[5])},
-                    {"rr_stopped", rr_stats.stopped ? "true" : "false"}
-                }
-            );
-        }
-    } else {
-        g_profile.event_raw(
-            "phase_skipped",
-            &timer,
-            {
-                {"phase", json_quote("solve.random_restart")},
-                {"n", std::to_string(n)},
-                {"reason", json_quote(n > config.random_restart_max_leaves ? "size_limit" : "timer_guard")}
-            }
-        );
-    }
-
     if (independent_small_packing_candidate.has_value()) {
         consider_candidate(
             best,
@@ -5943,121 +5743,6 @@ CoreForest solve_without_cluster_recursion(
             config.extended_search && config.enable_singleton_rescue && n <= 220,
             {},
             archive
-        );
-    }
-
-    const bool enable_post_rr_local_improve = false;
-
-    if (enable_post_rr_local_improve &&
-        !timer.should_stop(6.0) &&
-        n <= config.local_improve_max_leaves) {
-        const double phase_start = timer.elapsed_seconds();
-        const std::size_t before = best.component_count();
-        bool accepted = false;
-        bool threw = false;
-        try {
-            pace26::heuristics::LocalImprove::Options opts;
-
-            if (n <= 1000) {
-                opts.max_rounds = 6;
-                opts.max_candidates_per_singleton = 384;
-                opts.max_pair_tests_per_round = 40000;
-            } else {
-                opts.max_rounds = 4;
-                opts.max_candidates_per_singleton = 128;
-                opts.max_pair_tests_per_round = 15000;
-            }
-
-            opts.guard_seconds = 4.0;
-
-            pace26::heuristics::LocalImprove improver(opts);
-            CoreForest candidate = improver.improve(t1, t2, best, &timer, &rng);
-            if (archive != nullptr) {
-                archive->remember_if_valid(candidate, t1, t2);
-            }
-            accepted = consider_candidate(best, std::move(candidate), t1, t2);
-            if (accepted) {
-                publish_best();
-            }
-        } catch (const std::exception&) {
-            threw = true;
-        }
-        g_profile.phase_result(
-            "solve.local_improve",
-            timer,
-            phase_start,
-            n,
-            before,
-            best.component_count(),
-            accepted,
-            {{"exception", threw ? "true" : "false"}}
-        );
-    } else {
-        g_profile.event_raw(
-            "phase_skipped",
-            &timer,
-            {
-                {"phase", json_quote("solve.local_improve")},
-                {"n", std::to_string(n)},
-                {"reason", json_quote(!enable_post_rr_local_improve ? "disabled_low_roi" : (n > config.local_improve_max_leaves ? "size_limit" : "timer_guard"))}
-            }
-        );
-    }
-
-    if (config.enable_legacy_exact &&
-        !timer.should_stop(3.0) &&
-        n <= config.exact_max_leaves) {
-        const double phase_start = timer.elapsed_seconds();
-        const std::size_t before = best.component_count();
-        bool accepted = false;
-        bool found = false;
-        bool threw = false;
-        try {
-            pace26::exact::InProcessExactMaf::Options opts;
-            opts.enabled = true;
-            opts.max_leaves = config.exact_max_leaves;
-            opts.local_time_limit_seconds =
-                std::min(5.0, std::max(1.0, timer.remaining_seconds() * 0.20));
-            opts.global_guard_seconds = 1.0;
-
-            pace26::exact::InProcessExactMaf exact(opts);
-            std::optional<CoreForest> exact_forest = exact.solve(t1, t2, &timer, &best);
-
-            if (exact_forest.has_value()) {
-                found = true;
-                if (archive != nullptr) {
-                    archive->remember_if_valid(*exact_forest, t1, t2);
-                }
-                accepted = consider_candidate(best, std::move(*exact_forest), t1, t2);
-                if (accepted) {
-                    publish_best();
-                }
-            }
-        } catch (const std::exception&) {
-            threw = true;
-        }
-        g_profile.phase_result(
-            "solve.exact",
-            timer,
-            phase_start,
-            n,
-            before,
-            best.component_count(),
-            accepted,
-            {
-                {"found_exact_candidate", found ? "true" : "false"},
-                {"exception", threw ? "true" : "false"}
-            }
-        );
-    } else {
-        g_profile.event_raw(
-            "phase_skipped",
-            &timer,
-            {
-                {"phase", json_quote("solve.exact")},
-                {"n", std::to_string(n)},
-                {"reason", json_quote(!config.enable_legacy_exact ? "disabled_legacy_exact" : (n > config.exact_max_leaves ? "size_limit" : "timer_guard"))}
-            }
         );
     }
 
@@ -6191,8 +5876,8 @@ CoreForest solve_instance(
                         : count_leaves(split.top1_without_cluster);
                 const bool should_split = 
                     leaves >= config.cluster_min_leaves ||
-                    bottom_sz <= config.exact_max_leaves ||
-                    top_sz <= config.exact_max_leaves;
+                    bottom_sz <= config.cluster_small_side_split_max_leaves ||
+                    top_sz <= config.cluster_small_side_split_max_leaves;
 
                 if (should_split) {
                     g_profile.event_raw(
@@ -6518,534 +6203,6 @@ std::string forest_to_output_string(
     return out.str();
 }
 
-struct ExactWindowRepairOptions {
-    std::size_t max_subproblem_leaves = 24;
-    std::size_t max_components_per_subproblem = 8;
-    std::size_t max_attempts = 64;
-    int max_rounds = 3;
-
-    double total_time_limit_seconds = 3.0;
-    double local_time_limit_seconds = 0.20;
-    double guard_seconds = 2.0;
-
-    std::uint64_t max_candidate_masks_tested = 1500000ULL;
-};
-
-ExactWindowRepairOptions exact_window_repair_options(
-    std::size_t n,
-    const Timer& timer,
-    bool direct_stage,
-    bool extended_search
-) {
-    ExactWindowRepairOptions opts;
-
-    if (extended_search) {
-        opts.max_subproblem_leaves = direct_stage ? 64 : 48;
-        opts.max_components_per_subproblem = direct_stage ? 12 : 10;
-        opts.max_attempts = direct_stage ? 420 : 300;
-        opts.max_rounds = direct_stage ? 10 : 7;
-        opts.total_time_limit_seconds = direct_stage ? 45.0 : 25.0;
-        opts.local_time_limit_seconds = direct_stage ? 1.10 : 0.85;
-        opts.guard_seconds = 7.0;
-        opts.max_candidate_masks_tested = 12000000ULL;
-        return opts;
-    }
-
-    if (n >= 7000) {
-        opts.max_subproblem_leaves = 28;
-        opts.max_components_per_subproblem = 8;
-        opts.max_attempts = 0;
-        opts.max_rounds = 0;
-        opts.total_time_limit_seconds = 0.0;
-        opts.local_time_limit_seconds = 0.16;
-        opts.max_candidate_masks_tested = 900000ULL;
-    } else if (n >= 4000) {
-        opts.max_subproblem_leaves = 40;
-        opts.max_components_per_subproblem = 9;
-        opts.max_attempts = direct_stage ? 100 : 64;
-        opts.max_rounds = direct_stage ? 5 : 3;
-        opts.total_time_limit_seconds = direct_stage ? 5.0 : 2.5;
-        opts.local_time_limit_seconds = 0.20;
-        opts.max_candidate_masks_tested = 1500000ULL;
-    } else {
-        opts.max_subproblem_leaves = 45;
-        opts.max_components_per_subproblem = 9;
-        opts.max_attempts = 72;
-        opts.max_rounds = 3;
-        opts.total_time_limit_seconds = 2.5;
-        opts.local_time_limit_seconds = 0.18;
-        opts.max_candidate_masks_tested = 1200000ULL;
-    }
-
-    opts.total_time_limit_seconds = std::min(
-        opts.total_time_limit_seconds,
-        std::max(0.0, timer.remaining_seconds() - opts.guard_seconds)
-    );
-
-    return opts;
-}
-
-NewickTree induced_newick_tree(
-    const NewickTree& tree,
-    const std::vector<std::uint32_t>& labels
-) {
-    if (labels.empty()) {
-        throw std::runtime_error("cannot induce empty tree");
-    }
-
-    std::unordered_set<std::uint32_t> selected;
-    selected.reserve(labels.size() * 2);
-
-    for (std::uint32_t label : labels) {
-        selected.insert(label);
-    }
-
-    std::optional<std::string> body =
-        restricted_subtree_newick(tree, tree.root, selected);
-
-    if (!body.has_value()) {
-        throw std::runtime_error("failed to induce exact-repair tree");
-    }
-
-    std::string text = *body + ";";
-    return pace26::io::NewickParser::parse_string(text);
-}
-
-std::uint64_t exact_repair_label_hash(const std::vector<std::uint32_t>& labels) {
-    std::uint64_t h = 0x84222325cbf29ce4ULL;
-
-    for (std::uint32_t label : labels) {
-        h ^= profile_mix64(static_cast<std::uint64_t>(label) + 0x9e3779b97f4a7c15ULL);
-        h *= 0x100000001b3ULL;
-    }
-
-    h ^= profile_mix64(static_cast<std::uint64_t>(labels.size()));
-    return h;
-}
-
-struct ExactRepairWindow {
-    std::vector<std::size_t> component_indices;
-    std::vector<std::uint32_t> labels;
-    std::uint64_t hash = 0;
-};
-
-std::vector<std::size_t> component_order_by_tree(
-    const CoreForest& forest,
-    const Tree& tree
-) {
-    struct Entry {
-        std::size_t index = 0;
-        int min_tin = 0;
-        int max_tin = 0;
-        std::size_t size = 0;
-    };
-
-    std::vector<Entry> entries;
-    entries.reserve(forest.components.size());
-
-    for (std::size_t i = 0; i < forest.components.size(); ++i) {
-        const CoreComponent& component = forest.components[i];
-        if (component.empty()) {
-            continue;
-        }
-
-        int min_tin = std::numeric_limits<int>::max();
-        int max_tin = std::numeric_limits<int>::min();
-
-        for (std::uint32_t label : component.labels) {
-            const int node = tree.node_of_label(label);
-            const int tin = tree.tin[static_cast<std::size_t>(node)];
-            min_tin = std::min(min_tin, tin);
-            max_tin = std::max(max_tin, tin);
-        }
-
-        entries.push_back({i, min_tin, max_tin, component.labels.size()});
-    }
-
-    std::sort(
-        entries.begin(),
-        entries.end(),
-        [](const Entry& a, const Entry& b) {
-            if (a.min_tin != b.min_tin) {
-                return a.min_tin < b.min_tin;
-            }
-            if (a.max_tin != b.max_tin) {
-                return a.max_tin < b.max_tin;
-            }
-            if (a.size != b.size) {
-                return a.size < b.size;
-            }
-            return a.index < b.index;
-        }
-    );
-
-    std::vector<std::size_t> order;
-    order.reserve(entries.size());
-
-    for (const Entry& entry : entries) {
-        order.push_back(entry.index);
-    }
-
-    return order;
-}
-
-void collect_exact_repair_windows_from_order(
-    const CoreForest& forest,
-    const std::vector<std::size_t>& order,
-    const ExactWindowRepairOptions& opts,
-    std::vector<ExactRepairWindow>& windows,
-    std::unordered_set<std::uint64_t>& seen_hashes
-) {
-    const std::size_t collection_cap = std::max<std::size_t>(opts.max_attempts * 6, 32);
-
-    for (std::size_t start = 0; start < order.size() && windows.size() < collection_cap; ++start) {
-        ExactRepairWindow window;
-
-        for (std::size_t pos = start;
-             pos < order.size() &&
-             window.component_indices.size() < opts.max_components_per_subproblem;
-             ++pos) {
-            const std::size_t component_index = order[pos];
-            const CoreComponent& component = forest.components[component_index];
-
-            if (component.size() > opts.max_subproblem_leaves) {
-                break;
-            }
-
-            if (window.labels.size() + component.labels.size() > opts.max_subproblem_leaves) {
-                break;
-            }
-
-            window.component_indices.push_back(component_index);
-            window.labels.insert(
-                window.labels.end(),
-                component.labels.begin(),
-                component.labels.end()
-            );
-
-            if (window.component_indices.size() < 3 || window.labels.size() < 3) {
-                continue;
-            }
-
-            ExactRepairWindow candidate = window;
-            std::sort(candidate.labels.begin(), candidate.labels.end());
-            candidate.hash = exact_repair_label_hash(candidate.labels);
-
-            if (!seen_hashes.insert(candidate.hash).second) {
-                continue;
-            }
-
-            windows.push_back(std::move(candidate));
-            if (windows.size() >= collection_cap) {
-                break;
-            }
-        }
-    }
-}
-
-std::vector<ExactRepairWindow> collect_exact_repair_windows(
-    const CoreForest& forest,
-    const Tree& t1,
-    const Tree& t2,
-    const ExactWindowRepairOptions& opts
-) {
-    std::vector<ExactRepairWindow> windows;
-    std::unordered_set<std::uint64_t> seen_hashes;
-
-    seen_hashes.reserve(opts.max_attempts * 8 + 16);
-
-    const std::vector<std::size_t> order1 = component_order_by_tree(forest, t1);
-    collect_exact_repair_windows_from_order(forest, order1, opts, windows, seen_hashes);
-
-    const std::vector<std::size_t> order2 = component_order_by_tree(forest, t2);
-    collect_exact_repair_windows_from_order(forest, order2, opts, windows, seen_hashes);
-
-    std::sort(
-        windows.begin(),
-        windows.end(),
-        [](const ExactRepairWindow& a, const ExactRepairWindow& b) {
-            if (a.component_indices.size() != b.component_indices.size()) {
-                return a.component_indices.size() > b.component_indices.size();
-            }
-            if (a.labels.size() != b.labels.size()) {
-                return a.labels.size() < b.labels.size();
-            }
-            return a.hash < b.hash;
-        }
-    );
-
-    if (windows.size() > opts.max_attempts) {
-        windows.resize(opts.max_attempts);
-    }
-
-    return windows;
-}
-
-bool try_exact_repair_window(
-    CoreForest& best,
-    const NewickTree& nt1,
-    const NewickTree& nt2,
-    const Tree& full_t1,
-    const Tree& full_t2,
-    const ExactRepairWindow& window,
-    const ExactWindowRepairOptions& opts,
-    Timer& timer,
-    const std::string& context
-) {
-    const double attempt_start = timer.elapsed_seconds();
-    auto log_attempt = [&](const char* reason,
-                           bool accepted,
-                           std::size_t sub_before,
-                           std::size_t sub_after) {
-        if (!g_profile.enabled()) {
-            return;
-        }
-        g_profile.event_raw(
-            "exact_window_repair_attempt",
-            &timer,
-            {
-                {"context", json_quote(context)},
-                {"hash", json_quote(profile_hex64(window.hash))},
-                {"reason", json_quote(reason)},
-                {"accepted", accepted ? "true" : "false"},
-                {"labels", std::to_string(window.labels.size())},
-                {"window_components", std::to_string(window.component_indices.size())},
-                {"sub_components_before", std::to_string(sub_before)},
-                {"sub_components_after", std::to_string(sub_after)},
-                {"duration_seconds", std::to_string(timer.elapsed_seconds() - attempt_start)}
-            }
-        );
-    };
-
-    if (window.component_indices.size() < 3 ||
-        window.labels.empty() ||
-        window.labels.size() > opts.max_subproblem_leaves ||
-        timer.should_stop(opts.guard_seconds)) {
-        log_attempt("precheck_failed", false, 0, 0);
-        return false;
-    }
-
-    CoreForest sub_incumbent;
-    for (std::size_t component_index : window.component_indices) {
-        if (component_index >= best.components.size()) {
-            log_attempt("invalid_component_index", false, 0, 0);
-            return false;
-        }
-        sub_incumbent.add_component(best.components[component_index]);
-    }
-    sub_incumbent.normalize();
-    sub_incumbent.validate_partition_of(window.labels);
-
-    try {
-        NewickTree sub_nt1 = induced_newick_tree(nt1, window.labels);
-        NewickTree sub_nt2 = induced_newick_tree(nt2, window.labels);
-        Tree sub_t1 = Tree::from_newick(sub_nt1);
-        Tree sub_t2 = Tree::from_newick(sub_nt2);
-
-        pace26::exact::InProcessExactMaf::Options exact_opts;
-        exact_opts.enabled = true;
-        exact_opts.max_leaves = opts.max_subproblem_leaves;
-        exact_opts.local_time_limit_seconds = opts.local_time_limit_seconds;
-        exact_opts.global_guard_seconds = opts.guard_seconds;
-        exact_opts.local_guard_seconds = 0.01;
-        exact_opts.max_candidate_masks_tested = opts.max_candidate_masks_tested;
-
-        pace26::exact::InProcessExactMaf exact(exact_opts);
-        std::optional<CoreForest> exact_forest =
-            exact.solve(sub_t1, sub_t2, &timer, &sub_incumbent);
-
-        if (!exact_forest.has_value()) {
-            log_attempt(
-                "no_exact_candidate",
-                false,
-                sub_incumbent.component_count(),
-                0
-            );
-            return false;
-        }
-
-        exact_forest->normalize();
-        exact_forest->validate_partition_of(window.labels);
-
-        if (exact_forest->component_count() >= sub_incumbent.component_count()) {
-            log_attempt(
-                "no_sub_improvement",
-                false,
-                sub_incumbent.component_count(),
-                exact_forest->component_count()
-            );
-            return false;
-        }
-
-        std::vector<char> selected(best.components.size(), 0);
-        for (std::size_t component_index : window.component_indices) {
-            selected[component_index] = 1;
-        }
-
-        CoreForest candidate;
-        candidate.components.reserve(
-            best.components.size() -
-            window.component_indices.size() +
-            exact_forest->component_count()
-        );
-
-        for (std::size_t i = 0; i < best.components.size(); ++i) {
-            if (selected[i] == 0) {
-                candidate.add_component(best.components[i]);
-            }
-        }
-
-        for (const CoreComponent& component : exact_forest->components) {
-            candidate.add_component(component);
-        }
-
-        const std::size_t before = best.component_count();
-        const bool accepted =
-            consider_candidate(best, std::move(candidate), full_t1, full_t2);
-
-        if (accepted) {
-            log_attempt(
-                "accepted",
-                true,
-                sub_incumbent.component_count(),
-                exact_forest->component_count()
-            );
-            g_profile.event_raw(
-                "exact_window_repair_accept",
-                &timer,
-                {
-                    {"context", json_quote(context)},
-                    {"labels", std::to_string(window.labels.size())},
-                    {"components_before", std::to_string(before)},
-                    {"components_after", std::to_string(best.component_count())},
-                    {"sub_components_before", std::to_string(sub_incumbent.component_count())},
-                    {"sub_components_after", std::to_string(exact_forest->component_count())}
-                }
-            );
-        } else {
-            log_attempt(
-                "not_global_improvement",
-                false,
-                sub_incumbent.component_count(),
-                exact_forest->component_count()
-            );
-        }
-
-        return accepted;
-    } catch (const std::exception&) {
-        log_attempt("exception", false, 0, 0);
-        return false;
-    }
-}
-
-bool run_exact_window_repair(
-    CoreForest& best,
-    const NewickTree& nt1,
-    const NewickTree& nt2,
-    Timer& timer,
-    const ExactWindowRepairOptions& opts,
-    const std::string& context
-) {
-    if (best.component_count() < 3 ||
-        opts.total_time_limit_seconds <= 0.0 ||
-        timer.should_stop(opts.guard_seconds)) {
-        return false;
-    }
-
-    const double phase_start = timer.elapsed_seconds();
-    const std::size_t n = count_leaves(nt1);
-    const std::size_t before = best.component_count();
-    std::size_t attempts = 0;
-    std::size_t accepted_windows = 0;
-    std::size_t rounds_run = 0;
-    std::size_t windows_collected_total = 0;
-    std::size_t max_windows_in_round = 0;
-    std::size_t no_window_rounds = 0;
-
-    try {
-        Tree full_t1 = Tree::from_newick(nt1);
-        Tree full_t2 = Tree::from_newick(nt2);
-
-        for (int round = 0; round < opts.max_rounds; ++round) {
-            if (timer.should_stop(opts.guard_seconds) ||
-                timer.elapsed_seconds() - phase_start >= opts.total_time_limit_seconds ||
-                attempts >= opts.max_attempts) {
-                break;
-            }
-
-            const std::vector<ExactRepairWindow> windows =
-                collect_exact_repair_windows(best, full_t1, full_t2, opts);
-            ++rounds_run;
-            windows_collected_total += windows.size();
-            max_windows_in_round = std::max(max_windows_in_round, windows.size());
-            if (windows.empty()) {
-                ++no_window_rounds;
-            }
-
-            bool accepted_in_round = false;
-
-            for (const ExactRepairWindow& window : windows) {
-                if (timer.should_stop(opts.guard_seconds) ||
-                    timer.elapsed_seconds() - phase_start >= opts.total_time_limit_seconds ||
-                    attempts >= opts.max_attempts) {
-                    break;
-                }
-
-                ++attempts;
-
-                if (try_exact_repair_window(
-                        best,
-                        nt1,
-                        nt2,
-                        full_t1,
-                        full_t2,
-                        window,
-                        opts,
-                        timer,
-                        context)) {
-                    ++accepted_windows;
-                    accepted_in_round = true;
-                    break;
-                }
-            }
-
-            if (!accepted_in_round) {
-                break;
-            }
-        }
-    } catch (const std::exception&) {
-        // Repair is opportunistic. Keep the incoming valid incumbent.
-    }
-
-    if (g_profile.enabled()) {
-        g_profile.phase_result(
-            context,
-            timer,
-            phase_start,
-            n,
-            before,
-            best.component_count(),
-            best.component_count() < before,
-            {
-                {"attempts", std::to_string(attempts)},
-                {"accepted_windows", std::to_string(accepted_windows)},
-                {"rounds_run", std::to_string(rounds_run)},
-                {"windows_collected_total", std::to_string(windows_collected_total)},
-                {"max_windows_in_round", std::to_string(max_windows_in_round)},
-                {"no_window_rounds", std::to_string(no_window_rounds)},
-                {"max_subproblem_leaves", std::to_string(opts.max_subproblem_leaves)},
-                {"max_components_per_subproblem", std::to_string(opts.max_components_per_subproblem)},
-                {"max_attempts", std::to_string(opts.max_attempts)},
-                {"max_rounds", std::to_string(opts.max_rounds)},
-                {"total_time_limit_seconds", std::to_string(opts.total_time_limit_seconds)}
-            }
-        );
-    }
-
-    best.normalize();
-    return best.component_count() < before;
-}
-
 void publish_emergency_forest(
     const NewickTree& original_tree,
     CoreForest forest
@@ -7314,7 +6471,6 @@ int main(int argc, char** argv) {
             original_leaf_count,
             baseline_config.time_limit_seconds
         );
-        apply_packing_focused_config(baseline_config);
 
         SolverConfig extended_base_config = parsed_config;
         extended_base_config.time_limit_seconds = external_time_limit_seconds;
@@ -7322,7 +6478,6 @@ int main(int argc, char** argv) {
             original_leaf_count,
             external_time_limit_seconds
         );
-        apply_packing_focused_config(extended_base_config);
 
         const NewickTree original_tree_for_output = instance.trees[0];
 
@@ -7458,54 +6613,6 @@ int main(int argc, char** argv) {
             run_early_archive_crossover("main.early_archive_forest_crossover");
         }
 
-        if (kEnableExactWindowRepair &&
-            !baseline_config.packing_focused &&
-            baseline_direct &&
-            warm_forest.has_value() &&
-            !baseline_timer.should_stop(2.0)) {
-            try {
-                ExactWindowRepairOptions repair_opts =
-                    exact_window_repair_options(
-                        original_leaf_count,
-                        baseline_timer,
-                        true,
-                        false
-                    );
-
-                if (run_exact_window_repair(
-                        *warm_forest,
-                        instance.trees[0],
-                        instance.trees[1],
-                        baseline_timer,
-                        repair_opts,
-                        "main.direct_exact_window_repair")) {
-                    publish_if_global_best(*warm_forest);
-                }
-
-                const bool accepted = consider_candidate(
-                    incumbent,
-                    *warm_forest,
-                    original_core_tree,
-                    original_core_tree2
-                );
-                if (accepted) {
-                    publish_if_global_best(incumbent);
-                }
-            } catch (const std::exception&) {
-                // Keep the warm emergency incumbent.
-            }
-        } else if (!kEnableExactWindowRepair && baseline_direct) {
-            g_profile.event_raw(
-                "phase_skipped",
-                &baseline_timer,
-                {
-                    {"phase", json_quote("main.direct_exact_window_repair")},
-                    {"n", std::to_string(original_leaf_count)},
-                    {"reason", json_quote("disabled_low_roi_pruning")}
-                }
-            );
-        }
-
         if (baseline_direct) {
             g_profile.event_raw(
                 "baseline_direct_complete",
@@ -7544,42 +6651,6 @@ int main(int argc, char** argv) {
             }
             sync_incumbent_from_published();
 
-            if (kEnableExactWindowRepair &&
-                !baseline_config.packing_focused &&
-                original_leaf_count >= 1000 &&
-                !baseline_timer.should_stop(2.0)) {
-                try {
-                    ExactWindowRepairOptions repair_opts =
-                        exact_window_repair_options(
-                            original_leaf_count,
-                            baseline_timer,
-                            false,
-                            false
-                        );
-
-                    if (run_exact_window_repair(
-                        incumbent,
-                        instance.trees[0],
-                        instance.trees[1],
-                        baseline_timer,
-                        repair_opts,
-                        "main.final_exact_window_repair")) {
-                        publish_if_global_best(incumbent);
-                    }
-                } catch (const std::exception&) {
-                    // Keep the validated incumbent.
-                }
-            } else if (!kEnableExactWindowRepair && original_leaf_count >= 1000) {
-                g_profile.event_raw(
-                    "phase_skipped",
-                    &baseline_timer,
-                    {
-                        {"phase", json_quote("main.final_exact_window_repair")},
-                        {"n", std::to_string(original_leaf_count)},
-                        {"reason", json_quote("disabled_low_roi_pruning")}
-                    }
-                );
-            }
         }
 
         if (!baseline_direct) {
@@ -8622,18 +7693,6 @@ int main(int argc, char** argv) {
                                 ? "disabled_low_roi_medium_tail"
                                 : "timer_guard"
                         )}
-                    }
-                );
-            }
-
-            if (original_leaf_count >= 1000) {
-                g_profile.event_raw(
-                    "phase_skipped",
-                    &extended_timer,
-                    {
-                        {"phase", json_quote("main.extended_exact_window_repair")},
-                        {"n", std::to_string(original_leaf_count)},
-                        {"reason", json_quote("disabled_low_roi")}
                     }
                 );
             }

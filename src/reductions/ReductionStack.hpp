@@ -31,8 +31,8 @@ public:
  * This is deliberate.
  *
  * Do not try to expand reductions directly on Newick strings at this stage.
- * Keep the forest as label blocks, then let your final ForestWriter reconstruct
- * each component's topology from the original T1 or T2.
+ * Keep the forest as label blocks, then reconstruct each component's topology
+ * from the original T1 or T2 at output time.
  */
 struct LabelComponent {
     std::vector<std::uint32_t> labels;
