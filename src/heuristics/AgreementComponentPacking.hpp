@@ -62,6 +62,7 @@ public:
         std::size_t seed_intersection_added = 0;
 
         std::size_t greedy_variants = 0;
+        std::size_t greedy_polished_variants = 0;
         std::size_t exchange_rounds = 0;
         std::size_t deficit_exchange_tests = 0;
         std::size_t deficit_exchange_attempts = 0;
@@ -108,11 +109,16 @@ public:
         std::size_t seed_intersection_candidate_limit = 0;
         std::size_t exchange_rounds = 3;
         std::size_t two_exchange_pool = 160;
+        std::size_t greedy_variant_count = 4;
+        std::size_t greedy_polish_variants = 0;
+        std::size_t greedy_polish_exchange_rounds = 1;
+        std::size_t greedy_polish_two_exchange_pool = 96;
         int max_refill_deficit = 0;
         std::size_t deficit_exchange_rounds = 0;
         std::size_t deficit_exchange_pool = 0;
         std::size_t deficit_refill_pool = 0;
         std::size_t local_mwis_anchors = 0;
+        std::size_t local_mwis_anchor_scan_limit = 0;
         std::size_t local_mwis_candidate_limit = 0;
         std::size_t local_mwis_node_limit = 0;
         std::size_t exact_max_leaves = 180;
@@ -1225,21 +1231,67 @@ private:
         std::sort(order.begin(), order.end(), [&](int ai, int bi) {
             const Candidate& a = candidates_[static_cast<std::size_t>(ai)];
             const Candidate& b = candidates_[static_cast<std::size_t>(bi)];
-            if (variant == 0) {
+            const int normalized_variant = variant % 10;
+            const auto size_score = [](const Candidate& c) {
+                return static_cast<int>(c.labels.size());
+            };
+            const auto medium_penalty = [&](const Candidate& c) {
+                const int size = size_score(c);
+                const int target = size <= 8 ? 5 : 8;
+                return size >= target ? size - target : target - size;
+            };
+            if (normalized_variant == 0) {
                 if (a.gain != b.gain) return a.gain > b.gain;
                 if (a.edge_cost != b.edge_cost) return a.edge_cost < b.edge_cost;
-            } else if (variant == 1) {
+            } else if (normalized_variant == 1) {
                 const long long ad = static_cast<long long>(a.gain) * (b.edge_cost + 1);
                 const long long bd = static_cast<long long>(b.gain) * (a.edge_cost + 1);
                 if (ad != bd) return ad > bd;
                 if (a.gain != b.gain) return a.gain > b.gain;
-            } else if (variant == 2) {
+            } else if (normalized_variant == 2) {
                 if (a.from_seed != b.from_seed) return a.from_seed;
                 if (a.edge_cost != b.edge_cost) return a.edge_cost < b.edge_cost;
                 if (a.gain != b.gain) return a.gain > b.gain;
-            } else {
+            } else if (normalized_variant == 3) {
                 if (a.edge_cost != b.edge_cost) return a.edge_cost < b.edge_cost;
                 if (a.gain != b.gain) return a.gain > b.gain;
+            } else if (normalized_variant == 4) {
+                if (a.from_seed != b.from_seed) return a.from_seed;
+                if (a.gain != b.gain) return a.gain > b.gain;
+                if (size_score(a) != size_score(b)) return size_score(a) > size_score(b);
+                if (a.edge_cost != b.edge_cost) return a.edge_cost < b.edge_cost;
+            } else if (normalized_variant == 5) {
+                if (size_score(a) != size_score(b)) return size_score(a) > size_score(b);
+                if (a.gain != b.gain) return a.gain > b.gain;
+                if (a.edge_cost != b.edge_cost) return a.edge_cost < b.edge_cost;
+            } else if (normalized_variant == 6) {
+                const long long ad =
+                    static_cast<long long>(a.gain) * (b.edge_cost + size_score(b) + 1);
+                const long long bd =
+                    static_cast<long long>(b.gain) * (a.edge_cost + size_score(a) + 1);
+                if (ad != bd) return ad > bd;
+                if (size_score(a) != size_score(b)) return size_score(a) > size_score(b);
+            } else if (normalized_variant == 7) {
+                if (medium_penalty(a) != medium_penalty(b)) {
+                    return medium_penalty(a) < medium_penalty(b);
+                }
+                if (a.gain != b.gain) return a.gain > b.gain;
+                if (a.edge_cost != b.edge_cost) return a.edge_cost < b.edge_cost;
+            } else {
+                const long long as =
+                    static_cast<long long>(a.gain) * 64 +
+                    static_cast<long long>(size_score(a)) * 7 -
+                    static_cast<long long>(a.edge_cost);
+                const long long bs =
+                    static_cast<long long>(b.gain) * 64 +
+                    static_cast<long long>(size_score(b)) * 7 -
+                    static_cast<long long>(b.edge_cost);
+                if (as != bs) return as > bs;
+                const std::uint64_t ah =
+                    mix64(a.tie ^ 0x243f6a8885a308d3ULL ^ static_cast<std::uint64_t>(variant));
+                const std::uint64_t bh =
+                    mix64(b.tie ^ 0x243f6a8885a308d3ULL ^ static_cast<std::uint64_t>(variant));
+                if (ah != bh) return ah < bh;
             }
             return a.tie < b.tie;
         });
@@ -1247,14 +1299,28 @@ private:
     }
 
     void run_greedy_portfolio(PackingState& best) const {
-        for (int variant = 0; variant < 4 && !should_stop(); ++variant) {
+        const std::size_t variants =
+            std::max<std::size_t>(4, options_.greedy_variant_count);
+        for (std::size_t variant = 0; variant < variants && !should_stop(); ++variant) {
             if (stats_ != nullptr) {
                 ++stats_->greedy_variants;
             }
             PackingState state = empty_state();
-            const std::vector<int> order = candidate_order(variant);
+            const std::vector<int> order = candidate_order(static_cast<int>(variant));
             for (int index : order) {
                 add_to_state(state, index);
+            }
+            if (variant < options_.greedy_polish_variants &&
+                options_.greedy_polish_exchange_rounds > 0 &&
+                !should_stop()) {
+                if (stats_ != nullptr) {
+                    ++stats_->greedy_polished_variants;
+                }
+                run_exchange_search(
+                    state,
+                    options_.greedy_polish_exchange_rounds,
+                    options_.greedy_polish_two_exchange_pool
+                );
             }
             if (better_state(state, best)) {
                 best = std::move(state);
@@ -1522,14 +1588,22 @@ private:
         }
     }
 
-    void run_exchange_search(PackingState& best) const {
+    void run_exchange_search(
+        PackingState& best,
+        std::size_t round_limit = 0,
+        std::size_t pair_pool_limit = 0
+    ) const {
         const std::vector<int> order = candidate_order(1);
         std::vector<int> pair_pool = order;
-        if (pair_pool.size() > options_.two_exchange_pool) {
-            pair_pool.resize(options_.two_exchange_pool);
+        const std::size_t effective_rounds =
+            round_limit == 0 ? options_.exchange_rounds : round_limit;
+        const std::size_t effective_pair_pool =
+            pair_pool_limit == 0 ? options_.two_exchange_pool : pair_pool_limit;
+        if (pair_pool.size() > effective_pair_pool) {
+            pair_pool.resize(effective_pair_pool);
         }
 
-        for (std::size_t round = 0; round < options_.exchange_rounds && !should_stop(); ++round) {
+        for (std::size_t round = 0; round < effective_rounds && !should_stop(); ++round) {
             if (stats_ != nullptr) {
                 ++stats_->exchange_rounds;
             }
@@ -2027,11 +2101,20 @@ private:
         }
 
         const std::vector<int> order = candidate_order(1);
-        std::size_t anchors_seen = 0;
-        for (int anchor : order) {
-            if (anchors_seen >= options_.local_mwis_anchors || should_stop()) {
-                break;
-            }
+        struct AnchorChoice {
+            int index = -1;
+            long long score = 0;
+            std::size_t rank = 0;
+        };
+        std::vector<AnchorChoice> anchors;
+        anchors.reserve(options_.local_mwis_anchors * 4 + 8);
+
+        const std::size_t scan_limit = options_.local_mwis_anchor_scan_limit == 0
+            ? std::min<std::size_t>(order.size(), options_.local_mwis_anchors * 32 + 256)
+            : std::min<std::size_t>(order.size(), options_.local_mwis_anchor_scan_limit);
+
+        for (std::size_t rank = 0; rank < scan_limit && !should_stop(); ++rank) {
+            const int anchor = order[rank];
             if (best.selected[static_cast<std::size_t>(anchor)]) {
                 continue;
             }
@@ -2039,8 +2122,44 @@ private:
             if (conflicts.empty()) {
                 continue;
             }
-            ++anchors_seen;
-            if (try_local_mwis_anchor(best, anchor, order)) {
+
+            int removed_gain = 0;
+            int removed_size_score = 0;
+            for (int conflict : conflicts) {
+                const Candidate& c = candidates_[static_cast<std::size_t>(conflict)];
+                removed_gain += c.gain;
+                removed_size_score += static_cast<int>(c.labels.size());
+            }
+
+            const Candidate& candidate = candidates_[static_cast<std::size_t>(anchor)];
+            const int size = static_cast<int>(candidate.labels.size());
+            const long long immediate_delta =
+                static_cast<long long>(candidate.gain) - removed_gain;
+            const long long score =
+                immediate_delta * 4096LL +
+                static_cast<long long>(candidate.gain) * 96LL +
+                static_cast<long long>(size) * 23LL -
+                static_cast<long long>(removed_size_score) * 5LL -
+                static_cast<long long>(conflicts.size()) * 37LL +
+                (candidate.from_seed ? 1024LL : 0LL);
+
+            anchors.push_back({anchor, score, rank});
+        }
+
+        std::sort(anchors.begin(), anchors.end(), [](const AnchorChoice& a, const AnchorChoice& b) {
+            if (a.score != b.score) {
+                return a.score > b.score;
+            }
+            return a.rank < b.rank;
+        });
+
+        std::size_t anchors_tried = 0;
+        for (const AnchorChoice& choice : anchors) {
+            if (anchors_tried >= options_.local_mwis_anchors || should_stop()) {
+                break;
+            }
+            ++anchors_tried;
+            if (try_local_mwis_anchor(best, choice.index, order)) {
                 fill_uncontested(best, order);
             }
         }
