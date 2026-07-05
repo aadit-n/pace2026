@@ -23,12 +23,13 @@ export DEBIAN_FRONTEND=noninteractive
 
 ${APT_GET} update
 ${APT_GET} install -y --no-install-recommends \
-    build-essential \
     ca-certificates \
-    make
+    g++
 
-make clean
-make
+rm -f pace_solver
+g++ -O3 -march=native -flto -fno-plt -fno-rtti -fdevirtualize-speculatively \
+    -Isrc -Isrc/io -Isrc/reductions \
+    src/main.cpp -o pace_solver -pthread
 
 echo
 echo "Build complete: ./pace_solver"
