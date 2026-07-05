@@ -3,25 +3,6 @@
 This repository builds the PACE 2026 heuristic-track solver as a single native
 C++ executable named `pace_solver`.
 
-## Requirements
-
-Required external dependencies:
-
-- Debian 13.5 or another Linux environment with a modern GNU toolchain.
-- `g++` with C++17 support.
-- `make`.
-- POSIX threads support, provided by the system C/C++ runtime and linked through
-  `-pthread`.
-
-The solver itself does not require Boost, GMP, Python packages, or any external
-C++ libraries.
-
-Optional tools:
-
-- `./stride`, if present, can validate solutions with `./stride check`.
-- `pace26stride`/STRIDE tooling may be used for local benchmark runs, but is not
-  required to build or run the solver.
-
 ## Build On Debian 13.5
 
 From the repository root:
@@ -54,12 +35,6 @@ standard output:
 
 ```sh
 ./pace_solver < instance.txt > solution.txt
-```
-
-If the local STRIDE checker is available, validate with:
-
-```sh
-./stride check -q instance.txt solution.txt
 ```
 
 ## Notes
